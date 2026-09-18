@@ -47,6 +47,15 @@ testi oku — hepsinin kendini koruyan bir testi var.
     156 bardır; sabit 200 eşiği her haftalık seriyi reddeder.
 17. **Haftalık barlar Pazartesi'ye hizalı**, epoch'a (Perşembe) değil.
     → `clock.timeframe_offset`
+18. **Minimum bakiye yapısal.** `risk.min_equity` (ölçülen: 183) altında yeni
+    giriş yok. Altında bot test edilen stratejiyi küçültmez, evrenin daha sakin
+    bir alt kümesini işler. → `scripts/capital_check.py`
+19. **`starting_balance` sadece paper/backtest.** Canlıda bakiye borsadan okunur.
+20. **Pozisyon tavanları sadece kısar.** `max_position_notional` / `_pct` /
+    `max_risk_amount` — hangisi önce bağlarsa. Tavan bağlasa bile
+    `1R = adet × stop_mesafesi` korunur. → `risk/sizing.py`
+21. **`SizingResult` keyword-only.** Alan eklemek pozisyonel argümanı sessizce
+    yanlış alana bağlamasın diye — bir kez oldu, red sebebi `capped_by`'a düştü.
 
 ## Denetim (2026-09-17) — bulunan ve kapatılan
 
@@ -166,6 +175,22 @@ Varsayım değil, bu repodaki veriyle ölçüldü.
 - **Uyarı:** örneklem 2023-09..2026-09, taban oran pozitif. Ham getiri değil
   **taban üstü fazlalık** ölçülüyor; CPCV + DSR hâlâ zorunlu.
 
+## Zaman dilimi ekonomisi (ölçüldü)
+
+Gidiş-dönüş maliyet ~%0.3. Tipik bar hareketi ne kadarını yiyor:
+
+| tf | medyan hareket | maliyet / hareket |
+|---|---|---|
+| 15m | %0.24 | **%124** — maliyet hareketten büyük |
+| 30m | %0.34 | %88 |
+| 1h | %0.48 | %62 |
+| 4h | %0.94 | %32 |
+| 1d | %2.58 | %12 |
+
+Düşük zaman diliminde strateji sorunu yok, **aritmetik** sorunu var. Ama maliyet
+bar başına değil işlem başına ödeniyor: düşük tf `trigger` olarak bedava giriş
+hassasiyeti verir. Belirleyici olan zaman dilimi etiketi değil **tutuş ufku**.
+
 ## Kapı 1 durumu: GEÇİLMEDİ
 
 Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
@@ -179,7 +204,48 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 | CPCV yollarının çoğu pozitif | %20 | ❌ |
 | PBO ≤ 0.5 | 1.00 | ❌ |
 
-Al-tut karşılaştırması: strateji **+%2.27**, BTC al-tut **+%192**.
+### İki yapısal bulgu (v1 → v2)
+
+**1. $100'da ölçülen şey strateji değildi.** Huni ölçümü: taramayı 1.246 aday
+geçiyor, **1.215'i (%97.5) `min_notional`'a takılıyor.** Borsanın $5 minimumu,
+$0.75 risk bütçesiyle ancak stop %13'ten darsa aşılıyor. Yani sadece dar stop'lu
+kurulumlar işleme giriyordu — strateji değil, bir sermaye kısıtı ölçülmüştü.
+
+**1b. Minimum sermaye ölçüldü: $183.** Boyutlandırma zinciri
+`1R = bakiye × risk × vol_ölçeği`, `notional = 1R / stop%`, borsa $5 altını
+reddediyor. Ters çevirince: hesap ancak `1R/$5.75` kadar geniş stop ifade
+edebiliyor. $100'da bu %13 — kurulumların %84'ü geçiyor, %16'sı (volatil olanlar)
+sessizce atlanıyor. Volatilite ölçekleyici de aynı sembolleri küçülttüğü için iki
+etki birleşiyor. `risk.min_equity` olarak zorlanıyor.
+
+**2. Ölçtüğüm şeyi uygulamamışım.** Tail analizi **kesitsel**: her barda
+semboller birbirine karşı sıralanıp üst desil alınıyor. Conviction motoru ise
+her sembolü **mutlak bir eşiğe** karşı puanlıyordu. Farklı sorular. Mutlak eşik
+kıtlık-bolluk üretiyor; göreli sıralama fırsat sayısını sabit tutuyor.
+Düzeltince: 63→116 işlem, PF 0.97→1.34, expectancy −0.004→+0.280R.
+`conviction.selection: cross_sectional` artık varsayılan.
+
+Al-tut karşılaştırması: strateji **+%0.95**, BTC al-tut **+%192**.
+
+**3. Volatilite ölçekleyici hiç çalışmamış.** `vol_target_annual: 0.35` bir hisse
+portföyü hedefi; evrenin medyan yıllık volatilitesi **%79**. Ölçekleyici sürekli
+tabanında (0.4x) sıkışıyor, her pozisyon niyetlenenin %44'ü olarak açılıyor,
+sonra min_notional'a takılıyordu. Mekanizma muhafazakâr değil **işlevsizdi**.
+
+0.80'e kalibre edilince sonuçlar **kötüleşti**: PF 1.34→1.16, getiri
++%3.66→+%0.95. Önceki sayının bir kısmı yapaydı — bozuk ölçekleyici farkında
+olmadan şanslı bir alt küme seçiyordu. Düzeltme ölçümü güvenilir yaptı.
+
+### İstatistiksel bütçe tükendi
+
+9 denemeden sonra DSR'ın beklenen maks Sharpe eşiği ~1.5; gözlenen 0.24. Bu veri
+setinde (21 sembol × 3 yıl) **daha fazla ayar yapıp sonuca güvenmek matematiksel
+olarak mümkün değil.** CPCV (%44) ve PBO (0.67) aynı şeyi bağımsız söylüyor.
+
+Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var ve
+ödendi. Çıkış yolu ayar değil **taze veri**: paper ileri testi (maliyeti sıfır,
+ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
+edilen yeni hipotez sınıfı.
 
 **Kümülatif deneme: 7** (bkz. `research/hypotheses.md`). Bir sonraki CPCV
 koşusunda `--trials 7` geçirin — DSR her denemeyi fiyatlıyor.

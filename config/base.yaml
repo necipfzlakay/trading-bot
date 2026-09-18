@@ -4,7 +4,9 @@
 
 mode: paper
 venue: bybit-demo
-starting_balance: 100.0
+# SADECE paper ve backtest için başlangıç bakiyesi. Canlı modda gerçek bakiye
+# borsadan okunur; buradaki değer kullanılmaz.
+starting_balance: 1000.0
 quote_currency: USDT
 log_level: INFO
 
@@ -29,6 +31,19 @@ risk:
   max_positions: 3
   max_correlation: 0.85        # BTC ile ρ>0.85 olanlar tek pozisyon sayılır
   max_portfolio_exposure: 1.0
+
+  # --- pozisyon büyüklüğü tavanları -----------------------------------------
+  # Yüzde bazlı boyutlandırma sınırsız ölçekleniyor: %0.75 riskle 1R, $200
+  # hesapta $1.50 iken $50.000'de $375 olur. Aritmetik olarak tutarlı ama
+  # operasyonel olarak akılsız — küçük pozisyonlarla doğrulanmış bir strateji,
+  # ince bir emir defterini oynatacak büyüklükte doğrulanmış değildir.
+  #
+  # Bunlar boyutlandırmadan SONRA uygulanan sert tavanlar. Hangisi önce
+  # bağlarsa o geçerli; hiçbiri pozisyonu büyütemez, sadece kısar.
+  # 0 = o tavan kapalı.
+  max_position_notional: 0.0    # tek pozisyonda maks tutar (USDT). 0 = sınırsız
+  max_position_pct: 0.40        # tek pozisyon equity'nin en fazla %40'ı
+  max_risk_amount: 0.0          # tek işlemde maks 1R (USDT). 0 = sınırsız
   max_leverage: 1.0            # KULLANICI SINIRI. Kod bunu asla kendiliğinden yükseltemez.
 
   # Sürekli risk bütçesi merdiveni. Hiçbir kademede "işlem yok" yok —
@@ -42,12 +57,21 @@ risk:
   # Mutlak zemin: bu düşüşten sonra YENİ giriş yok, mevcutlar yönetilmeye devam
   # eder. Durma değil dondurma — açık riski terk etmek daha kötü olurdu.
   freeze_drawdown: 0.50
+  # Yapısal alt sınır, tercih değil. Bu bakiyenin altında bot yeni pozisyon
+  # açmaz — çünkü açtıkları test edilen stratejinin küçültülmüş hali değil,
+  # evrenin daha sakin bir alt kümesi olur.
+  # scripts/capital_check.py ile ölçüldü: %0.75 risk + 5 USDT borsa minimumunda
+  # 183 kurulumların %95'ini, 306 ise %99'unu kapsıyor.
+  min_equity: 183.0
 
   # Üst üste zarar işlem yasağı değil, conviction eşiği yükselmesi.
   loss_streak_start: 3
   loss_streak_threshold_bump: 2.0
 
-  vol_target_annual: 0.35
+  # Evrenin kendi medyan volatilitesine yakın olmalı: ölçekleyici hedef/gerçek
+  # oranıyla çalışır, mutlak seviye dayatmaz. Ölçüm: 21 çiftin medyanı %79.
+  # Eski 0.35 (hisse portföyü değeri) ölçekleyiciyi tabanda kilitliyordu.
+  vol_target_annual: 0.80
   vol_lookback_bars: 30
   vol_scale_min: 0.4
   vol_scale_max: 2.0
@@ -61,6 +85,15 @@ conviction:
   scarcity_max_relief: 6.0
   min_voting_blocks: 3         # korelasyonlu indikatörler tek oy sayılır
   collapse_threshold: 32.0
+  # absolute = her sembol sabit eşiğe karşı; cross_sectional = semboller
+  # birbirine karşı sıralanır, üst dilim alınır (tail analizi bunu ölçtü).
+  # Ölçümle uyum: tail analizi kesitsel yapıldı (her barda semboller birbirine
+  # karşı sıralanıp üst desil alındı). Mutlak eşik farklı bir soru soruyordu ve
+  # ölçülebilir her eksende daha kötü: 63 işlem / PF 0.97 vs 116 / PF 1.34.
+  selection: cross_sectional
+  top_percentile: 0.9
+  min_universe_for_ranking: 8
+  rank_absolute_floor: 40.0
   component_weights:
     regime_fit: 25.0
     indicator_confluence: 25.0

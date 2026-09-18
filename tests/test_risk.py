@@ -326,3 +326,184 @@ def test_gate_lists_every_reason_it_refused(tmp_path):
         now=10 * 86_400_000,
     )
     assert len(status.failures) >= 5
+
+
+# --------------------------------------------------------------------------
+# Minimum viable capital
+# --------------------------------------------------------------------------
+
+
+def test_minimum_capital_accounts_for_volatility_scaling():
+    """Ignoring the volatility scaler makes the requirement look far too low.
+
+    Volatility targeting shrinks size on volatile symbols — exactly the ones
+    with the widest stops. The two effects compound, so the stop distribution
+    alone understates what the account has to support.
+    """
+    from tbot.core.config import load_config
+    from tbot.risk.capital import minimum_viable_equity
+
+    cfg = load_config("config/base.yaml")
+    stops = [0.05] * 50 + [0.15] * 50
+    scales = [1.5] * 50 + [0.4] * 50  # calm symbols scaled up, wild ones down
+
+    stops_only = minimum_viable_equity(cfg, stops, min_notional=5.0)
+    with_scales = minimum_viable_equity(cfg, stops, min_notional=5.0, vol_scales=scales)
+
+    assert with_scales.minimum_equity > stops_only.minimum_equity
+
+
+def test_minimum_capital_scales_inversely_with_risk_fraction():
+    """A larger risk fraction reaches wider stops, so the floor drops."""
+    from tbot.core.config import load_config
+    from tbot.risk.capital import minimum_viable_equity
+
+    stops = [0.03, 0.05, 0.08, 0.12, 0.20]
+
+    low = load_config("config/base.yaml")
+    low.risk.risk_per_trade = 0.005
+    high = load_config("config/base.yaml")
+    high.risk.risk_per_trade = 0.02
+
+    assert (
+        minimum_viable_equity(high, stops).minimum_equity
+        < minimum_viable_equity(low, stops).minimum_equity
+    )
+
+
+def test_comfortable_capital_exceeds_the_minimum():
+    from tbot.core.config import load_config
+    from tbot.risk.capital import minimum_viable_equity
+
+    result = minimum_viable_equity(load_config("config/base.yaml"), [0.02, 0.05, 0.09, 0.15, 0.30])
+    assert result.comfortable_equity >= result.minimum_equity
+
+
+def test_minimum_capital_handles_no_observations():
+    from tbot.core.config import load_config
+    from tbot.risk.capital import minimum_viable_equity
+
+    result = minimum_viable_equity(load_config("config/base.yaml"), [])
+    assert result.minimum_equity == 0.0
+    assert result.observed_stops == 0
+
+
+def test_shipped_min_equity_matches_the_measured_requirement():
+    """The config floor must not drift away from what the data says."""
+    from tbot.core.config import load_config
+
+    cfg = load_config("config/base.yaml")
+    # 183 was measured by scripts/capital_check.py for this universe at 0.75%
+    # risk. If risk_per_trade changes, the floor has to be re-measured.
+    assert cfg.risk.risk_per_trade == pytest.approx(0.0075)
+    assert cfg.risk.min_equity == pytest.approx(183.0)
+
+
+def test_starting_balance_is_not_used_as_a_live_constraint():
+    """starting_balance is a paper/backtest figure; live reads the venue."""
+    import inspect
+
+    from tbot.engine.runner import Runner
+
+    source = inspect.getsource(Runner._equity_now)
+    assert "fetch_balance" in source
+
+
+# --------------------------------------------------------------------------
+# Position size ceilings
+# --------------------------------------------------------------------------
+
+
+UNCONSTRAINED = MarketSpec(
+    symbol="X/USDT",
+    base="X",
+    quote="USDT",
+    min_notional=5.0,
+    min_amount=1e-9,
+    amount_step=1e-9,
+    price_step=1e-6,
+    maker_fee=0.001,
+    taker_fee=0.001,
+)
+
+
+def _size(config: RiskConfig, equity: float, stop_pct: float = 0.05):
+    return size_position(
+        equity=equity,
+        risk_amount=equity * config.risk_per_trade,
+        entry_price=100.0,
+        stop_price=100.0 * (1 - stop_pct),
+        spec=UNCONSTRAINED,
+        config=config,
+    )
+
+
+def test_percentage_ceiling_binds_on_tight_stops():
+    """A tight stop produces a large position even at a small risk fraction."""
+    uncapped = _size(RiskConfig(max_position_pct=0.0), equity=10_000, stop_pct=0.01)
+    capped = _size(RiskConfig(max_position_pct=0.40), equity=10_000, stop_pct=0.01)
+
+    assert uncapped.notional == pytest.approx(7_500, rel=1e-3)  # 75% of equity
+    assert capped.notional == pytest.approx(4_000, rel=1e-3)
+    assert capped.capped_by == "max_position_pct"
+
+
+def test_absolute_notional_ceiling_binds_as_the_account_grows():
+    config = RiskConfig(max_position_pct=0.0, max_position_notional=500.0)
+    assert _size(config, equity=1_000).notional < 500.0  # not yet binding
+    large = _size(config, equity=50_000)
+    assert large.notional == pytest.approx(500.0, rel=1e-3)
+    assert large.capped_by == "max_position_notional"
+
+
+def test_risk_amount_ceiling_caps_the_loss_not_the_exposure():
+    """The most direct ceiling: it bounds what a stop-out costs."""
+    config = RiskConfig(max_position_pct=0.0, max_risk_amount=50.0)
+    result = _size(config, equity=100_000, stop_pct=0.05)
+    assert result.risk_amount == pytest.approx(50.0, rel=1e-2)
+    assert result.capped_by == "max_risk_amount"
+
+
+def test_tightest_ceiling_wins():
+    config = RiskConfig(max_position_pct=0.40, max_position_notional=500.0, max_risk_amount=50.0)
+    result = _size(config, equity=50_000, stop_pct=0.05)
+    assert result.notional == pytest.approx(500.0, rel=1e-3)
+    assert result.capped_by == "max_position_notional"
+
+
+def test_ceilings_can_only_shrink_never_grow():
+    """A ceiling above the natural size must leave the position untouched."""
+    natural = _size(RiskConfig(max_position_pct=0.0), equity=1_000)
+    generous = _size(
+        RiskConfig(max_position_pct=0.0, max_position_notional=1_000_000.0), equity=1_000
+    )
+    assert generous.notional == pytest.approx(natural.notional)
+    assert generous.capped_by == ""
+
+
+def test_zero_disables_an_individual_ceiling():
+    config = RiskConfig(max_position_pct=0.0, max_position_notional=0.0, max_risk_amount=0.0)
+    result = _size(config, equity=100_000, stop_pct=0.01)
+    # Only the portfolio exposure ceiling remains.
+    assert result.capped_by in ("", "portfolio_exposure")
+
+
+def test_capping_preserves_the_risk_relationship():
+    """After capping, risk_amount must still equal quantity x stop distance.
+
+    Otherwise every R figure downstream would be measured in a unit that
+    silently changed when a ceiling bound.
+    """
+    config = RiskConfig(max_position_pct=0.20)
+    result = _size(config, equity=10_000, stop_pct=0.01)
+    assert result.risk_amount == pytest.approx(result.quantity * result.stop_distance)
+    assert result.capped_by == "max_position_pct"
+
+
+def test_shipped_defaults_do_not_bind_a_small_account():
+    """The default ceilings must not silently shrink positions at the minimum balance."""
+    from tbot.core.config import load_config
+
+    cfg = load_config("config/base.yaml")
+    result = _size(cfg.risk, equity=cfg.risk.min_equity, stop_pct=0.05)
+    assert result.capped_by == ""

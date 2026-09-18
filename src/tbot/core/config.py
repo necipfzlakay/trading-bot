@@ -133,6 +133,25 @@ class RiskConfig(BaseModel):
     max_correlation: float = Field(default=0.85, gt=0, le=1.0)
     max_portfolio_exposure: float = Field(default=1.0, gt=0, le=2.0)
 
+    # --- position size ceilings -------------------------------------------
+    # Percentage-of-equity sizing scales without limit: at 0.75% risk, 1R is
+    # 1.50 on a 200 account and 375 on a 50,000 one. That is arithmetically
+    # consistent and operationally unwise — a strategy validated on small
+    # positions has not been validated on ones large enough to move a thin
+    # book, and confidence should not scale as fast as the balance does.
+    #
+    # These are hard ceilings applied after sizing. Whichever binds first wins;
+    # none of them can ever increase a position, only cap it. Set to 0 to
+    # disable an individual ceiling.
+
+    # Largest notional a single position may hold, in quote currency.
+    max_position_notional: float = Field(default=0.0, ge=0.0)
+    # Largest share of equity a single position may hold.
+    max_position_pct: float = Field(default=0.40, ge=0.0, le=1.0)
+    # Largest 1R a single trade may risk, in quote currency. The most direct
+    # ceiling: it caps the loss, not the exposure.
+    max_risk_amount: float = Field(default=0.0, ge=0.0)
+
     # User-owned hard cap. The promotion gate may never exceed it, and code may
     # never raise it on its own.
     max_leverage: float = Field(default=1.0, ge=1.0, le=2.0)
@@ -157,12 +176,35 @@ class RiskConfig(BaseModel):
     # different from abandoning open risk. Set to 1.0 to disable.
     freeze_drawdown: float = Field(default=0.50, gt=0.0, le=1.0)
 
+    # Below this balance the bot stops opening positions. Not a preference —
+    # a structural limit measured by scripts/capital_check.py.
+    #
+    # An account can only express stops wider than
+    # (risk_amount x vol_scale) / min_notional. Below the limit the bot does not
+    # trade a smaller version of the tested strategy; it trades a quieter subset
+    # of the universe, because wide-stop and high-volatility setups are silently
+    # skipped. The backtest that justified it does not describe that subset.
+    #
+    # Measured for this universe at 0.75% risk and a 5 USDT venue minimum:
+    # 183 covers 95% of setups, 306 covers 99%. Re-measure after changing
+    # risk_per_trade, the universe, or the stop multiple.
+    min_equity: float = Field(default=183.0, ge=0.0)
+
     # Consecutive losses raise the conviction bar; they never ban trading.
     loss_streak_threshold_bump: float = Field(default=2.0, ge=0.0, le=20.0)
     loss_streak_start: int = Field(default=3, ge=1)
 
     # Volatility targeting: normalise each position to the same portfolio risk.
-    vol_target_annual: float = Field(default=0.35, gt=0, le=3.0)
+    #
+    # This must sit near the universe's *own* median volatility, because the
+    # scaler works on the ratio target/realised — its job is to size a calm
+    # symbol up and a wild one down relative to normal, not to impose an
+    # absolute level. Measured across 21 Bybit spot pairs the median annualised
+    # volatility is 79%; the previous 0.35 (an equity-portfolio figure) pinned
+    # the scaler at its floor and quietly opened every position at 40% of the
+    # intended size, which then fell below the exchange minimum. The mechanism
+    # was not conservative — it was inoperative.
+    vol_target_annual: float = Field(default=0.80, gt=0, le=3.0)
     vol_lookback_bars: int = Field(default=30, ge=5)
     vol_scale_min: float = Field(default=0.4, gt=0, le=1.0)
     vol_scale_max: float = Field(default=2.0, ge=1.0, le=5.0)
@@ -222,6 +264,17 @@ class ConvictionConfig(BaseModel):
     min_voting_blocks: int = Field(default=3, ge=1)
     # Exit when conviction decays this far below the entry threshold.
     collapse_threshold: float = Field(default=35.0, ge=0, le=100)
+
+    # How a candidate qualifies. "absolute" compares each symbol to
+    # base_threshold; "cross_sectional" ranks symbols against each other and
+    # takes the top slice — which is what the tail analysis actually measured.
+    # An absolute bar produces feast and famine; a relative one keeps the
+    # opportunity count roughly constant and the sample measurable.
+    selection: Literal["absolute", "cross_sectional"] = "cross_sectional"
+    top_percentile: float = Field(default=0.9, gt=0.5, lt=1.0)
+    min_universe_for_ranking: int = Field(default=8, ge=3)
+    # A relative rank still needs a floor: best-of-a-bad-bunch is not a signal.
+    rank_absolute_floor: float = Field(default=40.0, ge=0, le=100)
 
     @model_validator(mode="after")
     def _threshold_sane(self) -> ConvictionConfig:

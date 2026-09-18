@@ -1,0 +1,14 @@
+# Kesitsel seçim: semboller birbirine karşı sıralanır, üst dilim alınır.
+# Tail analizi tam olarak bunu ölçmüştü; motor ise mutlak eşik kullanıyordu.
+# Bu profil o uyumsuzluğu kapatır.
+#
+# starting_balance 1000: $100'da min_notional adayların %97.5'ini kesiyor,
+# yani orada ölçülen şey strateji değil sermaye kısıtı olur.
+extends: base.yaml
+starting_balance: 1000.0
+
+conviction:
+  selection: cross_sectional
+  top_percentile: 0.9        # üst %10 — tail analizinin kullandığı kesim
+  min_universe_for_ranking: 8
+  rank_absolute_floor: 40.0  # göreli sıralama da bir tabana muhtaç

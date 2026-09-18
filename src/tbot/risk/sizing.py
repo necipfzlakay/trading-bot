@@ -29,14 +29,25 @@ from tbot.core.models import MarketSpec, NoTradeReason, Side
 log = get_logger("risk.sizing")
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class SizingResult:
+    """Sizing outcome.
+
+    Keyword-only on purpose: fields get inserted here as the risk layer grows,
+    and positional construction would silently rebind arguments to the wrong
+    field. That is exactly what happened once — a rejection reason landed in
+    ``capped_by`` and the caller's error message vanished.
+    """
+
     quantity: float
     notional: float
     risk_amount: float
     stop_distance: float
     vol_scale: float
     rejected: NoTradeReason | None = None
+    # Which ceiling bound the size, empty if none did. Surfaced so a position
+    # that is smaller than intended is visible rather than mysterious.
+    capped_by: str = ""
     detail: str = ""
 
     @property
@@ -87,7 +98,15 @@ def size_position(
     """
     stop_distance = abs(entry_price - stop_price)
     if stop_distance <= 0:
-        return SizingResult(0, 0, 0, 0, 1.0, NoTradeReason.BELOW_THRESHOLD, "zero stop distance")
+        return SizingResult(
+            quantity=0.0,
+            notional=0.0,
+            risk_amount=0.0,
+            stop_distance=0.0,
+            vol_scale=1.0,
+            rejected=NoTradeReason.BELOW_THRESHOLD,
+            detail="zero stop distance",
+        )
 
     vol_scale = 1.0
     if recent_returns is not None:
@@ -107,34 +126,58 @@ def size_position(
         quantity = math.floor(quantity / spec.amount_step) * spec.amount_step
 
     notional = quantity * entry_price
-    max_notional = equity * config.max_portfolio_exposure * leverage
-    if notional > max_notional:
-        quantity = max_notional / entry_price
+
+    # Ceilings, tightest wins. Each can only shrink a position, never grow one,
+    # so the order they are applied in does not matter.
+    ceilings: dict[str, float] = {
+        "portfolio_exposure": equity * config.max_portfolio_exposure * leverage
+    }
+    if config.max_position_pct > 0:
+        ceilings["max_position_pct"] = equity * config.max_position_pct * leverage
+    if config.max_position_notional > 0:
+        ceilings["max_position_notional"] = config.max_position_notional
+    if config.max_risk_amount > 0 and stop_distance > 0:
+        # A risk ceiling is a notional ceiling once the stop is known.
+        ceilings["max_risk_amount"] = config.max_risk_amount * entry_price / stop_distance
+
+    binding = min(ceilings, key=lambda name: ceilings[name])
+    cap = ceilings[binding]
+
+    capped_by = ""
+    if notional > cap:
+        capped_by = binding
+        quantity = cap / entry_price
         if spec.amount_step > 0:
             quantity = math.floor(quantity / spec.amount_step) * spec.amount_step
         notional = quantity * entry_price
         effective_risk = quantity * stop_distance
+        log.debug(
+            "position_capped",
+            ceiling=binding,
+            cap=round(cap, 2),
+            notional=round(notional, 2),
+        )
 
     if available_cash is not None and notional > available_cash * leverage:
         return SizingResult(
-            0,
-            notional,
-            effective_risk,
-            stop_distance,
-            vol_scale,
-            NoTradeReason.INSUFFICIENT_BALANCE,
-            f"needs {notional:.2f}, cash {available_cash:.2f}",
+            quantity=0.0,
+            notional=notional,
+            risk_amount=effective_risk,
+            stop_distance=stop_distance,
+            vol_scale=vol_scale,
+            rejected=NoTradeReason.INSUFFICIENT_BALANCE,
+            detail=f"needs {notional:.2f}, cash {available_cash:.2f}",
         )
 
     if quantity < spec.min_amount or quantity <= 0:
         return SizingResult(
-            0,
-            notional,
-            effective_risk,
-            stop_distance,
-            vol_scale,
-            NoTradeReason.MIN_NOTIONAL,
-            f"qty {quantity:.8f} below exchange minimum {spec.min_amount:.8f}",
+            quantity=0.0,
+            notional=notional,
+            risk_amount=effective_risk,
+            stop_distance=stop_distance,
+            vol_scale=vol_scale,
+            rejected=NoTradeReason.MIN_NOTIONAL,
+            detail=f"qty {quantity:.8f} below exchange minimum {spec.min_amount:.8f}",
         )
 
     required = spec.min_notional * min_notional_buffer if spec.min_notional else 0.0
@@ -142,15 +185,19 @@ def size_position(
         # Bumping the size to clear the minimum would multiply the intended
         # risk. Skipping the trade is the only option that keeps 1R meaning 1R.
         return SizingResult(
-            0,
-            notional,
-            effective_risk,
-            stop_distance,
-            vol_scale,
-            NoTradeReason.MIN_NOTIONAL,
-            f"notional {notional:.2f} below minimum {required:.2f} "
+            quantity=0.0,
+            notional=notional,
+            risk_amount=effective_risk,
+            stop_distance=stop_distance,
+            vol_scale=vol_scale,
+            rejected=NoTradeReason.MIN_NOTIONAL,
+            detail=f"notional {notional:.2f} below minimum {required:.2f} "
             f"(risk-correct size is too small for this venue)",
         )
+
+    detail = f"vol_scale={vol_scale:.2f} risk={quantity * stop_distance:.4f}"
+    if capped_by:
+        detail += f" capped_by={capped_by}"
 
     return SizingResult(
         quantity=quantity,
@@ -158,7 +205,8 @@ def size_position(
         risk_amount=quantity * stop_distance,
         stop_distance=stop_distance,
         vol_scale=vol_scale,
-        detail=f"vol_scale={vol_scale:.2f} risk={quantity * stop_distance:.4f}",
+        capped_by=capped_by,
+        detail=detail,
     )
 
 

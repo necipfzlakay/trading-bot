@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from tbot.core.config import Config
 from tbot.core.logging import get_logger
 
@@ -73,6 +75,93 @@ def diagnose(config: Config, equity: float, min_notional: float = 5.0) -> Capita
         max_stop_pct=max_stop_pct,
         usable=usable,
         note=note,
+    )
+
+
+@dataclass(slots=True)
+class MinimumCapital:
+    """Smallest balance at which the system trades the strategy it was tested on."""
+
+    coverage_target: float
+    required_stop_pct: float
+    minimum_equity: float
+    comfortable_equity: float
+    min_notional: float
+    risk_per_trade: float
+    observed_stops: int
+
+    def summary(self) -> str:
+        return (
+            f"minimum {self.minimum_equity:.0f}, comfortable {self.comfortable_equity:.0f} "
+            f"(covers {self.coverage_target:.0%} of setups at {self.risk_per_trade:.2%} risk)"
+        )
+
+
+def minimum_viable_equity(
+    config: Config,
+    stop_distributions: list[float],
+    min_notional: float = 5.0,
+    coverage: float = 0.95,
+    comfortable_coverage: float = 0.99,
+    vol_scales: list[float] | None = None,
+) -> MinimumCapital:
+    """Smallest account that can size the strategy the backtest measured.
+
+    Derived from the universe's own distributions rather than assumed. The chain
+    is fixed by arithmetic:
+
+        risk_amount = equity x risk_per_trade x vol_scale
+        quantity    = risk_amount / stop_distance
+        notional    = quantity x price = risk_amount / stop_pct
+
+    and the venue rejects anything below ``min_notional``.
+
+    ``vol_scales`` matters more than it looks, and omitting it makes this
+    answer optimistic. Volatility targeting shrinks position size on volatile
+    symbols — precisely the symbols that also carry the widest stops. The two
+    effects push the same way and compound: a symbol at 200% annualised
+    volatility gets both a wide stop *and* a 0.4x size multiplier, so its
+    notional is roughly a fifth of what stop distance alone would suggest.
+
+    Pass the observed (stop, scale) pairs to get the real requirement. Without
+    them this returns the stop-only figure, which is a floor rather than an
+    estimate.
+
+    Below the returned minimum the bot does not simply trade smaller — it trades
+    a *different, quieter subset* of the universe, because wide-stop and
+    high-volatility setups are silently skipped. That is not a scaled-down
+    version of the tested strategy; it is a different one, and its backtest does
+    not apply to it.
+    """
+    if not stop_distributions:
+        return MinimumCapital(coverage, 0.0, 0.0, 0.0, min_notional, config.risk.risk_per_trade, 0)
+
+    stops = np.asarray(stop_distributions, dtype="float64")
+    valid = np.isfinite(stops) & (stops > 0)
+
+    if vol_scales is not None and len(vol_scales) == len(stops):
+        scales = np.asarray(vol_scales, dtype="float64")
+        valid &= np.isfinite(scales) & (scales > 0)
+        stops, scales = stops[valid], scales[valid]
+        # Effective requirement per observation, accounting for both effects.
+        effective = stops / scales
+    else:
+        stops = stops[valid]
+        effective = stops
+
+    required = min_notional * config.execution.min_notional_buffer
+
+    def equity_for(quantile: float) -> float:
+        return required * float(np.quantile(effective, quantile)) / config.risk.risk_per_trade
+
+    return MinimumCapital(
+        coverage_target=coverage,
+        required_stop_pct=float(np.quantile(stops, coverage)),
+        minimum_equity=equity_for(coverage),
+        comfortable_equity=equity_for(comfortable_coverage),
+        min_notional=required,
+        risk_per_trade=config.risk.risk_per_trade,
+        observed_stops=int(stops.size),
     )
 
 

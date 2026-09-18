@@ -1,0 +1,8 @@
+# Değerlendirme profili. $100'da min_notional adayların %97.5'ini kesiyor, yani
+# o seviyede ölçülen şey strateji değil sermaye kısıtı. Bu profil kısıtı
+# kaldırıp stratejinin kendisini ölçer.
+#
+# Bu, "$1000 ile işlem yapacağız" demek DEĞİL — hangi sonucun stratejiye,
+# hangisinin hesap büyüklüğüne ait olduğunu ayırmak için.
+extends: base.yaml
+starting_balance: 1000.0

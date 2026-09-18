@@ -99,7 +99,111 @@ tail -f runtime/logs/bot.jsonl
 open http://127.0.0.1:8787
 ```
 
-## 7. Gerçek para (Kapı 3 geçilmeden yapma)
+## 7. Ne kadar para gerekiyor?
+
+**Minimum $183, rahat $306.** Bu bir tercih değil, aritmetik — `scripts/capital_check.py`
+ile ölçüldü ve `risk.min_equity` olarak config'e yazıldı. Bu bakiyenin altında bot
+yeni pozisyon açmaz.
+
+Sebep: boyutlandırma zinciri sabit.
+
+```
+1R        = bakiye × risk_oranı × volatilite_ölçeği
+adet      = 1R / stop_mesafesi
+notional  = adet × fiyat = 1R / stop_yüzdesi
+```
+
+Borsa $5'in altını reddediyor. Ters çevir: bir hesap ancak
+`1R / $5.75` kadar geniş stop ifade edebilir.
+
+$100'da bu sınır %13. Kurulumların %84'ü geçer, **%16'sı sessizce atlanır** — ve
+atlananlar volatil olanlar. Yani bot test edilen stratejinin küçültülmüş halini
+değil, evrenin **daha sakin bir alt kümesini** işler. Backtest o alt kümeyi
+tarif etmiyor.
+
+| bakiye | 1R | en geniş stop | erişilen kurulum |
+|---|---|---|---|
+| $50 | $0.38 | %6.5 | %62 |
+| $100 | $0.75 | %13.0 | %84 |
+| $150 | $1.12 | %19.6 | %92 |
+| **$200** | $1.50 | %26.1 | **%96** |
+| **$300** | $2.25 | %39.1 | **%99** |
+| $500 | $3.75 | %65.2 | %100 |
+
+Risk oranını yükseltmek sınırı düşürür ama portföy riskini artırır:
+
+| risk/işlem | min bakiye | portföy riski (3 pozisyon) |
+|---|---|---|
+| %0.50 | $274 | %1.5 |
+| %0.75 | **$183** | %2.2 |
+| %1.00 | $137 | %3.0 |
+| %1.50 | $91 | %4.5 |
+| %2.00 | $69 | %6.0 |
+
+Değiştirirsen yeniden ölç:
+
+```
+.venv/bin/python scripts/capital_check.py --equity 250
+```
+
+> `starting_balance` config'te sadece paper ve backtest için. **Canlı modda
+> bakiye borsadan okunur**, config'teki değer kullanılmaz.
+
+## 7b. Pozisyon büyüklüğü tavanları
+
+Yüzde bazlı boyutlandırma sınırsız ölçekleniyor: %0.75 riskle 1R, $200 hesapta
+$1.50 iken $50.000'de $375 olur. Aritmetik tutarlı, operasyonel olarak akılsız —
+küçük pozisyonlarla doğrulanmış bir strateji, ince bir emir defterini oynatacak
+büyüklükte doğrulanmış değildir.
+
+`config/base.yaml` → `risk:` altında üç sert tavan. **Hiçbiri pozisyonu
+büyütemez, sadece kısar.** Hangisi önce bağlarsa o geçerli. `0` = kapalı.
+
+```yaml
+max_position_notional: 0.0    # tek pozisyonda maks USDT. 0 = sınırsız
+max_position_pct: 0.40        # tek pozisyon equity'nin en fazla %40'ı
+max_risk_amount: 0.0          # tek işlemde maks 1R (USDT). 0 = sınırsız
+```
+
+Ne zaman hangisi bağlar ($10.000 equity, %0.75 risk):
+
+| stop | tavansız pozisyon | equity payı | %40 tavanıyla |
+|---|---|---|---|
+| %1 | $7.500 | %75 | **$4.000** |
+| %2 | $3.750 | %38 | $3.750 |
+| %5 | $1.500 | %15 | $1.500 |
+
+Dar stop büyük pozisyon üretir — `max_position_pct` orada devreye giriyor.
+`max_position_notional` hesap büyüdükçe, `max_risk_amount` ise doğrudan tek
+işlemin kaybını sınırlar (en doğrudan tavan).
+
+Tavan bağladığında risk ilişkisi korunuyor: `1R = adet × stop_mesafesi` hâlâ
+doğru, sadece maruziyet kısılıyor. Kısılan pozisyon loglarda `capped_by` ile
+görünür — küçük açılan pozisyon gizemli olmaz.
+
+## 8. Komisyon nasıl çalışıyor
+
+Emir **gönderirken değil, dolduğunda** kesiliyor. İptal edilen veya hiç dolmayan
+emir sıfır maliyet.
+
+```
+ALIŞ   $100 × %0.10 = $0.100
+SATIŞ  $105 × %0.10 = $0.105   ← çıkış değeri üzerinden
+                      ────────
+       gidiş-dönüş   $0.205 = pozisyonun %0.205'i
+```
+
+Bybit spot'ta maker = taker = %0.1. Satış tarafı çıkış değerinden kesildiği için
+kazandıkça komisyon da büyüyor.
+
+Ek gizli maliyet **spread** — market emri karşı taraftan alır. Evrende ölçüldü:
+medyan 1 bps, en kötü 8 bps. İhmal edilebilir.
+
+Sistem toplam 30 bps varsayıyor (komisyon 20 + kayma 10); gerçek ~21-28 bps.
+Muhafazakâr taraf, doğrusu bu. Canlıda gerçek kayma ölçülüyor
+(`execution/safety.py`) ve varsayımı aşarsa uyarıyor.
+
+## 9. Gerçek para (Kapı 3 geçilmeden yapma)
 
 `config/live.yaml` kullanır ve ek olarak environment değişkeni ister:
 

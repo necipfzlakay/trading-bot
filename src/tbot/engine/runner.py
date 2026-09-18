@@ -284,7 +284,31 @@ class Runner:
         self._drain_paper_fills(frames, bar_ts)
         self._manage_positions(frames, bar_ts)
         scans = self._scan(frames, bar_ts)
-        if self.risk.frozen:
+        if self.state.equity < self.config.risk.min_equity:
+            if self.state.status != "below_min_equity":
+                self.state.status = "below_min_equity"
+                log.error(
+                    "below_minimum_equity",
+                    equity=round(self.state.equity, 2),
+                    minimum=self.config.risk.min_equity,
+                    action="no new entries; open positions still managed",
+                    reason="wide-stop setups cannot be sized, so the bot would "
+                    "silently trade a different universe than the one tested",
+                )
+                self.db.record_event(
+                    "below_min_equity",
+                    f"equity {self.state.equity:.2f} < minimum {self.config.risk.min_equity:.2f}",
+                    level="error",
+                )
+                if self.notifier:
+                    self.notifier.notify_error(
+                        "Below minimum equity",
+                        f"{self.state.equity:.2f} < {self.config.risk.min_equity:.2f}. "
+                        f"No new entries — below this the bot would trade a quieter "
+                        f"subset of the universe than the one it was tested on. "
+                        f"Open positions are still managed.",
+                    )
+        elif self.risk.frozen:
             if self.state.status != "frozen":
                 self.state.status = "frozen"
                 log.error(

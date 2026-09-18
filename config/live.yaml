@@ -3,7 +3,8 @@
 extends: base.yaml
 mode: live
 venue: bybit-live
-starting_balance: 100.0
+# Canlı: starting_balance yok sayılır, bakiye borsadan okunur.
+starting_balance: 1000.0
 
 risk:
   # İlk ay boyunca boyut yarıya kısılmış halde koşulur.

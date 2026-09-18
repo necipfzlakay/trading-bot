@@ -6,17 +6,26 @@ Tasarım ilkesi tek cümlede: **yanılmak kârlı görünmesin.** Sistem bir str
 kabul etmeye değil, reddetmeye ayarlı. Şu anda kendi stratejisini reddediyor
 (aşağıya bakın) — bu bir arıza değil, çalıştığının kanıtı.
 
+## Hızlı başlangıç
+
 ```bash
-.venv/bin/python -m pytest -q              # 319 test
-.venv/bin/python scripts/backfill.py       # veri
-.venv/bin/python scripts/ic_report.py      # hangi indikatör işe yarıyor
-.venv/bin/python scripts/backtest.py       # backtest + rapor
-.venv/bin/python scripts/cpcv_report.py    # Kapı 1 kararı
-.venv/bin/python scripts/run.py --config config/paper.yaml
-.venv/bin/python scripts/dashboard.py      # http://127.0.0.1:8787
+.venv/bin/python -m pytest -q                            # 334 test
+.venv/bin/python scripts/backfill.py --with-derivatives  # veri (~15 dk, bir kez)
+.venv/bin/python scripts/ic_report.py --timeframe 1d     # indikatör ölçümü
+.venv/bin/python scripts/backtest.py                     # backtest
+.venv/bin/python scripts/run.py --config config/paper.yaml   # çalıştır
+.venv/bin/python scripts/dashboard.py                    # panel :8787
 ```
 
-Kurulum ve senin yapman gerekenler: **[SETUP.md](SETUP.md)**
+## Dokümanlar
+
+| | |
+|---|---|
+| **[docs/USAGE.md](docs/USAGE.md)** | **Nasıl çalıştırılır ve kullanılır** — sıfırdan günlük takibe |
+| [SETUP.md](SETUP.md) | API anahtarları, Telegram, gereken sermaye, komisyon |
+| [docs/INDICATORS.md](docs/INDICATORS.md) | 22 indikatör: ne ölçüyorlar, hangisi işe yaradı |
+| [CLAUDE.md](CLAUDE.md) | Mimari, değişmez kurallar, denetim geçmişi |
+| [research/hypotheses.md](research/hypotheses.md) | Denenen/denenecek hipotezler + deneme sayacı |
 Mimari, değişmez kurallar, ölçüm bulguları: **[CLAUDE.md](CLAUDE.md)**
 
 ## Neyi farklı yapıyor
@@ -39,6 +48,12 @@ mevcutlar yönetilmeye devam eder.
 taşıyamaz. Sınır kodda: veto rolünün yanıt şemasında `side`/`size`/`entry` alanı
 yok, yani "al" cümlesi temsil edilemez. Her veto karşı-olgusal ölçülüyor;
 faydası gösterilemeyen rol kapatılır.
+
+## Gereken sermaye
+
+**Minimum $183, rahat $306** — ölçüldü, varsayılmadı (`scripts/capital_check.py`).
+Altında bot test edilen stratejiyi küçültmez; evrenin daha sakin bir alt kümesini
+işler ve backtest o alt kümeyi tarif etmez. `risk.min_equity` bunu zorluyor.
 
 ## Şu anki durum: Kapı 1 geçilmedi
 

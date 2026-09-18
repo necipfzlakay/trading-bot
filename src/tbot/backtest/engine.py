@@ -21,6 +21,7 @@ Three structural guarantees, each with a test that fails if it breaks:
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -48,6 +49,7 @@ from tbot.risk.budget import RiskBudget
 from tbot.risk.sizing import correlation_conflict, size_position
 from tbot.strategy.conviction import ConvictionEngine, ScoringContext
 from tbot.strategy.exits import ExitManager
+from tbot.strategy.ranking import CrossSectionalRanker
 from tbot.strategy.regime import classify_series
 from tbot.strategy.setups import DEFAULT_SETUPS, detect_all
 
@@ -84,6 +86,10 @@ class BacktestResult:
     scans: list[ScanRow] = field(default_factory=list)
     config_summary: dict = field(default_factory=dict)
     bars_processed: int = 0
+    # Where entry candidates are lost, stage by stage. A strategy producing too
+    # few trades to measure is a solvable problem only once you know which gate
+    # is doing the filtering.
+    funnel: dict = field(default_factory=dict)
 
     @property
     def trades(self):
@@ -112,6 +118,12 @@ class Backtester:
         )
         self.exits = ExitManager(config.exits, edge_decay_bars)
         self.risk = RiskBudget(config.risk)
+        self._funnel: Counter = Counter()
+        self.ranker = CrossSectionalRanker(
+            top_percentile=config.conviction.top_percentile,
+            min_universe=config.conviction.min_universe_for_ranking,
+            min_absolute_score=config.conviction.rank_absolute_floor,
+        )
 
     # -- preparation -------------------------------------------------------
 
@@ -291,16 +303,17 @@ class Backtester:
                     continue
                 self._manage_position(portfolio, broker, d, idx, bar_ts)
 
-            # -- scan for new entries
-            candidates = []
+            # -- scan every symbol, then decide which qualify
+            bar_rows: list[tuple[ScanRow, SymbolData, int]] = []
             for symbol, d in data.items():
                 idx = cursors[symbol]
                 if idx >= len(d.frame) or d.frame["ts"].iloc[idx] != bar_ts:
                     continue
                 row = self._scan_symbol(portfolio, d, idx, bar_ts, correlations)
-                scans.append(row)
-                if row.no_trade_reason is None:
-                    candidates.append((row.score, symbol, d, idx))
+                bar_rows.append((row, d, idx))
+
+            candidates = self._qualify(bar_rows)
+            scans.extend(row for row, _, _ in bar_rows)
 
             # -- the highest-scoring candidate wins; others wait for next bar
             candidates.sort(key=lambda c: -c[0])
@@ -322,6 +335,7 @@ class Backtester:
             portfolio=portfolio,
             scans=scans,
             bars_processed=bars,
+            funnel=dict(self._funnel),
             config_summary={
                 "symbols": len(data),
                 "timeframes": self.config.timeframes.all,
@@ -374,6 +388,49 @@ class Backtester:
                 if pd.notna(value):
                     out[(a, b) if a < b else (b, a)] = float(value)
         return out
+
+    def _qualify(
+        self, bar_rows: list[tuple[ScanRow, SymbolData, int]]
+    ) -> list[tuple[float, str, SymbolData, int]]:
+        """Decide which scanned symbols may be entered on this bar.
+
+        Two modes, because the measurement and the implementation disagreed.
+        ``absolute`` compares each symbol to a fixed threshold, which is what the
+        engine originally did. ``cross_sectional`` ranks symbols against each
+        other and takes the top slice — which is what the tail analysis that
+        justified the strategy actually measured.
+        """
+        if self.config.conviction.selection == "absolute":
+            return [
+                (row.score, row.symbol, d, idx)
+                for row, d, idx in bar_rows
+                if row.no_trade_reason is None
+            ]
+
+        # Rank only symbols that cleared the structural gates (regime, position
+        # limits, correlation). Ranking a symbol the portfolio cannot take would
+        # waste a slot in the top slice on something ineligible.
+        open_rows = {
+            row.symbol: (row, d, idx)
+            for row, d, idx in bar_rows
+            if row.no_trade_reason in (None, NoTradeReason.BELOW_THRESHOLD)
+        }
+        if not open_rows:
+            return []
+
+        ranked = self.ranker.rank({s: r[0].score for s, r in open_rows.items()})
+        selected = []
+
+        for candidate in ranked:
+            row, d, idx = open_rows[candidate.symbol]
+            if candidate.eligible:
+                row.no_trade_reason = None
+                selected.append((candidate.score, candidate.symbol, d, idx))
+            elif row.no_trade_reason is None:
+                # Passed the absolute bar but not the relative one.
+                row.no_trade_reason = NoTradeReason.BELOW_THRESHOLD
+
+        return selected
 
     def _scan_symbol(
         self,
@@ -446,6 +503,7 @@ class Backtester:
             history, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
         )
         if not candidates:
+            self._funnel["no_setup_at_entry"] += 1
             return False
 
         candidate = candidates[0]
@@ -454,6 +512,7 @@ class Backtester:
         # relative to the price we will actually pay.
         stop = price - (candidate.entry_price - candidate.stop_price)
         if stop >= price:
+            self._funnel["stop_above_price"] += 1
             return False
 
         returns = d.frame["close"].pct_change().iloc[max(0, idx - 30) : idx + 1].dropna().to_numpy()
@@ -471,6 +530,8 @@ class Backtester:
             min_notional_buffer=self.config.execution.min_notional_buffer,
         )
         if not sizing.ok:
+            reason = sizing.rejected.value if sizing.rejected else "unknown"
+            self._funnel[f"sizing:{reason}"] += 1
             return False
 
         order = broker.build_order(
@@ -491,6 +552,7 @@ class Backtester:
             "risk_amount": sizing.risk_amount,
         }
         broker.submit(order)
+        self._funnel["entered"] += 1
         return True
 
     def _apply_fill(
