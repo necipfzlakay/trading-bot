@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 386 test
+.venv/bin/python -m pytest -q             # 389 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -126,6 +126,17 @@ testi oku — hepsinin kendini koruyan bir testi var.
     portföy yanlış, equity yanlış, slot boşa kilitli, ve sonraki barda olmayan
     pozisyon için ikinci satış. İki okuma şart — tek okuma kanıt değil.
     → `_detect_venue_exits`
+48. **Engellenmiş skor ile düşük skor aynı şey değildir.** `_blocking_reason`
+    skorlamadan önce kısa devre yapar, `total=0.0` hesaplanmadığı içindir —
+    "fikrim yok" (değişmez 10). Ama `below_threshold` skorlamadan *sonra*
+    atanır: gerçek bir sayıdır, sadece giriş barını geçmemiştir. İkisini bir
+    tutmak, conviction-çöküş çıkışının okuması gereken bütün skorları atar.
+    → `UNSCORED_REASONS`
+49. **Kendi tamirimin ölçümü de A/B ister.** "Ölü kodu canlandırdım, sonuç
+    düzeldi" iki ayrı iddiadır ve ikincisi ayrıca kanıt gerektirir. Bir kez
+    atlandı: tamir no-op çıktı, iyileşme arşiv büyümesindendi. Ölçüm için bot
+    **durdurulur** ve `--to <tarih>` ile pinlenir.
+
 46. **Bekleme döngüsü niyeti değil geçen süreyi ölçer.** Zaman aşımları
     `time.monotonic()` ile karşılaştırılır, adım adım toplanmaz. Toplayan sürüm
     döngü içindeki işi görmüyordu: Telegram `getUpdates` bu makineden 3-8 saniye
@@ -194,7 +205,7 @@ Bunların hiçbiri teste takılmamıştı; üçü de gerçek Bybit demo koşusun
 | 35 | **`_enter` beş yerden sessizce çıkıyordu** — tarama satırının sebebi hiç güncellenmiyordu, elenen sembol panelde `eligible` görünüyordu. "Neden işlem yapmadı" tablosunun tam olarak engellemek için var olduğu şey | yüksek | her red yolu `no_trade_reason` yazıyor; ulaşılmayan adaylar da işaretleniyor |
 | 36 | **`upsert_position` çakışmada giriş fiyatını güncellemiyordu.** Çakışma anahtarı `symbol`; aynı sembolde açılan **yeni** pozisyon eskisinin `entry_price`/`initial_stop`/`entry_ts`'ini miras alıyordu. R, MAE, MFE — hepsi başka bir işlemin girişine göre ölçülüyordu | kritik | tüm kimlik alanları güncelleniyor |
 | 37 | **Pozisyon `meta`'sı DB'den hiç geri yüklenmiyordu.** İçinde `stop_order_id` var: her restart'ta motor kendi koyduğu borsa stop'unun tutamağını kaybediyor, trailing ilerleyemiyordu. Ayrıca kendi stop'unu sonsuza kadar "orphan" diye raporluyordu | kritik | `meta` yükleniyor |
-| 40 | **Conviction-çöküş çıkışı hiç tetiklenmiyordu.** Belgelenen 4 katmanlı çıkış aslında 3 katmandı: `conviction_now=None` hem `runner.py:720` hem `backtest/engine.py:615` içinde sabit geçiliyordu. "Giriş sebebi öldü, stop'a kadar bekleme" mekanizması kapalıydı | yüksek | tutulan semboller için yeniden skorlanıyor; portföy-durumu engelleri nötrleniyor, engellenen skor **None** döner (değişmez 10 — sıfır her eşiğin altında olurdu ve her pozisyonu ilk barda kapatırdı) |
+| 40 | **Conviction-çöküş çıkışı hiç tetiklenmiyordu.** Belgelenen 4 katmanlı çıkış aslında 3 katmandı: `conviction_now=None` hem canlıda hem backtest'te sabit geçiliyordu | yüksek | **iki turda düzeltildi — bkz. #48.** İlk tamir işe yaramadı ve etkisi yanlış ölçüldü |
 | 39 | **`state.json` sadece bar kapanışında yazılıyordu.** Saatlik barda takılmış motor bekleyen motordan bir saat boyunca ayırt edilemiyordu; ölü-adam anahtarının eşiği de bu yüzden 90 dakikaya gevşetilmişti — yani yakalamak için var olduğu durumu 90 dakika boyunca kaçırıyordu, pozisyonlar o süre yönetilmeden | yüksek | bekleme döngüsünde 60s heartbeat; `healthcheck` eşiği 5400s → 600s |
 | 38 | Mutabakat borsada olmayan pozisyonu bellekten düşürüyor ama DB satırını bırakıyordu — her açılışta tekrar yükleniyor, tekrar düşürülüyor, tekrar uyarıyordu | orta | `delete_position` |
 | 34 | **Sıfırlama sonrası hayalet pozisyon.** `_resolve_duplicate` borsa geçmişindeki "Filled" emri benimsiyordu; ama o dolumun malı sıfırlamada satılmıştı. 1000 USDT'lik hesaba 1699 USDT'lik pozisyon yazıldı, nakit −699 oldu | kritik | dolumu benimsemeden önce envanter doğrulanıyor; yoksa bar atlanıyor |
@@ -219,6 +230,15 @@ Bu sonuncusu, bir saat önce eklediğim ölü-adam nabzının kendisi tarafında
 yakalandı: nabız 60 saniyede bir atacaktı, 110 saniyede atıyordu. Bir ölçüm
 aracı kurup ilk işinin kendi çatısındaki bir arızayı göstermesi, aracın doğru
 kurulduğunun kanıtı.
+
+| 47 | **#40'ın ilk tamiri no-op'tu ve etkisi yanlış atfedildi.** `conviction_now` bağlandı ama sonuç değişmedi — bot durdurulup sabit arşivle ölçülünce açık/kapalı **birebir aynı**. Sebep: tamirin içine koyduğum koruma, `no_trade_reason is not None` olan her skoru "fikrim yok" sayıyordu. Ama `below_threshold` engelleme değil, **gerçek bir skor** — ve çöken bir tez tanımı gereği eşiğin altındadır. Ölçüldü: 391 bar çöküş eşiğinin altında skorlandı, 391'i de atıldı | yüksek | `UNSCORED_REASONS`: yalnız *skorlanmadan* kısa devre yapan sebepler "fikrim yok" sayılır |
+| 48 | **Çalışır hale gelince conviction-çöküş çıkışı sonucu KÖTÜLEŞTİRDİ.** 24 çıkış üretti: PF 1.23 → 1.12, expectancy +0.179 → +0.100R, getiri +%5.75 → +%2.32, yakalama %8.7 → %5.6. Hâlâ çalışan kazananları kesiyor | — | `collapse_threshold: 0.0` (kapalı). Mekanizma doğru ve test edildi; **seviye onaylanmadı** |
+| 49 | **PF 1.20→1.41 ve PBO 1.00→0.33 iyileşmesi #40'a atfedilmişti. Yanlış atıf.** İki koşu arasında arşiv büyümüştü (bkz. #45) ve tamirin kendisi no-op'tu. Sayılar doğru — bugünkü sabit ölçüm de PBO 0.33 / 6'da 5 veriyor — ama **sebep A1 değildi** | orta | atıf CLAUDE.md ve `hypotheses.md`'de düzeltildi; A/B'ler artık bot **durdurularak** ve `--to` ile yapılıyor |
+
+Denetim #47 ve #49 birlikte bir ders: **kendi tamirimin ölçümüne en az başkasınınki
+kadar şüpheyle bakmalıyım.** #40'ı "canlandırdım" diye yazdım, sonuç iyi göründü,
+ve iyi görünen sonucu kimse soruşturmaz — tam olarak `hypotheses.md`'ye "iyileşen
+bir tamir daha fazla şüphe hak eder" diye yazdığım şeyi kendim yapmadım.
 
 ### Ölçülmüş borsa gerçekleri (2026-09-18, demo hesapta tek tek denendi)
 
@@ -368,18 +388,24 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 | kontrol | değer | |
 |---|---|---|
 | işlem ≥ 50 | 113 | ✅ |
-| profit factor ≥ 1.2 | 1.41 | ✅ |
+| profit factor ≥ 1.2 | 1.42 | ✅ |
 | maks düşüş ≤ %20 | %11.6 | ✅ |
 | DSR anlamlı | p=1.000 | ❌ |
 | CPCV yollarının çoğu pozitif | %55.6 | ✅ |
 | PBO ≤ 0.5 | 0.33 | ✅ |
 
-Altı kontrolden **beşi geçiyor**; kalan tek engel DSR. Conviction-çöküş çıkışının
-tamirinden sonra (bkz. denetim #40). DSR bu stratejiyle değil **deneme sayısıyla**
-ilgili — oradan çıkış ayar değil taze veri.
+Altı kontrolden **beşi geçiyor**; kalan tek engel DSR. `--trials 11`, bot
+durdurulmuş, tekrarlanabilir (iki ardışık koşu birebir aynı).
 
-Ölçüm `--trials 9` ile (10. deneme kurulu kırılım girişiydi ve **reddedildi**;
-aşağıya bakın). Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
+⚠️ **Bu iyileşme bir kod değişikliğine atfedilemez.** Önce denetim #40'ın tamirine
+bağlanmıştı; sabit ölçüm o tamirin no-op olduğunu gösterdi (#47, #49). PBO'nun
+1.00'den 0.33'e düşmesi arşivin büyümesiyle geldi — yani *daha fazla veri*, daha
+iyi kod değil. Bu, DSR'ın hâlâ neden reddettiğini de açıklıyor.
+
+DSR bu stratejiyle değil **deneme sayısıyla** ilgili — oradan çıkış ayar değil
+taze veri.
+
+Ölçüm `--trials 11` ile. Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
 deneme sayısını eksik saymak kapıyı geçirmeye yeten farkı üretiyor. Sayaç
 `research/hypotheses.md`'de ve `ops/pre-install.sh` oradan okuyor.
 
@@ -427,8 +453,8 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 10** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 10` geçirin — DSR her denemeyi fiyatlıyor.
+**Kümülatif deneme: 11** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 11` geçirin — DSR her denemeyi fiyatlıyor.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir

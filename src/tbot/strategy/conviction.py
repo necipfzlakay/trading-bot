@@ -52,6 +52,27 @@ from tbot.strategy.regime import regime_allows
 # a weak one — a signal of 0.05 is noise wearing a direction.
 MIN_SIGNAL_STRENGTH = 0.2
 
+# Reasons that short-circuit *before* any scoring happens. Their ``total`` is
+# 0.0 because nothing was computed, not because the evidence came out weak.
+#
+# The distinction is load-bearing for the conviction-collapse exit. That exit
+# asks "has this thesis died?", so it needs the number. A blocked verdict has
+# no number and must read as "no opinion" (invariant 10) — but ``below_threshold``
+# is *not* blocked: it is a real score that simply did not clear the entry bar.
+# Treating the two the same discards exactly the low scores the exit exists to
+# act on, and the layer silently never fires. Measured: 391 bars scored under
+# the collapse threshold and every one was thrown away as "unscored".
+UNSCORED_REASONS = frozenset(
+    {
+        NoTradeReason.STALE_DATA,
+        NoTradeReason.ALREADY_IN_POSITION,
+        NoTradeReason.MAX_POSITIONS,
+        NoTradeReason.LLM_EVENT_VETO,
+        NoTradeReason.REGIME_VETO,
+        NoTradeReason.CORRELATION_FULL,
+    }
+)
+
 
 @dataclass(slots=True)
 class ScoringContext:

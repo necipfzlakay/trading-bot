@@ -82,7 +82,7 @@ from tbot.risk.budget import RiskBudget
 from tbot.risk.capital import report as capital_report
 from tbot.risk.leverage import LeverageGate
 from tbot.risk.sizing import correlation_conflict, size_position
-from tbot.strategy.conviction import ConvictionEngine, ScoringContext
+from tbot.strategy.conviction import UNSCORED_REASONS, ConvictionEngine, ScoringContext
 from tbot.strategy.exits import ExitManager
 from tbot.strategy.regime import classify_series
 from tbot.strategy.setups import DEFAULT_SETUPS, detect_all
@@ -1123,8 +1123,11 @@ class Runner:
             log.warning("conviction_rescore_failed", symbol=symbol, error=str(exc)[:160])
             return None
 
-        # A blocked score is 0.0 and means "not scored", not "worthless".
-        if scored.no_trade_reason is not None:
+        # Only a *blocked* verdict is "no opinion". ``below_threshold`` is a
+        # real score that did not clear the entry bar — and a thesis that has
+        # collapsed is below the entry bar by definition, so discarding those
+        # was discarding the entire point of this method.
+        if scored.no_trade_reason in UNSCORED_REASONS:
             return None
         return scored.total
 

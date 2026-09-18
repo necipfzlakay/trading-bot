@@ -693,3 +693,65 @@ def test_a_slow_command_poll_does_not_starve_the_between_bar_check(make_runner, 
 
     assert counts["polls"] == 1, "the slow poll must not repeat within its interval"
     assert counts["checks"] >= 10, f"only {counts['checks']} exit checks in a 2s wait"
+
+
+def test_a_blocked_verdict_is_no_opinion_but_a_low_score_is_a_score():
+    """The distinction the conviction-collapse exit lives or dies on.
+
+    ``_blocking_reason`` short-circuits with ``total = 0.0`` — nothing was
+    computed. ``below_threshold`` is assigned *after* scoring — a real number
+    that did not clear the entry bar. Treating them alike discards every score
+    the collapse exit exists to read, because a collapsed thesis is below the
+    entry bar by definition. Measured: 391 bars scored under the threshold and
+    all 391 were thrown away as "unscored", so the layer never fired once.
+    """
+    from tbot.core.models import NoTradeReason
+    from tbot.strategy.conviction import UNSCORED_REASONS
+
+    assert NoTradeReason.BELOW_THRESHOLD not in UNSCORED_REASONS
+    for blocked in (
+        NoTradeReason.ALREADY_IN_POSITION,
+        NoTradeReason.MAX_POSITIONS,
+        NoTradeReason.STALE_DATA,
+        NoTradeReason.CORRELATION_FULL,
+        NoTradeReason.LLM_EVENT_VETO,
+        NoTradeReason.REGIME_VETO,
+    ):
+        assert blocked in UNSCORED_REASONS
+
+
+def test_collapse_exit_is_disabled_by_a_zero_threshold():
+    """Zero means off, explicitly — not by accident of score clipping.
+
+    Measured with it on at 32: 24 exits, PF 1.23 -> 1.12, expectancy
+    +0.179 -> +0.100R, capture 8.7% -> 5.6%. The mechanism is correct; the
+    level is not endorsed.
+    """
+    manager = ExitManager(ExitConfig())
+    decision = manager.evaluate(
+        _position(),
+        high=101.0,
+        low=99.0,
+        close=100.0,
+        atr=1.0,
+        entry_atr=1.0,
+        regime=Regime.TREND_UP,
+        conviction_now=0.0,  # as collapsed as a score can be
+        collapse_threshold=0.0,
+        )
+    assert not decision.should_exit
+
+    # And still fires when a level is genuinely configured.
+    armed = manager.evaluate(
+        _position(),
+        high=101.0,
+        low=99.0,
+        close=100.0,
+        atr=1.0,
+        entry_atr=1.0,
+        regime=Regime.TREND_UP,
+        conviction_now=10.0,
+        collapse_threshold=32.0,
+    )
+    assert armed.should_exit
+    assert armed.reason is ExitReason.CONVICTION_COLLAPSE

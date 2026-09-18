@@ -47,7 +47,7 @@ from tbot.indicators import ta
 from tbot.indicators.registry import compute_signals
 from tbot.risk.budget import RiskBudget
 from tbot.risk.sizing import correlation_conflict, size_position
-from tbot.strategy.conviction import ConvictionEngine, ScoringContext
+from tbot.strategy.conviction import UNSCORED_REASONS, ConvictionEngine, ScoringContext
 from tbot.strategy.exits import ExitManager
 from tbot.strategy.ranking import CrossSectionalRanker
 from tbot.strategy.regime import classify_series
@@ -813,7 +813,9 @@ class Backtester:
         except Exception:  # noqa: BLE001 — an exit check must never stop the replay
             return None
 
-        if scored.no_trade_reason is not None:
+        # See ``Runner._conviction_for_open``: only a blocked verdict is "no
+        # opinion". A low score is the signal this exit was built to read.
+        if scored.no_trade_reason in UNSCORED_REASONS:
             return None
         return scored.total
 

@@ -94,7 +94,16 @@ conviction:
   scarcity_bars: 72
   scarcity_max_relief: 6.0
   min_voting_blocks: 3 # korelasyonlu indikatörler tek oy sayılır
-  collapse_threshold: 32.0
+  # 0 disables the conviction-collapse exit. Measured, not assumed: the layer
+  # was dead for the life of the project (conviction_now was hard-coded None,
+  # then a guard discarded every score below the entry bar — which is every
+  # score a collapse produces). Once it genuinely fired it took 24 exits and
+  # made everything worse: PF 1.23 -> 1.12, expectancy +0.179 -> +0.100R,
+  # capture 8.7% -> 5.6%. It cuts winners that were still working.
+  #
+  # The mechanism is now correct and tested. The level is not endorsed. Turning
+  # it on again is a pre-registered hypothesis, not a config tweak.
+  collapse_threshold: 0.0
   # absolute = her sembol sabit eşiğe karşı; cross_sectional = semboller
   # birbirine karşı sıralanır, üst dilim alınır (tail analizi bunu ölçtü).
   # Ölçümle uyum: tail analizi kesitsel yapıldı (her barda semboller birbirine

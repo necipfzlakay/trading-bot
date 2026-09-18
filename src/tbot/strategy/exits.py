@@ -105,7 +105,14 @@ class ExitManager:
         # The entry reasons are gone even though price has not yet moved
         # against us. Exiting here is what stops a thesis-less position from
         # drifting into a full stop-out.
-        if conviction_now is not None and conviction_now < collapse_threshold:
+        # ``collapse_threshold <= 0`` disables the layer outright. Relying on
+        # "no score can be below zero" would work by accident; saying so is
+        # what lets the config comment be trusted.
+        if (
+            collapse_threshold > 0
+            and conviction_now is not None
+            and conviction_now < collapse_threshold
+        ):
             return ExitDecision(
                 True,
                 ExitReason.CONVICTION_COLLAPSE,

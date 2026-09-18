@@ -20,11 +20,12 @@ bir sonrakinin barını yükseltiyor.
 
 | 8 | Volatilite ölçekleyici çalışıyor | varsayım | **red — mekanizma hiç çalışmamış.** Hedef %35 (hisse portföyü değeri), evren medyanı %79. Ölçekleyici sürekli tabanda, her pozisyon niyetlenenin %44'ü. Düzeltildi (0.80) | 0 (tamir, deneme değil) |
 
-| 9 | Conviction-çöküş çıkışı canlıda ve backtest'te **hiç tetiklenmiyordu** (`conviction_now=None` sabit) | mimari denetim | **doğrulandı ve tamir edildi** — PF 1.20→1.41, expectancy +0.339→+0.364R, Sharpe 0.22→0.44, **PBO 1.00→0.33** | 0 (tamir, deneme değil) |
+| 9 | Conviction-çöküş çıkışı canlıda ve backtest'te **hiç tetiklenmiyordu** (`conviction_now=None` sabit) | mimari denetim | **doğrulandı; ilk tamir NO-OP çıktı, ikinci tamir çalıştı, sonuç REDDEDİLDİ** — aşağıya bakın | 1 |
+| 11 | Conviction-çöküş çıkışı (eşik 32) sonucu iyileştirir | belgelenen 4. katman | **test edildi, REDDEDİLDİ** — PF 1.23→1.12, expectancy +0.179→+0.100R, yakalama %8.7→%5.6. Kapatıldı (`collapse_threshold: 0.0`) | (yukarıdaki 1'e dahil) |
 
 | 10 | Kırılım seviyesine önceden kurulu emir bırakmak, bar kapanışını beklemekten iyidir | bar-arası körlük | **test edildi, REDDEDİLDİ** — sonuç iyi göründü ama 5 işlemden geliyor, 2'si %92'sini taşıyor. Mekanizma kuruldu, varsayılan **kapalı** | 1 |
 
-**Kümülatif deneme: 10.** Bir sonraki CPCV koşusunda `--trials 10` geçirin.
+**Kümülatif deneme: 11.** Bir sonraki CPCV koşusunda `--trials 11` geçirin.
 
 ## 10. deneme: kurulu kırılım girişi — neden reddedildi
 
@@ -96,24 +97,52 @@ Yine de ölçtüm: gate'leri `allowed`'a tabi kılmak PF 1.41 → 1.38, expectan
 +0.362 → +0.339R, getiri +11.31% → +10.76%. Hem gerekçe zayıf hem sonuç kötü.
 Geri alındı, gerekçe koda yazıldı.
 
-## Conviction-çöküş tamiri hakkında bir uyarı
+## Conviction-çöküş: üç aşamalı bir hata, ve benim kendi ölçümüme düşmem
 
-Bu tamir sonucu **iyileştirdi** — volatilite ölçekleyici tamirinin aksine, o kötüleştirmişti.
+Bu maddenin geçmişi, bu defterin var olma sebebinin en iyi örneği. **Üç ayrı hata,
+üçü de benim.**
 
-İyileşen bir tamir daha fazla şüphe hak eder, çünkü kimse hoş sürprizi soruşturmaz.
-Kayda geçen çekinceler:
+**1. İlk tamir no-op'tu.** `conviction_now=None` bağlandı, sonuç değişti sanıldı.
+Bot durdurulup sabit arşivle ölçülünce açık ile kapalı **birebir aynı** çıktı.
 
-1. **Temiz bir A/B değil.** İki koşu arasında arşiv büyüdü (al-tut +%194.9 → +%205.2),
-   yani farkın bir kısmı veriden geliyor olabilir. Temiz atıf için eski kodu aynı veriyle
-   koşturmak gerekirdi.
-2. **Bootstrap CI hâlâ sıfırı içeriyor:** [-0.096, +0.903]R. Yani expectancy'nin pozitif
-   olduğu istatistiksel olarak gösterilmiş değil.
-3. **Deneme sayılmama gerekçesi:** hiçbir parametre aranmadı. `collapse_threshold: 32.0`
-   config'te baştan beri duruyordu; yalnız kendisine geçirilen değer `None` olduğu için
-   dal hiç çalışmıyordu. Funding polaritesi ve vol-scaler tamirleriyle aynı kategori.
-4. **PBO 1.00 → 0.33 asıl haber.** Aşırı uyum sinyali büyük ölçüde kayboldu. Kalan tek
-   engel DSR ve DSR bu stratejiyle değil **deneme sayısıyla** ilgili — oradan çıkış hâlâ
-   taze veri.
+**2. Sebep, tamirin içine koyduğum korumaydı.** Değişmez kural 10'a uymak için
+`no_trade_reason is not None` olan her skoru "fikrim yok" saydım. Ama
+`below_threshold` bir engelleme değil — skorlamadan *sonra* atanan **gerçek bir
+sayı**. Ve çöken bir tez tanımı gereği giriş eşiğinin altındadır. Yani korumam,
+çıkışın okuması gereken skorların tam olarak hepsini atıyordu. Ölçüldü: **391 bar
+çöküş eşiğinin altında skorlandı, 391'i de atıldı.**
+
+**3. İyileşmeyi yanlış atfettim.** "PF 1.20→1.41, PBO 1.00→0.33" diye yazdım.
+İki koşu arasında arşiv büyümüştü ve tamir zaten çalışmıyordu. Sayılar bugün de
+doğru (sabit ölçüm PBO 0.33 veriyor) ama **sebep tamir değil, daha fazla veri**.
+
+Bu üçüncüsü en can sıkıcı olanı, çünkü bu dosyada zaten şu yazıyordu: *"iyileşen
+bir tamir daha fazla şüphe hak eder, çünkü kimse hoş sürprizi soruşturmaz."*
+Kendi yazdığım uyarıyı kendi tamirime uygulamadım. Kural artık koda bağlı
+(değişmez 49): ölçüm için bot durdurulur ve tarih pinlenir.
+
+### Katman düzgün çalışınca ne oldu
+
+Kötüleşti:
+
+| | çöküş ölü | çöküş canlı (32) |
+|---|---|---|
+| işlem | 103 | 116 |
+| profit factor | **1.23** | 1.12 |
+| expectancy | **+0.179R** | +0.100R |
+| getiri | **+%5.75** | +%2.32 |
+| Sharpe | **0.25** | 0.13 |
+| yakalama | **%8.7** | %5.6 |
+| çöküş çıkışı | 0 | 24 |
+
+24 çıkışın yaptığı şey, hâlâ çalışan pozisyonları kesmek. Ortalama tutuş 111 →
+87 bara düştü ve yakalama oranı da düştü — yani erken çıkmak kârı korumadı,
+azalttı.
+
+**Karar: mekanizma doğru ve test edildi, seviye onaylanmadı.**
+`collapse_threshold: 0.0`. Açmak ayar değil, ön-kayıtlı bir hipotez.
+
+Bootstrap CI zaten sıfırı içeriyor: [-0.244, +0.684]R.
 
 ## Ölçekleyici tamirinin bedeli
 
