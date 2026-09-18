@@ -1,0 +1,63 @@
+# tbot
+
+Otonom kripto al-sat botu. Bybit spot, sürekli tarama, yüksek seçicilik.
+
+Tasarım ilkesi tek cümlede: **yanılmak kârlı görünmesin.** Sistem bir stratejiyi
+kabul etmeye değil, reddetmeye ayarlı. Şu anda kendi stratejisini reddediyor
+(aşağıya bakın) — bu bir arıza değil, çalıştığının kanıtı.
+
+```bash
+.venv/bin/python -m pytest -q              # 319 test
+.venv/bin/python scripts/backfill.py       # veri
+.venv/bin/python scripts/ic_report.py      # hangi indikatör işe yarıyor
+.venv/bin/python scripts/backtest.py       # backtest + rapor
+.venv/bin/python scripts/cpcv_report.py    # Kapı 1 kararı
+.venv/bin/python scripts/run.py --config config/paper.yaml
+.venv/bin/python scripts/dashboard.py      # http://127.0.0.1:8787
+```
+
+Kurulum ve senin yapman gerekenler: **[SETUP.md](SETUP.md)**
+Mimari, değişmez kurallar, ölçüm bulguları: **[CLAUDE.md](CLAUDE.md)**
+
+## Neyi farklı yapıyor
+
+**İndikatör seçimi ölçülüyor, varsayılmıyor.** 22 indikatörün her biri
+Information Coefficient ve kuyruk (tail) analiziyle sınanıyor; geçemeyen ne
+kadar popüler olursa olsun oy veremiyor. Korelasyonu 0.8'i geçenler tek "oy
+bloğuna" düşüyor — ölçümde 7 indikatör tek bloğa indi, yani onları ayrı onay
+saymak 1 okumanın 7 kopyasına sahip olmak demekti.
+
+**Doğrulama peşin bir bara bağlı.** CPCV (purge + embargo ile yüzlerce
+out-of-sample yol), Deflated Sharpe (kaç deneme yapıldığını fiyatlar) ve PBO.
+Eşikler önceden sabit; sonucu kurtarmak için oynatılamaz.
+
+**Risk sürekli, ikili değil.** Düşüşte pozisyon küçülür ve conviction eşiği
+yükselir; bot susmaz. Sadece mutlak zeminde (%50 düşüş) yeni giriş durur,
+mevcutlar yönetilmeye devam eder.
+
+**LLM sadece risk azaltabilir.** Sinyal üretemez, boyut belirleyemez, stop
+taşıyamaz. Sınır kodda: veto rolünün yanıt şemasında `side`/`size`/`entry` alanı
+yok, yani "al" cümlesi temsil edilemez. Her veto karşı-olgusal ölçülüyor;
+faydası gösterilemeyen rol kapatılır.
+
+## Şu anki durum: Kapı 1 geçilmedi
+
+| kontrol | değer | |
+|---|---|---|
+| işlem ≥ 50 | 18 | ❌ |
+| profit factor ≥ 1.2 | ~1.0 | ❌ |
+| maks düşüş ≤ %20 | %4.2 | ✅ |
+| DSR anlamlı | p=0.51 | ❌ |
+| CPCV yollarının çoğu pozitif | %20 | ❌ |
+| PBO ≤ 0.5 | 1.00 | ❌ |
+
+Strateji **+%2.27**, BTC al-tut **+%192**.
+
+Altyapı tamamlandı ve çalışıyor. Strateji tamamlanmadı — açık hipotezler
+`research/hypotheses.md`'de, her biri denendiğinde `--trials` sayacına eklenmeli.
+
+## Lisans / sorumluluk
+
+Kişisel kullanım için yazıldı. Alım satım para kaybettirir; bu kod hiçbir şey
+garanti etmez. Gerçek paraya geçiş `TBOT_CONFIRM_LIVE=yes` gerektirir ve
+Kapı 1/2/3 ölçütleri rapor çıktısıyla karşılanmadan yapılmamalıdır.

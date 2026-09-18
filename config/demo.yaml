@@ -1,0 +1,5 @@
+# Bybit Demo: gerçek emir akışı, sanal para. Amaç strateji ölçmek değil,
+# emir borusunu (precision, min notional, red sebepleri, gerçek kayma) doğrulamak.
+extends: base.yaml
+mode: live
+venue: bybit-demo

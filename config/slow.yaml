@@ -1,0 +1,12 @@
+# Hipotez: ölçüm 1d sinyal + 20 gün ufuk diyor, base.yaml ise 4h sinyal + 1h tetik.
+# Bu profil o uyumsuzluğu kapatır: haftalık rejim, günlük kurulum, 4h tetik.
+# research/hypotheses.md #1 — test edilmeden kabul edilmez.
+extends: base.yaml
+
+timeframes:
+  permission: 1w
+  setup: 1d
+  trigger: 4h
+
+exits:
+  trail_timeframe: permission   # haftalık ATR = haftalarca tutuş

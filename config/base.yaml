@@ -1,0 +1,141 @@
+# Temel config. Diğer profiller bunu `extends: base.yaml` ile miras alır ve
+# sadece farklarını yazar. Buradaki her değer pydantic ile doğrulanır —
+# geçersiz bir değer botu açılışta durdurur, işlem sırasında değil.
+
+mode: paper
+venue: bybit-demo
+starting_balance: 100.0
+quote_currency: USDT
+log_level: INFO
+
+universe:
+  # symbols boş bırakılırsa 24s hacme göre en likit auto_top_n çift seçilir.
+  symbols: []
+  auto_top_n: 30
+  quote: USDT
+  min_volume_24h_usd: 5000000     # Bybit spot hacmi yoğunlaşmış: 20M sadece 8 çift verir, 5M ~29 verir
+  max_spread_bps: 8.0
+  min_history_days: 540           # yeni listelenen çiftler elenir (tek rejimde doğrulama = doğrulama değil)
+  # Stablecoin/stablecoin çiftleri: hacim var, yön yok.
+  exclude: ["USDC/USDT", "FDUSD/USDT", "DAI/USDT", "TUSD/USDT", "USD1/USDT", "USDE/USDT", "BUSD/USDT", "EURT/USDT"]
+
+timeframes:
+  permission: 1d   # yön/rejim. Hayır derse alt katmanlar konuşamaz.
+  setup: 4h        # konfluens burada aranır
+  trigger: 1h      # giriş zamanlaması
+
+risk:
+  risk_per_trade: 0.0075       # equity'nin %0.75'i = 1R
+  max_positions: 3
+  max_correlation: 0.85        # BTC ile ρ>0.85 olanlar tek pozisyon sayılır
+  max_portfolio_exposure: 1.0
+  max_leverage: 1.0            # KULLANICI SINIRI. Kod bunu asla kendiliğinden yükseltemez.
+
+  # Sürekli risk bütçesi merdiveni. Hiçbir kademede "işlem yok" yok —
+  # bot küçülür ve seçicileşir, susmaz.
+  drawdown_tiers:
+    - {max_drawdown: 0.05, risk_multiplier: 1.00, threshold_bump: 0.0}
+    - {max_drawdown: 0.10, risk_multiplier: 0.75, threshold_bump: 5.0}
+    - {max_drawdown: 0.15, risk_multiplier: 0.50, threshold_bump: 10.0}
+    - {max_drawdown: 1.00, risk_multiplier: 0.25, threshold_bump: 15.0}
+  tier_recovery_buffer: 0.01
+  # Mutlak zemin: bu düşüşten sonra YENİ giriş yok, mevcutlar yönetilmeye devam
+  # eder. Durma değil dondurma — açık riski terk etmek daha kötü olurdu.
+  freeze_drawdown: 0.50
+
+  # Üst üste zarar işlem yasağı değil, conviction eşiği yükselmesi.
+  loss_streak_start: 3
+  loss_streak_threshold_bump: 2.0
+
+  vol_target_annual: 0.35
+  vol_lookback_bars: 30
+  vol_scale_min: 0.4
+  vol_scale_max: 2.0
+
+  rolling_windows: [20, 50, 100]
+
+conviction:
+  base_threshold: 62.0           # ölçülen skor dağılımının ~p98'i (p99=63.9, maks=80.9)
+  absolute_floor: 56.0         # fırsat kıtlığında bile bu tabanın altına inilmez
+  scarcity_bars: 72
+  scarcity_max_relief: 6.0
+  min_voting_blocks: 3         # korelasyonlu indikatörler tek oy sayılır
+  collapse_threshold: 32.0
+  component_weights:
+    regime_fit: 25.0
+    indicator_confluence: 25.0
+    mtf_alignment: 15.0
+    flow_confirmation: 15.0
+    derivatives: 10.0
+    expected_r: 10.0
+
+indicators:
+  min_abs_ic: 0.02             # bunun altı gürültü, skora giremez
+  min_ic_ir: 0.3
+  redundancy_threshold: 0.8
+  ic_horizons: [1, 4, 12, 24]
+  weighting: equal             # önce eşit ağırlık; ic_weighted ancak WF'de geçerse
+  enabled: []                  # boş = registry varsayılanı
+
+execution:
+  order_type: market
+  assumed_taker_fee: 0.001     # Bybit spot taker ~%0.1; canlıda borsadan çekilir
+  assumed_maker_fee: 0.001
+  slippage_bps: 5.0            # backtest'te sıfır kayma = kurgu
+  min_notional_buffer: 1.15
+  limit_offset_bps: 2.0
+  max_retries: 3
+
+exits:
+  initial_stop_atr_mult: 2.0
+  trailing_atr_mult: 2.5
+  atr_period: 14
+  trail_timeframe: permission     # tutuş süresini asıl belirleyen ayar (1d ATR = haftalarca tutuş)
+  edge_decay_enabled: true     # sabit süre yok; edge sönerse trailing sıkışır
+  edge_decay_tighten_factor: 0.6
+  vol_shock_atr_ratio: 2.5
+  breakeven_at_r: 1.0
+
+data:
+  backfill_years: 3.0
+  parquet_dir: runtime/data
+  fetch_derivatives: true
+  max_gap_ratio: 0.005         # veri boşluğu sahte edge'in en sık kaynağı
+  rest_rate_limit_ms: 120
+
+llm:
+  enabled: false               # anahtar girilince true yapılır
+  primary_provider: gemini
+  fallback_provider: groq
+  gemini_model: gemini-flash-latest
+  groq_model: llama-3.3-70b-versatile
+  timeout_seconds: 5.0
+  max_calls_per_day: 50
+  cache_ttl_seconds: 900
+  circuit_breaker_failures: 3
+  event_guard_min_trial_days: 90
+  roles:
+    event_guard:    {enabled: false, max_calls_per_day: 24}
+    post_mortem:    {enabled: false, max_calls_per_day: 2}
+    anomaly_triage: {enabled: false, max_calls_per_day: 10}
+    report_writer:  {enabled: false, max_calls_per_day: 4}
+    config_auditor: {enabled: false, max_calls_per_day: 5}
+
+web:
+  enabled: true
+  host: 127.0.0.1
+  port: 8787
+
+telegram:
+  enabled: false
+  notify_fills: true
+  notify_risk_changes: true
+  notify_errors: true
+  daily_summary_hour_utc: 0
+
+engine:
+  loop_interval_seconds: 5.0
+  max_restarts_per_hour: 10
+  stale_data_tolerance_bars: 2.0
+  reconcile_on_start: true
+  state_snapshot_seconds: 30

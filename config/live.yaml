@@ -1,0 +1,12 @@
+# GERÇEK PARA. Sadece Kapı 3 geçildikten sonra kullanılır.
+# Ek koruma: TBOT_CONFIRM_LIVE=yes environment değişkeni olmadan başlamaz.
+extends: base.yaml
+mode: live
+venue: bybit-live
+starting_balance: 100.0
+
+risk:
+  # İlk ay boyunca boyut yarıya kısılmış halde koşulur.
+  risk_per_trade: 0.00375
+  max_positions: 2
+  max_leverage: 1.0

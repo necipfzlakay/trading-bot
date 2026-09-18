@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+runtime/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+research/notebooks/.ipynb_checkpoints/

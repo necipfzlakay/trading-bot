@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Dead-man switch. A crashed engine is loud — launchd restarts it. A wedged
+  engine is silent: the process lives, nothing restarts it, and positions stop
+  being managed while everything looks fine. This notices that, and snapshots
+  the database while it is at it.
+
+  Runs every 15 minutes.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tbot.health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/necipfazilakay/Documents/PROJECTS/TRADING-BOT/.venv/bin/python</string>
+    <string>/Users/necipfazilakay/Documents/PROJECTS/TRADING-BOT/scripts/healthcheck.py</string>
+    <string>--backup</string>
+    <string>--quiet</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/necipfazilakay/Documents/PROJECTS/TRADING-BOT</string>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/necipfazilakay/Documents/PROJECTS/TRADING-BOT/runtime/logs/health.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/necipfazilakay/Documents/PROJECTS/TRADING-BOT/runtime/logs/health.err.log</string>
+</dict>
+</plist>

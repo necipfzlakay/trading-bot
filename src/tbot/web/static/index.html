@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tbot</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#21262d;--text:#e6edf3;--dim:#8b949e;
+--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
+h1{font-size:16px;margin:0;letter-spacing:.5px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);margin:0 0 10px}
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.pill{font:11px var(--mono);padding:3px 9px;border-radius:999px;border:1px solid var(--border);background:var(--panel)}
+.pill.running{border-color:var(--green);color:var(--green)}
+.pill.degraded,.pill.safe_mode{border-color:var(--amber);color:var(--amber)}
+.pill.stopped,.pill.not_started{border-color:var(--red);color:var(--red)}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0}
+.card.wide{grid-column:1/-1}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px}
+.kpi .label{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+.kpi .value{font:20px/1.2 var(--mono);margin-top:2px}
+.pos{color:var(--green)}.neg{color:var(--red)}.warn{color:var(--amber)}.dim{color:var(--dim)}
+table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+th{text-align:left;color:var(--dim);font-weight:500;padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.bar{height:5px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:3px;min-width:60px}
+.bar>i{display:block;height:100%;background:var(--blue)}
+.bar>i.ok{background:var(--green)}
+canvas{width:100%;height:190px;display:block}
+footer{margin-top:16px;color:var(--dim);font-size:11px}
+.empty{color:var(--dim);font-style:italic;padding:8px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>tbot</h1>
+  <span class="pill" id="status">…</span>
+  <span class="pill" id="mode"></span>
+  <span class="pill" id="uptime"></span>
+  <span class="pill dim" id="updated"></span>
+</header>
+
+<div class="grid">
+  <div class="card wide">
+    <h2>Account</h2>
+    <div class="kpis" id="kpis"></div>
+  </div>
+
+  <div class="card wide">
+    <h2>Equity</h2>
+    <canvas id="equity"></canvas>
+  </div>
+
+  <div class="card wide">
+    <h2>Open positions</h2>
+    <div class="scroll"><table id="positions"></table></div>
+  </div>
+
+  <div class="card wide">
+    <h2>Scan — every symbol, every bar</h2>
+    <div class="scroll"><table id="scan"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Why no trade (24h)</h2>
+    <div class="scroll"><table id="reasons"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent trades</h2>
+    <div class="scroll"><table id="trades"></table></div>
+  </div>
+
+  <div class="card wide">
+    <h2>MAE / MFE — exit calibration</h2>
+    <canvas id="excursion"></canvas>
+    <div class="dim" style="font-size:11px;margin-top:6px">
+      Each dot is a closed trade: x = worst point reached (MAE), y = best point reached (MFE), both in R.
+      Winners clustered at low MAE mean the stop is wider than it needs to be.
+    </div>
+  </div>
+</div>
+
+<footer>Reads <code>runtime/state.json</code> and <code>runtime/tbot.db</code> directly — same source as the engine. Auto-refresh 10s.</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d=2) => v==null||isNaN(v) ? '—' : Number(v).toFixed(d);
+const pct = v => v==null||isNaN(v) ? '—' : (v*100).toFixed(1)+'%';
+const cls = v => v>0 ? 'pos' : v<0 ? 'neg' : '';
+const time = ts => ts ? new Date(ts).toISOString().slice(5,16).replace('T',' ') : '—';
+
+async function get(url){ try{ const r = await fetch(url); return r.ok ? await r.json() : null; }catch{ return null; } }
+
+function table(el, cols, rows, render){
+  if(!rows || !rows.length){ el.innerHTML = `<tr><td class="empty">no data yet</td></tr>`; return; }
+  el.innerHTML = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`
+    + `<tbody>${rows.map(render).join('')}</tbody>`;
+}
+
+function line(canvas, values, color){
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w*dpr; canvas.height = h*dpr;
+  const c = canvas.getContext('2d'); c.scale(dpr,dpr); c.clearRect(0,0,w,h);
+  if(!values || values.length < 2) return;
+  const min = Math.min(...values), max = Math.max(...values), span = (max-min)||1;
+  const x = i => i/(values.length-1)*(w-8)+4;
+  const y = v => h-6-((v-min)/span)*(h-16);
+  c.strokeStyle = color; c.lineWidth = 1.5; c.beginPath();
+  values.forEach((v,i)=> i ? c.lineTo(x(i),y(v)) : c.moveTo(x(i),y(v)));
+  c.stroke();
+  c.lineTo(x(values.length-1), h); c.lineTo(x(0), h); c.closePath();
+  c.fillStyle = color+'18'; c.fill();
+}
+
+function scatter(canvas, points){
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w*dpr; canvas.height = h*dpr;
+  const c = canvas.getContext('2d'); c.scale(dpr,dpr); c.clearRect(0,0,w,h);
+  if(!points.length) return;
+  const maxX = Math.max(1, ...points.map(p=>Math.abs(p.mae_r)));
+  const maxY = Math.max(1, ...points.map(p=>p.mfe_r));
+  c.strokeStyle = '#21262d'; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(34,h-18); c.lineTo(w-6,h-18); c.moveTo(34,6); c.lineTo(34,h-18); c.stroke();
+  c.fillStyle = '#8b949e'; c.font = '10px ui-monospace,monospace';
+  c.fillText('MAE (R)', w-58, h-5); c.save(); c.translate(10,40); c.rotate(-Math.PI/2); c.fillText('MFE (R)',0,0); c.restore();
+  points.forEach(p=>{
+    const x = 34 + Math.abs(p.mae_r)/maxX*(w-44);
+    const y = (h-18) - Math.max(0,p.mfe_r)/maxY*(h-26);
+    c.beginPath(); c.arc(x,y,3,0,7);
+    c.fillStyle = p.r_multiple>0 ? '#3fb95099' : '#f8514999'; c.fill();
+  });
+}
+
+async function refresh(){
+  const s = await get('/api/state') || {status:'not_started'};
+  $('status').textContent = s.status || '—';
+  $('status').className = 'pill ' + (s.status||'');
+  $('mode').textContent = `${s.mode||'—'} · ${s.venue||'—'}`;
+  $('uptime').textContent = s.uptime_human ? `up ${s.uptime_human}` : '';
+  $('updated').textContent = s.updated_iso ? `bar ${s.last_bar_iso||'—'}` : '';
+
+  const ret = s.peak_equity ? (s.equity/100 - 1) : 0;
+  $('kpis').innerHTML = [
+    ['Equity', fmt(s.equity), cls(s.equity-100)],
+    ['Return', pct(ret), cls(ret)],
+    ['Drawdown', pct(s.drawdown), s.drawdown>0.1?'warn':''],
+    ['Risk mult', fmt(s.risk_multiplier)+'×', s.risk_multiplier<1?'warn':''],
+    ['Threshold', fmt(s.threshold,0), ''],
+    ['Positions', (s.open_positions||[]).length, ''],
+    ['Leverage', fmt(s.leverage_allowed,1)+'×', ''],
+    ['Restarts', s.restarts||0, (s.restarts||0)>5?'warn':''],
+  ].map(([l,v,k])=>`<div class="kpi"><div class="label">${l}</div><div class="value ${k}">${v}</div></div>`).join('');
+
+  table($('positions'), ['symbol','setup','entry','stop','bars','MFE R','MAE R','conviction'],
+    s.open_positions, p=>`<tr><td>${p.symbol}</td><td class="dim">${p.setup}</td>
+    <td>${fmt(p.entry,4)}</td><td>${fmt(p.stop,4)}</td><td>${p.bars_held}</td>
+    <td class="pos">${fmt(p.mfe_r)}</td><td class="neg">${fmt(p.mae_r)}</td>
+    <td>${fmt(p.conviction,0)}</td></tr>`);
+
+  const scan = await get('/api/scan') || (s.scan_top||[]).map(r=>({...r,no_trade_reason:r.reason}));
+  table($('scan'), ['symbol','regime','score','threshold','','status'], scan, r=>{
+    const score = r.score||0, thr = r.threshold||1;
+    const w = Math.min(100, score/thr*100);
+    const ok = score >= thr;
+    return `<tr><td>${r.symbol}</td><td class="dim">${r.regime}</td>
+      <td class="${ok?'pos':''}">${fmt(score,1)}</td><td class="dim">${fmt(thr,0)}</td>
+      <td style="width:90px"><div class="bar"><i class="${ok?'ok':''}" style="width:${w}%"></i></div></td>
+      <td class="dim">${r.no_trade_reason||'eligible'}</td></tr>`;
+  });
+
+  const reasons = await get('/api/no-trade-reasons');
+  table($('reasons'), ['reason','count'], reasons,
+    r=>`<tr><td>${r.reason||'eligible'}</td><td>${r.n}</td></tr>`);
+
+  const trades = await get('/api/trades?limit=25');
+  table($('trades'), ['closed','symbol','R','bars','exit'], trades,
+    t=>`<tr><td class="dim">${time(t.exit_ts)}</td><td>${t.symbol}</td>
+    <td class="${cls(t.r_multiple)}">${fmt(t.r_multiple)}</td>
+    <td>${t.bars_held}</td><td class="dim">${t.exit_reason}</td></tr>`);
+
+  const eq = await get('/api/equity?limit=1500');
+  if(eq) line($('equity'), eq.map(p=>p.equity), '#58a6ff');
+
+  const ex = await get('/api/excursion');
+  if(ex) scatter($('excursion'), ex);
+}
+
+refresh(); setInterval(refresh, 10000);
+window.addEventListener('resize', refresh);
+</script>
+</body>
+</html>
