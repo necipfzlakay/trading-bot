@@ -39,6 +39,22 @@ class Portfolio:
             self.cash = self.starting_cash
         self.peak_equity = max(self.peak_equity, self.starting_cash)
 
+    def seed_from_venue(self, cash: float, marks: dict[str, float] | None = None) -> None:
+        """Adopt the account's real balance as the starting point.
+
+        In live and demo mode ``starting_balance`` from config is fiction — the
+        account holds whatever it holds. Without this the portfolio carries the
+        configured number instead: sizing reads a cash limit that does not
+        exist, and the first bar's equity contradicts the balance read at
+        startup, which the implausible-jump guard correctly flags as corrupt
+        data. Call it once, after reconciliation, before the first bar.
+        """
+        self.cash = cash
+        equity = self.equity(marks or {})
+        self.starting_cash = equity
+        self.peak_equity = equity
+        log.info("portfolio_seeded_from_venue", cash=round(cash, 2), equity=round(equity, 2))
+
     # -- positions ---------------------------------------------------------
 
     def open_position(

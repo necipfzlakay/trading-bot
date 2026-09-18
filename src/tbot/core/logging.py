@@ -16,6 +16,7 @@ from typing import Any
 import structlog
 
 _configured = False
+_file_configured = False
 
 
 def configure(
@@ -26,9 +27,18 @@ def configure(
     max_bytes: int = 50_000_000,
     backup_count: int = 5,
 ) -> None:
-    """Set up structlog once per process. Safe to call again (no-op)."""
-    global _configured
-    if _configured:
+    """Set up structlog. Safe to call again.
+
+    Re-entrant on purpose. Module-level ``get_logger()`` calls run at import
+    time, before any CLI has read the config, and each one configures logging
+    with no ``log_dir``. Treating that first call as final meant the file
+    handler was never attached: every event went to stdout and ``bot.jsonl``
+    stayed empty, which quietly removed the log that the whole observability
+    story depends on. So a later call carrying a ``log_dir`` is allowed to
+    upgrade the configuration.
+    """
+    global _configured, _file_configured
+    if _configured and (log_dir is None or _file_configured):
         return
 
     handlers: list[logging.Handler] = []
@@ -84,6 +94,7 @@ def configure(
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     _configured = True
+    _file_configured = log_dir is not None
 
 
 def _shared_processors() -> list[Any]:

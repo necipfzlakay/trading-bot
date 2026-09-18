@@ -269,6 +269,29 @@ restart döngüsünü açık bırakmak, durmuş olmaktan kötü.
 `TBOT_CONFIRM_LIVE=yes` plist'e yazılıyor, yani o bariyer agent kurulu olduğu
 sürece kalıcı hale geliyor. Onay ekranı bunu açıkça söylüyor.
 
+### Kod değiştirdiğinde
+
+`KeepAlive` süreci **çökünce** geri getirir, **dosya değişince getirmez.** Python
+kodu bir kez, açılışta yükleniyor. Bir şey düzelttiysen:
+
+```bash
+./ops/bot.sh restart
+```
+
+Unutması kolay ve sessiz: bot mutlu şekilde çalışmaya devam eder, sadece eski
+kodu çalıştırır. `./ops/bot.sh status` bunu artık söylüyor:
+
+```
+! source files are newer than the running engine — it is executing old code
+  ./ops/bot.sh restart
+```
+
+`restart` kurulu modu koruyor — `demo`daysan `demo`da kalıyor.
+
+Config (`config/*.yaml`) değişikliği de aynı: restart gerekiyor. İstisna panel
+düğmeleri ve Telegram komutları — onlar `command.json` üzerinden ~10 saniyede
+işleniyor, yeniden başlatma istemiyor.
+
 ### Neden hâlâ ayakta
 
 `KeepAlive=true` — süreç nasıl ölürse ölsün geri gelir, girişte otomatik başlar.

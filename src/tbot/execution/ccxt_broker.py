@@ -17,6 +17,8 @@ Two things this layer must get right, because both fail silently otherwise:
 
 from __future__ import annotations
 
+import time
+
 import ccxt
 
 from tbot.core.clock import now_ms
@@ -188,13 +190,18 @@ class CCXTBroker(Broker):
             log.warning("cancel_failed", client_id=client_id, error=str(exc)[:160])
             return False
 
-    def fetch_balance(self) -> dict[str, float]:
+    def _balances(self, kind: str) -> dict[str, float]:
+        """``free`` (spendable), ``used`` (locked in orders) or ``total``."""
         try:
             balance = self.exchange.fetch_balance()
         except ccxt.BaseError as exc:
             log.error("balance_fetch_failed", error=str(exc)[:200])
             return {}
-        return {k: float(v) for k, v in (balance.get("free") or {}).items() if v}
+        return {k: float(v) for k, v in (balance.get(kind) or {}).items() if v}
+
+    def fetch_balance(self) -> dict[str, float]:
+        """Spendable balances. Money locked in a resting order cannot be sized against."""
+        return self._balances("free")
 
     def fetch_open_orders(self, symbol: str | None = None) -> list[Order]:
         try:
@@ -230,6 +237,50 @@ class CCXTBroker(Broker):
 
     # -- protective stops ---------------------------------------------------
 
+    def _resting_stops(self, symbol: str) -> list[dict]:
+        """Protective stops the venue currently holds for this symbol."""
+        try:
+            response = self.exchange.privateGetV5OrderRealtime(
+                {
+                    "category": "spot",
+                    "symbol": symbol.replace("/", ""),
+                    "orderFilter": "tpslOrder",
+                }
+            )
+            return (response.get("result") or {}).get("list") or []
+        except ccxt.BaseError as exc:
+            log.warning("stop_lookup_failed", symbol=symbol, error=str(exc)[:120])
+            return []
+
+    def _sellable(self, symbol: str, wanted: float) -> float:
+        """How much of the base asset can actually be sold, at most ``wanted``.
+
+        On Bybit spot a market buy pays its fee **in the base currency**, so a
+        filled order for 65.69 leaves 65.62 in the account. Asking the venue to
+        stop out the order quantity is then rejected with "Insufficient
+        balance" (170131) — which is how a long position ends up with no
+        protective stop at all. Partial fills and dust rounding land in the same
+        place, so the clamp is on the balance rather than on the fee.
+        """
+        base = symbol.split("/")[0]
+        try:
+            free = float((self.exchange.fetch_balance().get("free") or {}).get(base) or 0.0)
+        except ccxt.BaseError as exc:
+            # Unknown is not zero: proceed with the requested size and let the
+            # venue decide, rather than refusing to protect the position.
+            log.warning("sellable_balance_unknown", symbol=symbol, error=str(exc)[:120])
+            return wanted
+
+        if free < wanted:
+            log.info(
+                "stop_quantity_clamped",
+                symbol=symbol,
+                wanted=wanted,
+                free=free,
+                reason="spot buy fees are charged in the base asset",
+            )
+        return min(wanted, free)
+
     def place_stop(
         self, symbol: str, quantity: float, stop_price: float, client_id: str
     ) -> str | None:
@@ -245,6 +296,38 @@ class CCXTBroker(Broker):
         which the operator needs to know about.
         """
         self.load_markets()
+
+        # Adopt a stop that already protects this holding rather than churning
+        # it. Cancelling first and placing second was actively harmful: when the
+        # placement then failed, a working stop had been replaced with none.
+        for order in self._resting_stops(symbol):
+            order_id = str(order.get("orderId") or "")
+            try:
+                resting_qty = float(order.get("qty") or 0.0)
+                resting_trigger = float(order.get("triggerPrice") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            covers = resting_qty >= quantity * 0.995
+            same_level = resting_trigger > 0 and abs(resting_trigger - stop_price) / stop_price < 1e-3
+            if order_id and covers and same_level:
+                log.info("protective_stop_adopted", symbol=symbol, order_id=order_id)
+                return order_id
+
+        # Only now is replacing correct: what is resting does not protect this
+        # position. Release it so the asset it reserves can back the new stop.
+        for order in self._resting_stops(symbol):
+            order_id = str(order.get("orderId") or "")
+            if order_id and self.cancel_stop(symbol, order_id):
+                log.info("stale_stop_cancelled", symbol=symbol, order_id=order_id)
+
+        quantity = self._sellable(symbol, quantity)
+        if quantity <= 0:
+            log.error(
+                "protective_stop_impossible",
+                symbol=symbol,
+                consequence="nothing of this asset is free to sell",
+            )
+            return None
         try:
             amount = float(self.exchange.amount_to_precision(symbol, quantity))
             trigger = float(self.exchange.price_to_precision(symbol, stop_price))
@@ -257,7 +340,7 @@ class CCXTBroker(Broker):
                 params={
                     "stopLossPrice": trigger,
                     "reduceOnly": True,
-                    "clientOrderId": client_id,
+                    "clientOrderId": f"{client_id[:24]}-{int(time.time() * 1000) % 1_000_000}",
                     "triggerDirection": 2,  # trigger on a falling price
                 },
             )
@@ -306,8 +389,15 @@ class CCXTBroker(Broker):
             return False
 
     def fetch_positions(self) -> dict[str, float]:
-        """Non-quote balances — on spot this is what "a position" means."""
-        balances = self.fetch_balance()
+        """Non-quote balances — on spot this is what "a position" means.
+
+        Deliberately ``total`` and not ``free``: a protective stop **locks** the
+        base asset it would sell, so a correctly protected position reads as
+        ``free ≈ 0``. Reading free here made the engine conclude its own stop
+        had closed the position, drop it from the portfolio, and stop managing
+        a holding it still owned.
+        """
+        balances = self._balances("total")
         return {f"{k}/{self.quote}": v for k, v in balances.items() if k != self.quote and v > 0}
 
     def fetch_ticker(self, symbol: str) -> dict:

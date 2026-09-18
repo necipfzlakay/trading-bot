@@ -56,6 +56,23 @@ testi oku — hepsinin kendini koruyan bir testi var.
     `1R = adet × stop_mesafesi` korunur. → `risk/sizing.py`
 21. **`SizingResult` keyword-only.** Alan eklemek pozisyonel argümanı sessizce
     yanlış alana bağlamasın diye — bir kez oldu, red sebebi `capped_by`'a düştü.
+22. **Canlıda bakiye borsadan, portföy de öyle.** `_equity_now` başarısız okumada
+    `starting_balance`'a düşemez; portföy `seed_from_venue` ile besleniyor. Aksi
+    halde nakit sınırı hayali oluyor ve ilk barda equity kendiyle çelişiyor.
+    → `test_portfolio_seeded_from_venue_replaces_configured_balance`
+23. **Stop miktarı satılabilir bakiyeye kısılır.** Bybit spot alış komisyonunu
+    **base varlıktan** kesiyor: 65.69 dolan emir hesapta 65.62 bırakıyor, 65.69'luk
+    stop "Insufficient balance" ile reddediliyor. → `_sellable`
+24. **Reddedilen stop her barda yeniden denenir.** Tek red, pozisyonu ömrü
+    boyunca korumasız bırakıyordu. → `_place_protective_stop` retry
+25. **Kilitli varlık hâlâ pozisyondur.** Koruyucu stop base varlığı rezerve
+    eder; `fetch_positions` bu yüzden `total` okur, `free` değil. Nakit ise
+    `free` — kilitli para boyutlandırılamaz. → `_balances`
+26. **Çalışan stop iptal edilmeden önce yerine konacağı bilinmelidir.** Var olan
+    ve doğru seviyedeki stop benimsenir; iptal yalnızca gerçekten
+    değiştirilecekse yapılır. → `place_stop` adopt/replace
+27. **Kod değişikliği otomatik yüklenmez.** launchd çökmede geri getirir,
+    dosya değişince getirmez. → `bot.sh status` bayat kod uyarısı
 
 ## Denetim (2026-09-17) — bulunan ve kapatılan
 
@@ -87,6 +104,29 @@ Sistemi baştan sona tarayıp uç durumları test ettim. Bulunanlar:
 | 17 | Sabit bar eşikleri (200/220/250/300) haftalık veriyi imkânsız kılıyordu | yüksek | zaman dilimi tablosuna bağlandı |
 | 18 | `funding` contrarian varsayılıyordu — ölçüm 5/5 ufukta momentum dedi | orta | registry düzeltildi, `scripts/polarity.py` eklendi |
 | 19 | `_veto_prices` sınırsız büyüyordu | düşük | 2000 ile sınırlandı |
+
+### Üçüncü tur (2026-09-18, ilk demo koşusunda canlı yakalandı)
+
+Bunların hiçbiri teste takılmamıştı; üçü de gerçek Bybit demo koşusunda çıktı.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 20 | **Canlı modda portföy config'ten besleniyordu.** Borsada 50.000 varken portföy 1.000 taşıyor; sizing olmayan bir nakit sınırına takılıyor, ilk barda equity 50.000→1.000 "sıçrıyor", implausible-jump koruması motoru degraded'a düşürüyor (risk 0.25x). Değişmez kural 19 ihlali | kritik | `seed_from_venue` |
+| 21 | `_equity_now` başarısız bakiye okumasında `starting_balance`'a düşüyordu — geçici API hatası, config parasıyla boyutlandırmaya dönüşürdü | kritik | son bilinen değere düşüyor, yoksa reddediyor |
+| 22 | **Her spot long'un koruyucu stop'u reddediliyordu.** Komisyon base varlıktan kesildiği için emir miktarı hesaptakinden büyük → `retCode 170131 Insufficient balance` → pozisyon borsada korumasız. Değişmez kural 12 pratikte çalışmıyordu | kritik | `_sellable` kısma |
+| 23 | Reddedilen stop hiç tekrar denenmiyordu | yüksek | her barda retry |
+| 24 | **`bot.jsonl` hiç yazılmıyordu.** Modül seviyesindeki `get_logger()` import anında `configure()`'u `log_dir=None` ile çalıştırıyor, sonraki gerçek `configure(log_dir)` no-op'a düşüyordu. Tüm gözlem katmanı sadece stdout'taydı | yüksek | `configure` yeniden girilebilir |
+| 25 | `expiredAt` ISO string geliyor, `int()` bekleniyordu — `assert_key_is_safe` çöküyor, demo/live hiç başlayamıyordu | kritik | `_parse_expiry` |
+| 26 | **Kendi stop'u pozisyonu görünmez yapıyordu.** Stop base varlığı kilitliyor (`used`), `fetch_positions` sadece `free` okuyordu → motor pozisyonu kapandı sanıp portföyden düşürdü, yönetmeyi bıraktı, equity'yi 1.762 USDT eksik gösterdi | kritik | `fetch_positions` artık `total` |
+| 27 | **Önce iptal, sonra yerleştir** — çalışan stop iptal edildi, yerine koyma başarısız oldu, pozisyon korumasız kaldı. Üstelik stop client id'si deterministik olduğu için tekrar deneme `170141 Duplicate clientOrderId` alıyordu | kritik | var olan stop **benimseniyor**; iptal sadece gerçekten değiştirilecekse; retry id'si benzersiz |
+| 28 | Açık pozisyonlar `state.json`'a sadece bar kapanışında yazılıyordu — açılıştan ilk bara kadar (1h'e kadar) panel ve `status` "pozisyon yok" diyordu | orta | `_positions_view` açılışta da yayımlanıyor |
+| 29 | Kod değişince launchd yeniden başlatmıyor; bot sessizce eski kodu çalıştırmaya devam ediyordu | orta | `bot.sh status` kaynak dosya mtime'ını süreç başlangıcıyla karşılaştırıyor |
+
+**Açık, düzeltilmedi:** `report.py` ve panel `run_id`/`mode` filtrelemiyor. `runs`
+tablosunda mod var (`paper` / `live`), ama equity eğrisi ve işlem istatistikleri
+paper ($1.000 ölçek) ile demo ($50.000 ölçek) koşularını tek seriye karıştırıyor.
+İşlem güvenliği sorunu değil, **rapor doğruluğu** sorunu. Çözüm: sorguları aktif
+moda göre filtrelemek, ya da mod başına ayrı `runtime/` dizini.
 
 ### Eklenen özellikler
 

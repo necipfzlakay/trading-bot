@@ -82,6 +82,25 @@ agent_exit_status() {
 
 is_loaded() { launchctl list "$1" >/dev/null 2>&1; }
 
+# Python loads its code once, at startup. launchd restarts the engine when it
+# crashes, never when a file changes — so after an edit the running process
+# keeps executing the old code, silently, for as long as it stays up. Nothing
+# else in the system would ever mention it.
+code_is_stale() {
+  local pid newest started
+  pid=$(pgrep -f "scripts/run.py" | head -1)
+  [[ -n "$pid" ]] || return 1
+
+  newest=$(find src scripts config -type f \( -name '*.py' -o -name '*.yaml' \) -print0 2>/dev/null \
+    | xargs -0 stat -f '%m' 2>/dev/null | sort -rn | head -1)
+  started=$(ps -o lstart= -p "$pid" 2>/dev/null)
+  [[ -n "$newest" && -n "$started" ]] || return 1
+
+  local started_epoch
+  started_epoch=$(date -j -f "%a %b %d %T %Y" "$started" +%s 2>/dev/null) || return 1
+  [[ "$newest" -gt "$started_epoch" ]]
+}
+
 # ------------------------------------------------------------------- preflight
 
 preflight() {
@@ -571,6 +590,11 @@ PYEOF
     ok "healthy"
   else
     warn "healthcheck reports a problem — .venv/bin/python scripts/healthcheck.py"
+  fi
+
+  if code_is_stale; then
+    warn "source files are newer than the running engine — it is executing old code"
+    say "    ${DIM}./ops/bot.sh restart${N}"
   fi
 }
 

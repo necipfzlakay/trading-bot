@@ -202,8 +202,16 @@ class Runner:
             self._reconcile()
 
         balance = self._equity_now()
+        if self.config.mode is Mode.LIVE:
+            # Invariant: in live mode the balance comes from the venue, never
+            # from config. Seeding here keeps the portfolio, the sizing cash
+            # limit and the equity curve on the same real number.
+            self.portfolio.seed_from_venue(balance)
+            balance = self.portfolio.equity({})
         self.risk.update_equity(balance)
         self.state.equity = balance
+        self.state.cash = self.portfolio.cash
+        self.state.open_positions = self._positions_view()
         self.state.status = "running" if self.state.status != "safe_mode" else "safe_mode"
         self.writer.write(self.state)
 
@@ -701,6 +709,12 @@ class Runner:
                 position.current_stop = decision.new_stop
                 self.db.upsert_position(position)
                 self._sync_protective_stop(position)
+            elif not position.meta.get("stop_order_id"):
+                # No venue stop on this position: either the venue refused it at
+                # entry, or the process restarted before one was placed. Retry
+                # every bar — a single refusal used to leave the position
+                # unprotected for its entire life.
+                self._place_protective_stop(position, bar_ts)
 
     def _scan(self, frames: dict, bar_ts: int) -> list[ScanRow]:
         correlations = self._correlations(frames)
@@ -1161,12 +1175,32 @@ class Runner:
             self.notifier.notify_error("Reconciliation mismatch", report.summary())
 
     def _equity_now(self) -> float:
+        """Account equity, read from the venue in live mode.
+
+        A failed read is "unknown", not ``starting_balance``. Substituting the
+        configured number for a real balance is how a transient API error turns
+        into sizing against money the account does not have — and, on the next
+        bar, into an equity series that jumps between two unrelated figures.
+        """
         if isinstance(self.broker, PaperBroker):
             return self.broker.equity({})
+
         balance = self.watchdog.call(
-            "fetch_balance", lambda: self.broker.fetch_balance(), default={}
+            "fetch_balance", lambda: self.broker.fetch_balance(), default=None
         )
-        return float((balance or {}).get(self.config.quote_currency, self.config.starting_balance))
+        if balance:
+            return float(balance.get(self.config.quote_currency, 0.0))
+
+        # Fall back to the last figure the venue actually gave us. On the very
+        # first read there is none, and refusing is the only honest answer.
+        if self.state.equity > 0:
+            log.warning("balance_read_failed", using_last_known=round(self.state.equity, 2))
+            return float(self.state.equity)
+        raise RuntimeError(
+            "Could not read the account balance from the venue, and there is no "
+            "previous reading to fall back on. Refusing to start rather than size "
+            "positions against a number from the config file."
+        )
 
     def _correlations(self, frames: dict) -> dict[tuple[str, str], float]:
         series = {
@@ -1284,21 +1318,9 @@ class Runner:
             f"restarts    {self.state.restarts}"
         )
 
-    def _snapshot(self, bar_ts: int, scans: list[ScanRow], point) -> None:
-        self.state.last_bar_ts = bar_ts
-        self.state.bars_processed += 1
-        self.state.equity = point.equity
-        self.state.cash = point.cash
-        self.state.peak_equity = self.portfolio.peak_equity
-        self.state.drawdown = point.drawdown
-        self.state.risk_multiplier = self.risk.risk_multiplier
-        self.state.threshold = self.conviction.current_threshold(self.risk.threshold_bump())
-        self.state.degraded_reason = self.risk.state.degraded_reason
-        self.state.slippage = self.slippage.summary()
-        if self.state.status not in ("safe_mode", "stopped"):
-            self.state.status = "degraded" if self.risk.state.degraded else "running"
-
-        self.state.open_positions = [
+    def _positions_view(self) -> list[dict]:
+        """What the dashboard and ``bot.sh status`` read as "open positions"."""
+        return [
             {
                 "symbol": p.symbol,
                 "side": p.side.value,
@@ -1313,6 +1335,22 @@ class Runner:
             }
             for p in self.portfolio.positions.values()
         ]
+
+    def _snapshot(self, bar_ts: int, scans: list[ScanRow], point) -> None:
+        self.state.last_bar_ts = bar_ts
+        self.state.bars_processed += 1
+        self.state.equity = point.equity
+        self.state.cash = point.cash
+        self.state.peak_equity = self.portfolio.peak_equity
+        self.state.drawdown = point.drawdown
+        self.state.risk_multiplier = self.risk.risk_multiplier
+        self.state.threshold = self.conviction.current_threshold(self.risk.threshold_bump())
+        self.state.degraded_reason = self.risk.state.degraded_reason
+        self.state.slippage = self.slippage.summary()
+        if self.state.status not in ("safe_mode", "stopped"):
+            self.state.status = "degraded" if self.risk.state.degraded else "running"
+
+        self.state.open_positions = self._positions_view()
         self.state.scan_top = [
             {
                 "symbol": r.symbol,

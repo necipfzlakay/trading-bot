@@ -6,6 +6,7 @@ corresponds to something that was silently doing nothing.
 """
 
 import json
+import time
 
 import pytest
 
@@ -349,3 +350,297 @@ def test_implausible_equity_jump_is_caught():
     assert equity_jump_is_implausible(100.0, 200.0)
     assert not equity_jump_is_implausible(100.0, 95.0)
     assert not equity_jump_is_implausible(0.0, 100.0)  # first reading, nothing to compare
+
+
+# --------------------------------------------------------------------------
+# Live balance comes from the venue, never from config
+# --------------------------------------------------------------------------
+
+
+def test_portfolio_seeded_from_venue_replaces_configured_balance():
+    """Invariant 19, enforced.
+
+    This was a live failure: the portfolio kept starting_balance (1000) while
+    the venue held 50000. Sizing then refused entries for lack of cash that
+    existed, and the first bar's equity contradicted the startup reading hard
+    enough for the implausible-jump guard to degrade the engine.
+    """
+    from tbot.engine.portfolio import Portfolio
+
+    portfolio = Portfolio(starting_cash=1000.0)
+    assert portfolio.cash == 1000.0
+
+    portfolio.seed_from_venue(50000.0)
+
+    assert portfolio.cash == 50000.0
+    assert portfolio.starting_cash == 50000.0
+    assert portfolio.peak_equity == 50000.0
+    # No drawdown may be implied by adopting the real balance.
+    point = portfolio.record_equity(0, {})
+    assert point.equity == 50000.0
+    assert point.drawdown == 0.0
+
+
+def test_seeding_counts_positions_carried_in_from_reconciliation():
+    from tbot.core.models import Position, Side
+    from tbot.engine.portfolio import Portfolio
+
+    portfolio = Portfolio(starting_cash=1000.0)
+    portfolio.positions["BTC/USDT"] = Position(
+        symbol="BTC/USDT",
+        side=Side.BUY,
+        quantity=0.1,
+        entry_price=50_000.0,
+        entry_ts=0,
+        initial_stop=45_000.0,
+        current_stop=45_000.0,
+        setup="test",
+        risk_amount=500.0,
+    )
+
+    portfolio.seed_from_venue(2_000.0)
+
+    # 2000 free cash plus a position worth 5000 at its entry price.
+    assert portfolio.cash == 2_000.0
+    assert portfolio.starting_cash == pytest.approx(7_000.0)
+
+
+def test_logging_attaches_the_file_handler_after_an_import_time_call(tmp_path):
+    """Import-time get_logger() must not permanently disable the JSONL log.
+
+    Every module calls get_logger() at import, which configures logging with no
+    log_dir. When that first call was treated as final, bot.jsonl was never
+    written and the engine's only queryable log silently did not exist.
+    """
+    import logging as std_logging
+
+    from tbot.core import logging as tlog
+
+    tlog.get_logger("import-time")  # what a module-level call does
+    tlog.configure(tmp_path)  # what the CLI does afterwards
+    tlog.get_logger("after").info("event_written", value=1)
+    std_logging.shutdown()
+
+    path = tmp_path / "bot.jsonl"
+    assert path.exists(), "configure(log_dir) after an import-time call must attach a file handler"
+    assert "event_written" in path.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Protective stops survive spot fee accounting
+# --------------------------------------------------------------------------
+
+
+def test_stop_quantity_is_clamped_to_what_is_actually_sellable():
+    """Bybit spot charges the buy fee in the base asset.
+
+    A filled buy for 65.69 leaves 65.62 in the account, so a stop for 65.69 is
+    rejected with "Insufficient balance" and the position ends up with no venue
+    stop at all. Observed live on demo; invariant 12 depends on this.
+    """
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    placed = {}
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            return {"result": {"list": []}}
+
+        def fetch_balance(self):
+            return {"free": {"VVV": 65.62431}}
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.5f}"
+
+        def price_to_precision(self, symbol, price):
+            return f"{price:.4f}"
+
+        def create_order(self, **kwargs):
+            placed.update(kwargs)
+            return {"id": "stop-1"}
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.load_markets = lambda: None
+
+    order_id = broker.place_stop("VVV/USDT", 65.69, 23.35, "cid")
+
+    assert order_id == "stop-1"
+    assert placed["amount"] <= 65.62431, "must never ask to sell more than is held"
+
+
+def test_stop_is_not_attempted_when_nothing_is_sellable():
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            return {"result": {"list": []}}
+
+        def fetch_balance(self):
+            return {"free": {}}
+
+        def create_order(self, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("must not send an order for zero quantity")
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.load_markets = lambda: None
+
+    assert broker.place_stop("VVV/USDT", 65.69, 23.35, "cid") is None
+
+
+def test_unknown_balance_does_not_block_protecting_the_position():
+    """Unknown is not zero — let the venue decide rather than skip the stop."""
+    import ccxt
+
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            return {"result": {"list": []}}
+
+        def fetch_balance(self):
+            raise ccxt.NetworkError("down")
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.5f}"
+
+        def price_to_precision(self, symbol, price):
+            return f"{price:.4f}"
+
+        def create_order(self, **kwargs):
+            return {"id": "stop-2"}
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.load_markets = lambda: None
+
+    assert broker.place_stop("VVV/USDT", 65.69, 23.35, "cid") == "stop-2"
+
+
+def test_a_position_locked_by_its_own_stop_is_still_a_position():
+    """A protective stop reserves the base asset, so free drops to dust.
+
+    Reading free here made the engine conclude its own stop had closed the
+    position: it dropped VVV from the portfolio, stopped managing a holding it
+    still owned, and understated equity by the position's whole value.
+    """
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    class Exchange:
+        def fetch_balance(self):
+            return {
+                "free": {"USDT": 48300.93, "VVV": 0.00431},
+                "used": {"VVV": 65.62},
+                "total": {"USDT": 48300.93, "VVV": 65.62431},
+            }
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.quote = "USDT"
+
+    positions = broker.fetch_positions()
+    assert positions["VVV/USDT"] == pytest.approx(65.62431)
+
+    # Cash stays the spendable figure — locked funds cannot be sized against.
+    assert broker.fetch_balance()["USDT"] == pytest.approx(48300.93)
+
+
+def test_an_existing_stop_at_the_right_level_is_adopted_not_replaced():
+    """Cancel-then-place lost real protection when the placement failed.
+
+    Observed live: a working stop was cancelled, the replacement was refused
+    with "Duplicate clientOrderId" (the id is deterministic), and the position
+    was left with no stop at all.
+    """
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            return {"result": {"list": [{"orderId": "live-stop", "qty": "65.62", "triggerPrice": "23.352"}]}}
+
+        def cancel_order(self, id, symbol):  # pragma: no cover - must not be reached
+            raise AssertionError("must not cancel a stop that already protects the position")
+
+        def create_order(self, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("must not place a second stop")
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.load_markets = lambda: None
+
+    assert broker.place_stop("VVV/USDT", 65.62431, 23.352, "cid") == "live-stop"
+
+
+def test_retrying_a_stop_does_not_reuse_a_refused_client_id():
+    """Bybit remembers cancelled ids and refuses them with 170141."""
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    seen = []
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            return {"result": {"list": []}}
+
+        def fetch_balance(self):
+            return {"free": {"VVV": 65.62431}}
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.5f}"
+
+        def price_to_precision(self, symbol, price):
+            return f"{price:.4f}"
+
+        def create_order(self, **kwargs):
+            seen.append(kwargs["params"]["clientOrderId"])
+            return {"id": f"stop-{len(seen)}"}
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.load_markets = lambda: None
+
+    broker.place_stop("VVV/USDT", 65.62431, 23.35, "cid")
+    time.sleep(0.002)
+    broker.place_stop("VVV/USDT", 65.62431, 23.35, "cid")
+
+    assert seen[0] != seen[1], "a retry must not reuse an id the venue already refused"
+
+
+def test_replacing_a_stop_at_a_different_level_releases_the_old_one():
+    """Otherwise the clamp sees only dust and the replacement protects nothing."""
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    cancelled, placed = [], {}
+    state = {"free": 0.00431}  # everything is locked by the resting stop
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            # Resting at a level the new stop does not match, so it must go.
+            resting = [{"orderId": "old-stop", "qty": "65.62", "triggerPrice": "19.00"}]
+            return {"result": {"list": [] if cancelled else resting}}
+
+        def cancel_order(self, id, symbol):
+            cancelled.append(id)
+            state["free"] = 65.62431  # the venue releases the reservation
+            return {}
+
+        def fetch_balance(self):
+            return {"free": {"VVV": state["free"]}}
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.5f}"
+
+        def price_to_precision(self, symbol, price):
+            return f"{price:.4f}"
+
+        def create_order(self, **kwargs):
+            placed.update(kwargs)
+            return {"id": "new-stop"}
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = Exchange()
+    broker.load_markets = lambda: None
+
+    assert broker.place_stop("VVV/USDT", 65.62431, 23.35, "cid") == "new-stop"
+    assert cancelled == ["old-stop"]
+    assert placed["amount"] == pytest.approx(65.62431), "must protect the whole holding"
