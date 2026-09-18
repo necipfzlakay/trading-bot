@@ -363,11 +363,22 @@ class Database:
                                      conviction_at_entry, entry_conviction_id, meta)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(symbol) DO UPDATE SET
-                   quantity=excluded.quantity, current_stop=excluded.current_stop,
-                   fees_paid=excluded.fees_paid,
+                   run_id=excluded.run_id, side=excluded.side,
+                   quantity=excluded.quantity,
+                   -- Identity fields too: the conflict key is the symbol, so a
+                   -- NEW position in a symbol that held one before lands here.
+                   -- Leaving entry_price behind meant a trade's R, MAE and MFE
+                   -- were all measured against a previous trade's entry.
+                   entry_price=excluded.entry_price, entry_ts=excluded.entry_ts,
+                   initial_stop=excluded.initial_stop, current_stop=excluded.current_stop,
+                   setup=excluded.setup, risk_amount=excluded.risk_amount,
+                   leverage=excluded.leverage, fees_paid=excluded.fees_paid,
                    max_favorable_price=excluded.max_favorable_price,
                    max_adverse_price=excluded.max_adverse_price,
-                   bars_held=excluded.bars_held, meta=excluded.meta""",
+                   bars_held=excluded.bars_held,
+                   conviction_at_entry=excluded.conviction_at_entry,
+                   entry_conviction_id=excluded.entry_conviction_id,
+                   meta=excluded.meta""",
             (
                 pos.symbol,
                 self.run_id,

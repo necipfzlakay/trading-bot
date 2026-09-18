@@ -39,6 +39,10 @@ class EngineState:
     equity: float = 0.0
     cash: float = 0.0
     peak_equity: float = 0.0
+    # What the account was worth when this run began. In live mode that is the
+    # venue balance, not a config number, so every percentage the dashboard
+    # shows is measured against money that actually existed.
+    starting_equity: float = 0.0
     drawdown: float = 0.0
     risk_multiplier: float = 1.0
     threshold: float = 0.0

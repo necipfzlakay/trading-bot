@@ -354,7 +354,12 @@ class Order:
 
     ``client_id`` is derived from (strategy, symbol, bar_ts, action) so a crash
     between "sent" and "acknowledged" cannot produce a duplicate on restart:
-    the exchange rejects the second one as a duplicate client order id.
+    the exchange refuses the second one as a duplicate client order id.
+
+    The venue remembers ids past an order's life, so the same refusal also
+    arrives for intents that never opened anything — after a local reset, say.
+    ``CCXTBroker._resolve_duplicate`` tells the two apart by looking up what
+    became of the original: filled or live is adopted, cancelled is re-sent.
     """
 
     client_id: str

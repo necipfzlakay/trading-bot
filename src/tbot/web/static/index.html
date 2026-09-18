@@ -147,9 +147,12 @@ async function refresh(){
   $('uptime').textContent = s.uptime_human ? `up ${s.uptime_human}` : '';
   $('updated').textContent = s.updated_iso ? `bar ${s.last_bar_iso||'—'}` : '';
 
-  const ret = s.peak_equity ? (s.equity/100 - 1) : 0;
+  // Measured against where this run actually started, not a hardcoded figure.
+  // This read 100 for a long time, which showed a 1014 USDT account as +914%.
+  const base = s.starting_equity || 0;
+  const ret = base ? (s.equity/base - 1) : 0;
   $('kpis').innerHTML = [
-    ['Equity', fmt(s.equity), cls(s.equity-100)],
+    ['Equity', fmt(s.equity), cls(base ? s.equity-base : 0)],
     ['Return', pct(ret), cls(ret)],
     ['Drawdown', pct(s.drawdown), s.drawdown>0.1?'warn':''],
     ['Risk mult', fmt(s.risk_multiplier)+'×', s.risk_multiplier<1?'warn':''],

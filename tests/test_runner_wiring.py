@@ -6,7 +6,6 @@ corresponds to something that was silently doing nothing.
 """
 
 import json
-import time
 
 import pytest
 
@@ -572,9 +571,18 @@ def test_an_existing_stop_at_the_right_level_is_adopted_not_replaced():
     assert broker.place_stop("VVV/USDT", 65.62431, 23.352, "cid") == "live-stop"
 
 
-def test_retrying_a_stop_does_not_reuse_a_refused_client_id():
-    """Bybit remembers cancelled ids and refuses them with 170141."""
-    from tbot.execution.ccxt_broker import CCXTBroker
+def test_stop_client_id_is_the_callers_and_varies_per_attempt():
+    """Bybit remembers cancelled ids and refuses them with 170141.
+
+    Uniqueness lives in the caller, which is also what lets reconciliation
+    recognise the bot's own stop instead of calling it an orphan. Duplicate
+    stops are prevented by place_stop adopting an existing one, not by the id.
+    """
+    from tbot.execution.broker import client_order_id
+
+    first = client_order_id("momentum", "VVV/USDT", 1, "stop-1000")
+    second = client_order_id("momentum", "VVV/USDT", 1, "stop-1001")
+    assert first != second, "a later attempt must not reuse a refused id"
 
     seen = []
 
@@ -595,15 +603,12 @@ def test_retrying_a_stop_does_not_reuse_a_refused_client_id():
             seen.append(kwargs["params"]["clientOrderId"])
             return {"id": f"stop-{len(seen)}"}
 
-    broker = CCXTBroker.__new__(CCXTBroker)
-    broker.exchange = Exchange()
-    broker.load_markets = lambda: None
+    broker = _broker_with(Exchange())
+    broker.place_stop("VVV/USDT", 65.62431, 23.35, first)
+    broker.place_stop("VVV/USDT", 65.62431, 23.35, second)
 
-    broker.place_stop("VVV/USDT", 65.62431, 23.35, "cid")
-    time.sleep(0.002)
-    broker.place_stop("VVV/USDT", 65.62431, 23.35, "cid")
-
-    assert seen[0] != seen[1], "a retry must not reuse an id the venue already refused"
+    # Passed through verbatim so the caller can record what it sent.
+    assert seen == [first, second]
 
 
 def test_replacing_a_stop_at_a_different_level_releases_the_old_one():
@@ -679,3 +684,303 @@ def test_balance_that_changed_while_the_engine_was_down_is_reported(tmp_path):
     recorded.clear()
     runner._check_balance_against_last_run(50063.15 * 0.95)
     assert not recorded
+
+
+# --------------------------------------------------------------------------
+# A remembered client id is evidence, not a rejection
+# --------------------------------------------------------------------------
+
+
+def _duplicate_error():
+    import ccxt
+
+    return ccxt.BaseError('bybit {"retCode":170141,"retMsg":"Duplicate clientOrderId."}')
+
+
+def _broker_with(exchange):
+    from tbot.core.models import MarketSpec
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = exchange
+    broker.quote = "USDT"
+    broker.load_markets = lambda: None
+    broker.market_spec = lambda symbol: MarketSpec(
+        symbol=symbol,
+        base=symbol.split("/")[0],
+        quote="USDT",
+        price_step=0.001,
+        amount_step=0.01,
+        min_amount=0.01,
+        min_notional=5.0,
+        maker_fee=0.001,
+        taker_fee=0.001,
+    )
+    return broker
+
+
+def _entry_order():
+    from tbot.core.models import Order, OrderType, Side
+
+    return Order(
+        client_id="tb-vvv-entry-abc",
+        symbol="VVV/USDT",
+        side=Side.BUY,
+        type=OrderType.MARKET,
+        quantity=65.0,
+    )
+
+
+class _FilledDuplicate:
+    """Venue that refuses the id and reports the original as Filled."""
+
+    def __init__(self, held):
+        self.held = held
+
+    def fetch_open_orders(self, symbol):
+        return []  # terminal orders are invisible here — that is the trap
+
+    def fetch_balance(self):
+        return {"total": {"VVV": self.held, "USDT": 1000.0}}
+
+    def amount_to_precision(self, symbol, amount):
+        return f"{amount:.2f}"
+
+    def create_order(self, **kwargs):
+        raise _duplicate_error()
+
+    def privateGetV5OrderHistory(self, params):
+        return {
+            "result": {
+                "list": [
+                    {
+                        "orderId": "venue-1",
+                        "orderLinkId": "tb-vvv-entry-abc",
+                        "orderStatus": "Filled",
+                        "cumExecQty": "65.0",
+                        "cumExecValue": "1740.0",
+                    }
+                ]
+            }
+        }
+
+
+def test_duplicate_id_whose_fill_we_still_hold_is_adopted():
+    """The deterministic id exists to stop exactly this becoming two positions."""
+    result = _broker_with(_FilledDuplicate(held=65.0)).submit(_entry_order())
+    assert result.exchange_id == "venue-1"
+    assert result.filled_quantity == pytest.approx(65.0)
+
+
+def test_duplicate_id_whose_inventory_is_gone_is_not_adopted():
+    """A filled order is evidence only of a position we still hold.
+
+    Observed live after a reset: the venue still listed a pre-reset entry as
+    Filled, the engine adopted it, and booked a 1699 USDT position on a 1000
+    USDT account — cash went to -699 and the position existed nowhere but in
+    the bot. Skipping the bar is the cheap mistake; the next bar's client id
+    differs anyway.
+    """
+    from tbot.core.models import OrderStatus
+
+    result = _broker_with(_FilledDuplicate(held=0.004)).submit(_entry_order())
+    assert result.status is OrderStatus.REJECTED
+    assert "inventory is gone" in (result.reject_reason or "")
+
+
+def test_duplicate_id_whose_original_was_cancelled_is_reissued():
+    """A cancelled order opened nothing, so the intent may be sent again.
+
+    This is what a local reset looks like: the venue still remembers ids from
+    orders our wiped database no longer knows about. Treating that as a plain
+    rejection retired the symbol after three tries.
+    """
+    sent = []
+
+    class Exchange:
+        def fetch_open_orders(self, symbol):
+            return []
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.2f}"
+
+        def create_order(self, **kwargs):
+            sent.append(kwargs["params"]["clientOrderId"])
+            if len(sent) == 1:
+                raise _duplicate_error()
+            return {"id": "venue-2", "status": "closed", "filled": 65.0, "average": 26.8}
+
+        def fetch_balance(self):
+            return {"total": {"USDT": 1000.0}}
+
+        def privateGetV5OrderHistory(self, params):
+            return {
+                "result": {
+                    "list": [{"orderLinkId": "tb-vvv-entry-abc", "orderStatus": "Cancelled"}]
+                }
+            }
+
+    result = _broker_with(Exchange()).submit(_entry_order())
+    assert result.exchange_id == "venue-2"
+    assert sent[0] != sent[1], "the refused id must not be reused"
+
+
+def test_unsellable_dust_is_not_reported_as_a_position():
+    """0.00431 VVV cannot be sold — min_amount is 0.01 — so it is not a position.
+
+    Reporting it every restart as an unmanaged position is a warning no action
+    can ever clear, which only teaches the operator to ignore the channel.
+    """
+
+    class Exchange:
+        def fetch_balance(self):
+            return {"total": {"USDT": 1000.0, "VVV": 0.00431, "BTC": 0.5}}
+
+    positions = _broker_with(Exchange()).fetch_positions()
+    assert "VVV/USDT" not in positions
+    assert positions["BTC/USDT"] == pytest.approx(0.5)
+
+
+# --------------------------------------------------------------------------
+# The scan table must never claim "eligible" for a symbol it passed over
+# --------------------------------------------------------------------------
+
+
+def _scan_row(symbol, score):
+    from tbot.core.models import Regime, ScanRow, Side
+
+    return ScanRow(
+        symbol=symbol,
+        bar_ts=0,
+        regime=Regime.TREND_UP,
+        best_side=Side.BUY,
+        score=score,
+        threshold=62.0,
+        no_trade_reason=None,
+    )
+
+
+def test_every_candidate_ends_the_bar_with_a_reason():
+    """A row left at None renders as "eligible" — a lie about a rejected symbol.
+
+    Observed live: VVV scored 69.2 against a threshold of 62, no position was
+    opened, and the dashboard showed it as eligible with nothing explaining the
+    gap. The scans table exists so that question is answered by query.
+    """
+    from tbot.core.config import RiskConfig
+    from tbot.core.models import NoTradeReason
+    from tbot.engine.runner import Runner
+
+    rows = [_scan_row("AAA/USDT", 80.0), _scan_row("BBB/USDT", 70.0), _scan_row("CCC/USDT", 65.0)]
+
+    class Portfolio:
+        positions: dict = {}
+
+    class OneEntry(Runner):
+        # Runner uses __slots__, so the behaviour is injected by subclassing.
+        # The best candidate enters; the rest were never tried, not rejected.
+        def _enter(self, data, row, bar_ts):
+            return row.symbol == "AAA/USDT"
+
+    runner = OneEntry.__new__(OneEntry)
+    runner.portfolio = Portfolio()
+    runner.config = type("C", (), {"risk": RiskConfig(max_positions=3)})()
+
+    runner._maybe_enter({r.symbol: {} for r in rows}, rows, 0)
+
+    assert rows[0].no_trade_reason is NoTradeReason.ENTERED
+    assert all(r.no_trade_reason is not None for r in rows), "no row may stay 'eligible'"
+    assert rows[1].no_trade_reason is NoTradeReason.COOLDOWN_SAME_BAR
+
+
+def test_candidates_past_the_position_limit_say_so():
+    from tbot.core.config import RiskConfig
+    from tbot.core.models import NoTradeReason
+    from tbot.engine.runner import Runner
+
+    rows = [_scan_row("AAA/USDT", 80.0), _scan_row("BBB/USDT", 70.0)]
+
+    class Portfolio:
+        positions = {"XXX/USDT": object(), "YYY/USDT": object()}
+
+    class NeverEnters(Runner):
+        def _enter(self, data, row, bar_ts):
+            raise AssertionError("must not try to enter when full")
+
+    runner = NeverEnters.__new__(NeverEnters)
+    runner.portfolio = Portfolio()
+    runner.config = type("C", (), {"risk": RiskConfig(max_positions=2)})()
+
+    runner._maybe_enter({r.symbol: {} for r in rows}, rows, 0)
+    assert all(r.no_trade_reason is NoTradeReason.MAX_POSITIONS for r in rows)
+
+
+def test_a_new_position_does_not_inherit_the_previous_one_s_entry(tmp_path):
+    """The conflict key is the symbol, so a new trade lands on the old row.
+
+    Observed live: VVV filled at 26.171 but the database kept entry_price
+    25.865 from the previous position in that symbol. Every R-based number for
+    the trade — expectancy, MAE, MFE — was then measured against a different
+    trade's entry, which is the measurement the whole system rests on.
+    """
+    from tbot.core.db import Database
+    from tbot.core.models import Position, Side
+
+    db = Database(tmp_path / "t.db")
+    db.start_run(mode="live", venue="bybit-demo", config_hash="x")
+
+    def position(quantity, entry, stop):
+        return Position(
+            symbol="VVV/USDT",
+            side=Side.BUY,
+            quantity=quantity,
+            entry_price=entry,
+            entry_ts=1,
+            initial_stop=stop,
+            current_stop=stop,
+            setup="momentum_continuation",
+            risk_amount=3.0,
+        )
+
+    db.upsert_position(position(65.69, 25.865, 23.125))
+    db.upsert_position(position(1.31, 26.171, 23.431))
+
+    stored = {p["symbol"]: p for p in db.load_positions()}["VVV/USDT"]
+    assert stored["entry_price"] == pytest.approx(26.171)
+    assert stored["initial_stop"] == pytest.approx(23.431)
+    assert stored["quantity"] == pytest.approx(1.31)
+
+
+def test_position_meta_survives_a_restart(tmp_path):
+    """meta carries stop_order_id — the handle on the venue's protective stop.
+
+    Dropping it on load left the engine unable to move a stop it had placed
+    itself, so every restart silently lost the trail, and reconciliation
+    reported the bot's own stop as an orphan for ever.
+    """
+    import json as json_mod
+
+    from tbot.core.db import Database
+    from tbot.core.models import Position, Side
+
+    db = Database(tmp_path / "t.db")
+    db.start_run(mode="live", venue="bybit-demo", config_hash="x")
+
+    position = Position(
+        symbol="VVV/USDT",
+        side=Side.BUY,
+        quantity=1.31,
+        entry_price=26.171,
+        entry_ts=1,
+        initial_stop=23.431,
+        current_stop=23.431,
+        setup="momentum_continuation",
+        risk_amount=3.0,
+    )
+    position.meta = {"stop_order_id": "2306901319086247168", "entry_atr": 2.42}
+    db.upsert_position(position)
+
+    raw = {p["symbol"]: p for p in db.load_positions()}["VVV/USDT"]
+    restored = json_mod.loads(raw["meta"]) if raw.get("meta") else {}
+    assert restored.get("stop_order_id") == "2306901319086247168"
+    assert restored.get("entry_atr") == pytest.approx(2.42)

@@ -175,12 +175,125 @@ class CCXTBroker(Broker):
             log.warning("order_rejected_funds", symbol=order.symbol, error=str(exc)[:160])
             return order
         except ccxt.BaseError as exc:
+            if "170141" in str(exc) or "Duplicate clientOrderId" in str(exc):
+                return self._resolve_duplicate(order, amount, price, params)
             order.status = OrderStatus.REJECTED
             order.reject_reason = str(exc)[:200]
             log.error("order_rejected", symbol=order.symbol, error=str(exc)[:200])
             return order
 
         return self._merge(order, response)
+
+    def _resolve_duplicate(self, order: Order, amount: float, price, params: dict) -> Order:
+        """The venue already knows this client id. Find out what became of it.
+
+        Client ids are deterministic so that a crash between sending and
+        recording cannot open a second position. The venue remembers them past
+        the order's life, so the same id also comes back after the local
+        database is wiped — and ``_find_by_client_id`` only searches *open*
+        orders, so a terminal one is invisible and the resend is refused.
+
+        What to do depends entirely on the original order's fate:
+
+        * it filled, or is still live -> adopt it. Sending another would be the
+          duplicate position the deterministic id exists to prevent.
+        * it was cancelled or rejected -> no position came of it, so the intent
+          is unfulfilled and may legitimately be re-sent under a fresh id.
+        """
+        historic = self._find_in_history(order.symbol, order.client_id)
+        status = str((historic or {}).get("orderStatus") or "")
+
+        if status in ("New", "PartiallyFilled"):
+            log.info("duplicate_order_adopted", client_id=order.client_id, status=status)
+            return self._merge(order, self._from_raw_v5(historic))
+
+        if status in ("Filled", "PartiallyFilledCanceled"):
+            # A filled order is only evidence of a position we still hold. The
+            # venue remembers fills whose inventory has since been sold — by a
+            # stop, by hand, or by a reset — and adopting one of those invents a
+            # position that does not exist, with negative cash to match.
+            executed = float(historic.get("cumExecQty") or 0.0)
+            held = self._balances("total").get(order.symbol.split("/")[0], 0.0)
+            if held >= executed * 0.95:
+                log.info("duplicate_order_adopted", client_id=order.client_id, status=status)
+                return self._merge(order, self._from_raw_v5(historic))
+
+            # Inventory is gone, so that fill is spent. Re-sending under a new id
+            # might be right, but might also double an entry whose exit we simply
+            # have no record of. Skipping one bar is the cheap mistake: the next
+            # bar has a different bar_ts, so a fresh id follows on its own.
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = (
+                f"client id already used by a filled order whose inventory is gone "
+                f"(executed {executed:g}, held {held:g}) — skipping this bar"
+            )
+            log.warning(
+                "duplicate_order_inventory_gone",
+                symbol=order.symbol,
+                executed=executed,
+                held=held,
+                action="entry skipped; the next bar gets a fresh client id",
+            )
+            return order
+
+        if historic is None:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "duplicate client id, and the original could not be found"
+            log.error("duplicate_order_unresolved", symbol=order.symbol, client_id=order.client_id)
+            return order
+
+        # Cancelled or rejected: nothing was opened, so re-issue the intent.
+        retry_id = f"{order.client_id[:24]}-r{int(time.time() * 1000) % 100_000}"
+        log.info(
+            "duplicate_order_reissued",
+            symbol=order.symbol,
+            original_status=status,
+            client_id=retry_id,
+        )
+        try:
+            response = self.exchange.create_order(
+                symbol=order.symbol,
+                type=order.type.value,
+                side=order.side.value,
+                amount=amount,
+                price=price,
+                params={**params, "clientOrderId": retry_id},
+            )
+        except ccxt.BaseError as exc:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = str(exc)[:200]
+            log.error("order_rejected", symbol=order.symbol, error=str(exc)[:200])
+            return order
+
+        order.client_id = retry_id
+        return self._merge(order, response)
+
+    def _find_in_history(self, symbol: str, client_id: str) -> dict | None:
+        """The order's final state, including terminal ones open-order calls hide."""
+        try:
+            response = self.exchange.privateGetV5OrderHistory(
+                {"category": "spot", "symbol": symbol.replace("/", ""), "orderLinkId": client_id}
+            )
+        except ccxt.BaseError as exc:
+            log.warning("order_history_lookup_failed", symbol=symbol, error=str(exc)[:120])
+            return None
+        for raw in (response.get("result") or {}).get("list") or []:
+            if str(raw.get("orderLinkId") or "") == client_id:
+                return raw
+        return None
+
+    @staticmethod
+    def _from_raw_v5(raw: dict) -> dict:
+        """Shape a raw v5 order like the ccxt dict ``_merge`` expects."""
+        filled = float(raw.get("cumExecQty") or 0.0)
+        value = float(raw.get("cumExecValue") or 0.0)
+        return {
+            "id": raw.get("orderId"),
+            "status": "closed" if raw.get("orderStatus") == "Filled" else "open",
+            "filled": filled,
+            "average": (value / filled) if filled else None,
+            "info": raw,
+        }
 
     def cancel(self, client_id: str, symbol: str | None = None) -> bool:
         try:
@@ -340,7 +453,11 @@ class CCXTBroker(Broker):
                 params={
                     "stopLossPrice": trigger,
                     "reduceOnly": True,
-                    "clientOrderId": f"{client_id[:24]}-{int(time.time() * 1000) % 1_000_000}",
+                    # Unique per attempt, supplied by the caller: the venue
+                    # remembers cancelled ids and refuses them (170141). Two
+                    # stops on one holding are prevented by the adopt check
+                    # above, not by the id.
+                    "clientOrderId": client_id,
                     "triggerDirection": 2,  # trigger on a falling price
                 },
             )
@@ -397,8 +514,22 @@ class CCXTBroker(Broker):
         had closed the position, drop it from the portfolio, and stop managing
         a holding it still owned.
         """
-        balances = self._balances("total")
-        return {f"{k}/{self.quote}": v for k, v in balances.items() if k != self.quote and v > 0}
+        positions = {}
+        for coin, amount in self._balances("total").items():
+            if coin == self.quote or amount <= 0:
+                continue
+            symbol = f"{coin}/{self.quote}"
+            # Below the venue's minimum order size there is no way to sell it,
+            # so it is not a position — it is a residue no action can clear.
+            # Reporting it forever as "unmanaged" only trains the operator to
+            # ignore that warning.
+            try:
+                if amount < self.market_spec(symbol).min_amount:
+                    continue
+            except Exception:  # noqa: BLE001 — no market for it, report and let the operator see
+                pass
+            positions[symbol] = amount
+        return positions
 
     def fetch_ticker(self, symbol: str) -> dict:
         try:

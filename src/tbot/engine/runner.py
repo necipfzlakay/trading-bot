@@ -212,6 +212,7 @@ class Runner:
         self.risk.update_equity(balance)
         self.state.equity = balance
         self.state.cash = self.portfolio.cash
+        self.state.starting_equity = self.portfolio.starting_cash
         self.state.open_positions = self._positions_view()
         self.state.status = "running" if self.state.status != "safe_mode" else "safe_mode"
         self.writer.write(self.state)
@@ -779,12 +780,26 @@ class Runner:
         return rows
 
     def _maybe_enter(self, frames: dict, scans: list[ScanRow], bar_ts: int) -> None:
+        """Try candidates best-first, and leave a reason on every one of them.
+
+        Every row here ends the bar with a ``no_trade_reason`` set. A row left
+        at ``None`` reads as "eligible" in the scan table, which is a lie about
+        a symbol that was considered and passed over — and that table exists
+        precisely so "why did it not trade?" is answered by query, not guess.
+        """
         candidates = sorted((r for r in scans if r.no_trade_reason is None), key=lambda r: -r.score)
-        for row in candidates:
+        for index, row in enumerate(candidates):
             if len(self.portfolio.positions) >= self.config.risk.max_positions:
+                for remaining in candidates[index:]:
+                    remaining.no_trade_reason = NoTradeReason.MAX_POSITIONS
                 return
             if self._enter(frames[row.symbol], row, bar_ts):
-                return  # one entry per bar keeps concentration under control
+                row.no_trade_reason = NoTradeReason.ENTERED
+                # One entry per bar keeps concentration under control. The ones
+                # not reached were not rejected — say so rather than implying it.
+                for remaining in candidates[index + 1 :]:
+                    remaining.no_trade_reason = NoTradeReason.COOLDOWN_SAME_BAR
+                return
 
     def _enter(self, data: dict, row: ScanRow, bar_ts: int) -> bool:
         setup_frame = data["setup"]
@@ -792,12 +807,15 @@ class Runner:
             setup_frame, row.regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
         )
         if not setups:
+            # Scored well enough, but no entry trigger fired on this bar.
+            row.no_trade_reason = NoTradeReason.NO_SETUP
             return False
 
         candidate = setups[0]
         price = float(data["trigger"]["close"].iloc[-1])
         stop = price - candidate.stop_distance
         if stop >= price:
+            row.no_trade_reason = NoTradeReason.NO_SETUP
             return False
 
         spec = self.broker.market_spec(row.symbol)
@@ -818,6 +836,7 @@ class Runner:
             min_notional_buffer=self.config.execution.min_notional_buffer,
         )
         if not sizing.ok:
+            row.no_trade_reason = sizing.rejected or NoTradeReason.MIN_NOTIONAL
             log.info("entry_skipped", symbol=row.symbol, reason=sizing.detail)
             return False
 
@@ -834,6 +853,7 @@ class Runner:
             # A crash between sending and recording would otherwise double the
             # position on restart.
             log.info("duplicate_order_suppressed", client_id=order.client_id)
+            row.no_trade_reason = NoTradeReason.COOLDOWN_SAME_BAR
             return False
 
         order.meta = {
@@ -847,6 +867,7 @@ class Runner:
         submitted = self.watchdog.call("submit_order", lambda: self.broker.submit(order))
         if submitted is None or submitted.status.value in ("rejected", "expired"):
             self._record_rejection(row.symbol, submitted)
+            row.no_trade_reason = NoTradeReason.INSUFFICIENT_BALANCE
             return False
         self._rejections.pop(row.symbol, None)
         self.db.upsert_order(submitted)
@@ -882,6 +903,7 @@ class Runner:
             )
             self.watchdog.call("cancel_remainder", lambda: self.broker.cancel(submitted.client_id))
             if filled <= 0:
+                row.no_trade_reason = NoTradeReason.MIN_NOTIONAL
                 return False
 
         fill = Fill(
@@ -977,7 +999,12 @@ class Runner:
         if not isinstance(self.broker, CCXTBroker):
             return
 
-        client_id = client_order_id(position.setup, position.symbol, bar_ts, "stop")
+        # Unique per attempt: a stop that is replaced cannot reuse the id the
+        # venue already refused. Duplicate stops are prevented by place_stop
+        # adopting an existing one, not by the id being stable.
+        client_id = client_order_id(
+            position.setup, position.symbol, bar_ts, f"stop-{int(now_ms() / 1000)}"
+        )
         order_id = self.watchdog.call(
             "place_stop",
             lambda: self.broker.place_stop(
@@ -986,6 +1013,10 @@ class Runner:
         )
         if order_id:
             position.meta["stop_order_id"] = order_id
+            # Remembered so reconciliation recognises the bot's own stop instead
+            # of reporting it as an orphan on every start — a warning nothing
+            # can clear is a warning that gets ignored.
+            position.meta["stop_client_id"] = client_id
             self.db.upsert_position(position)
         else:
             # The position is now protected only while this process is alive.
@@ -1141,6 +1172,10 @@ class Runner:
                 max_adverse_price=raw["max_adverse_price"],
                 bars_held=raw["bars_held"],
                 conviction_at_entry=raw["conviction_at_entry"],
+                # Restoring meta is not cosmetic: it carries stop_order_id, so
+                # dropping it left the engine unable to move the venue stop it
+                # had itself placed. Every restart then lost the trail.
+                meta=json.loads(raw["meta"]) if raw.get("meta") else {},
             )
 
         if self.config.mode is not Mode.LIVE:
@@ -1157,11 +1192,33 @@ class Runner:
             or []
         )
         known = {o["client_id"] for o in self.db.query("SELECT client_id FROM orders")}
+        # Protective stops never reach the orders table; they are ours all the
+        # same. Matched by venue order id as well as client id, because a stop
+        # placed by an older build recorded only the former — and a warning that
+        # nothing can clear is a warning that gets ignored.
+        own_stops = {
+            str(p.meta.get("stop_order_id") or "") for p in self.portfolio.positions.values()
+        }
+        known |= {
+            p.meta["stop_client_id"]
+            for p in self.portfolio.positions.values()
+            if p.meta.get("stop_client_id")
+        }
+        open_orders = [
+            o for o in open_orders if not (o.exchange_id and str(o.exchange_id) in own_stops)
+        ]
 
         report = reconcile(self.portfolio.positions, venue_positions, open_orders, known)
         self.portfolio.positions = apply_reconcile(
             report, self.portfolio.positions, venue_positions
         )
+
+        # Dropping it from memory is not enough: the row is reloaded on the next
+        # start, dropped again, and warns again — for ever. Worse, it keeps the
+        # symbol's stale entry price alive to be inherited by the next position
+        # opened there.
+        for symbol in report.missing_remotely:
+            self.db.delete_position(symbol)
 
         self.db.record_event(
             "reconcile",
@@ -1370,6 +1427,7 @@ class Runner:
         self.state.equity = point.equity
         self.state.cash = point.cash
         self.state.peak_equity = self.portfolio.peak_equity
+        self.state.starting_equity = self.portfolio.starting_cash
         self.state.drawdown = point.drawdown
         self.state.risk_multiplier = self.risk.risk_multiplier
         self.state.threshold = self.conviction.current_threshold(self.risk.threshold_bump())

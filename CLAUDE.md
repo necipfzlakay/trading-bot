@@ -78,6 +78,25 @@ testi oku — hepsinin kendini koruyan bir testi var.
     üretir. → `_check_balance_against_last_run`
 29. **Sıfırlama gerçek paraya dokunamaz.** `scripts/venue_reset.py` yalnızca
     `bybit-demo` kabul eder ve bunu değiştiren bayrak yoktur.
+30. **Yinelenen client id red değil kanıttır.** Borsa id'yi hatırlıyorsa emir
+    *vardı*: dolan/açık olan benimsenir (çift pozisyon olmaz), iptal edilmiş
+    olan yeni id ile tekrar gönderilir (niyet gerçekleşmemişti).
+    → `_resolve_duplicate`
+31. **Satılamayan miktar pozisyon değildir.** `min_amount` altı bakiye
+    `fetch_positions`'ta görünmez — temizlenemeyen uyarı üretmemeli.
+32. **Dolan emir, hâlâ elde tutulan pozisyonun kanıtıdır.** Borsa geçmişi malı
+    satılmış dolumları da hatırlar; benimsemeden önce envanter doğrulanır,
+    yoksa o bar atlanır. → `_resolve_duplicate`
+33. **Yüzdeler gerçekten var olan paraya göre ölçülür.** `starting_equity`
+    state'te taşınır; hiçbir arayüz sabit bir taban sayı kullanamaz.
+34. **Hiçbir tarama satırı sebepsiz kalamaz.** `no_trade_reason=None` panelde
+    "eligible" demek; değerlendirilip elenen sembol için bu yalandır.
+    → `test_every_candidate_ends_the_bar_with_a_reason`
+35. **Upsert pozisyonun tamamını tazeler.** Çakışma anahtarı sembol olduğu için
+    yeni bir pozisyon eskisinin satırına düşer; giriş fiyatı miras kalırsa R
+    ölçümü başka bir işleme ait olur. → `upsert_position`
+36. **`meta` kalıcıdır.** `stop_order_id`'yi taşır; kaybolursa motor kendi
+    borsa stop'unu ne taşıyabilir ne tanıyabilir. → `_reconcile`
 
 ## Denetim (2026-09-17) — bulunan ve kapatılan
 
@@ -126,6 +145,14 @@ Bunların hiçbiri teste takılmamıştı; üçü de gerçek Bybit demo koşusun
 | 27 | **Önce iptal, sonra yerleştir** — çalışan stop iptal edildi, yerine koyma başarısız oldu, pozisyon korumasız kaldı. Üstelik stop client id'si deterministik olduğu için tekrar deneme `170141 Duplicate clientOrderId` alıyordu | kritik | var olan stop **benimseniyor**; iptal sadece gerçekten değiştirilecekse; retry id'si benzersiz |
 | 28 | Açık pozisyonlar `state.json`'a sadece bar kapanışında yazılıyordu — açılıştan ilk bara kadar (1h'e kadar) panel ve `status` "pozisyon yok" diyordu | orta | `_positions_view` açılışta da yayımlanıyor |
 | 29 | Kod değişince launchd yeniden başlatmıyor; bot sessizce eski kodu çalıştırmaya devam ediyordu | orta | `bot.sh status` kaynak dosya mtime'ını süreç başlangıcıyla karşılaştırıyor |
+| 31 | **Yerel sıfırlama sonrası girişler reddediliyordu.** Borsa client id'leri emrin ömründen sonra da hatırlıyor; `_find_by_client_id` sadece *açık* emirlere baktığı için iptal edilmiş eski emir görünmüyor, yeniden gönderiliyor, `170141 Duplicate clientOrderId` alıyordu. 3 red sonrası sembol evrenden düşüyordu | yüksek | `_resolve_duplicate`: dolan/açık **benimsenir**, iptal edilmiş yeni id ile tekrar gönderilir |
+| 33 | **Panel getiriyi 100'e bölüyordu** — sabit kodlanmış eski hesap büyüklüğü. 1014 USDT'lik hesap `%914.8` getiri gösteriyordu. Başlangıç sermayesi state'e hiç taşınmıyordu | yüksek | `EngineState.starting_equity` + panel ona bölüyor |
+| 35 | **`_enter` beş yerden sessizce çıkıyordu** — tarama satırının sebebi hiç güncellenmiyordu, elenen sembol panelde `eligible` görünüyordu. "Neden işlem yapmadı" tablosunun tam olarak engellemek için var olduğu şey | yüksek | her red yolu `no_trade_reason` yazıyor; ulaşılmayan adaylar da işaretleniyor |
+| 36 | **`upsert_position` çakışmada giriş fiyatını güncellemiyordu.** Çakışma anahtarı `symbol`; aynı sembolde açılan **yeni** pozisyon eskisinin `entry_price`/`initial_stop`/`entry_ts`'ini miras alıyordu. R, MAE, MFE — hepsi başka bir işlemin girişine göre ölçülüyordu | kritik | tüm kimlik alanları güncelleniyor |
+| 37 | **Pozisyon `meta`'sı DB'den hiç geri yüklenmiyordu.** İçinde `stop_order_id` var: her restart'ta motor kendi koyduğu borsa stop'unun tutamağını kaybediyor, trailing ilerleyemiyordu. Ayrıca kendi stop'unu sonsuza kadar "orphan" diye raporluyordu | kritik | `meta` yükleniyor |
+| 38 | Mutabakat borsada olmayan pozisyonu bellekten düşürüyor ama DB satırını bırakıyordu — her açılışta tekrar yükleniyor, tekrar düşürülüyor, tekrar uyarıyordu | orta | `delete_position` |
+| 34 | **Sıfırlama sonrası hayalet pozisyon.** `_resolve_duplicate` borsa geçmişindeki "Filled" emri benimsiyordu; ama o dolumun malı sıfırlamada satılmıştı. 1000 USDT'lik hesaba 1699 USDT'lik pozisyon yazıldı, nakit −699 oldu | kritik | dolumu benimsemeden önce envanter doğrulanıyor; yoksa bar atlanıyor |
+| 32 | Satılamayacak toz bakiye (0.00431 VVV, `min_amount` 0.01) her açılışta "unmanaged position" diye uyarıyordu — hiçbir eylemin temizleyemeyeceği bir uyarı, kanalı görmezden gelmeyi öğretir | düşük | `fetch_positions` `min_amount` altını atıyor |
 | 30 | **Motor kapalıyken değişen bakiye sessizce kabul ediliyordu.** Implausible-jump koruması sadece bir koşu *içinde* bar-bar karşılaştırıyor; 50.063 → 1.763 (%97 düşüş) yeniden başlatmada yeni taban olarak benimsendi. Restart arası bir değişimi piyasa açıklayamaz: para çekimi, elle işlem, yanlış hesap ya da sıfırlama | yüksek | `_check_balance_against_last_run` |
 
 **Açık, düzeltilmedi:** `report.py` ve panel `run_id`/`mode` filtrelemiyor. `runs`
