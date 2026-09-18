@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 319 test
+.venv/bin/python -m pytest -q             # 386 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -100,6 +100,47 @@ testi oku — hepsinin kendini koruyan bir testi var.
 37. **Motor beklerken de nabız atar.** `HEARTBEAT_SECONDS=60`; ölü-adam
     anahtarı ancak nabız kadar keskin olabilir. Bar uzunluğu, arıza tespit
     süresini belirlememeli.
+38. **Bar arası yalnız seviye sorulur, indikatör hesaplanmaz.** Bar kapanışında
+    hesaplanmış bir sayıya fiyat değdi mi — tek izinli soru. Oluşmakta olan barda
+    indikatör hesaplamak backtest'in canlı yolu üretmesini imkânsız kılar, ki bu
+    repodaki her sayı ona dayanıyor. → `ExitManager.evaluate_intrabar`
+39. **Bybit spot'ta stop ve kar-al aynı anda duramaz.** Stop base varlığı
+    kilitliyor; ikinci reduce-only emir `170131` ile reddediliyor (demo'da
+    ölçüldü). Bu yüzden **stop borsada, hedef motorda**. Asimetri kasıtlı:
+    kaçırılan hedef fırsat kaybı, eksik stop sermaye kaybı.
+40. **Aynı barda hem stop hem hedef tetiklenirse stop dolmuş sayılır.** Bar OHLC
+    hangisinin önce olduğunu söyleyemez; kötümser seçilir. Aksi halde canlı R
+    backtest'ten *iyi* çıkar — ve kimse hoş sürprizi soruşturmaz.
+41. **Kurulu giriş emrinin ömrü bir bardır** ve iptali **doğrulanır.** Seviyeyi
+    üreten kanal kaydı; kalan emir, stratejinin artık fikri olmadığı bir fiyattan
+    dolar. Sessizce başarısız olan iptal, hiç yapılmamış iptalden kötüdür.
+42. **Feed thread'i Broker, Database, Portfolio veya Store'a dokunmaz.** Kendi
+    dict'ine kendi kilidiyle yazar; emri motor thread'i verir. Ayrıca public veri
+    olduğu için o thread'e hiç anahtar girmiyor.
+43. **Bybit public spot WS abonelik başına 10 topic alır.** 11'inci sembol
+    aboneliği *sessizce* askıda bırakıyor — hata yok, exception yok, sadece hiç
+    çözülmeyen bir future. Tüm evren kararıyor. Bisection ile ölçüldü.
+    → `MAX_TOPICS_PER_SUBSCRIPTION`
+44. **Borsanın kendi başına yaptığı işlemi motor bar kapanışını beklemeden
+    öğrenir.** Stop borsada dolduğunda motor bunu bir saate kadar bilmiyordu:
+    portföy yanlış, equity yanlış, slot boşa kilitli, ve sonraki barda olmayan
+    pozisyon için ikinci satış. İki okuma şart — tek okuma kanıt değil.
+    → `_detect_venue_exits`
+46. **Bekleme döngüsü niyeti değil geçen süreyi ölçer.** Zaman aşımları
+    `time.monotonic()` ile karşılaştırılır, adım adım toplanmaz. Toplayan sürüm
+    döngü içindeki işi görmüyordu: Telegram `getUpdates` bu makineden 3-8 saniye
+    sürüyor ve her 5 saniyelik tick'te çağrılıyordu, yani her tur gerçekte ~9
+    saniyeydi ama 5 sayılıyordu. Bar kapanışları **7-38 dakika geç** işlendi.
+    → `_wait_for_next_bar`
+47. **Telegram komutları yavaş şeritte.** `telegram.poll_seconds` (15s) ve ayrı
+    `poll_timeout` (3s). Komut bir kolaylık; açık pozisyonu izleyen kontrol
+    değil. Yavaş bir ağ, pozisyon takibini yavaşlatamaz.
+
+45. **Bot çalışırken alınan backtest ölçümü tekrarlanabilir değil.** Motor her
+    barda aynı parquet arşivine yazıyor; iki koşu arasında veri büyüyor. A/B
+    karşılaştırması `--to <tarih>` ile sabitlenmeli, yoksa kodun etkisi ile
+    verinin etkisi ayrılamaz. Bu bir kez 113→114 işlemlik "kod değişikliği"
+    üretti; kod aynıydı.
 
 ## Denetim (2026-09-17) — bulunan ve kapatılan
 
@@ -153,11 +194,52 @@ Bunların hiçbiri teste takılmamıştı; üçü de gerçek Bybit demo koşusun
 | 35 | **`_enter` beş yerden sessizce çıkıyordu** — tarama satırının sebebi hiç güncellenmiyordu, elenen sembol panelde `eligible` görünüyordu. "Neden işlem yapmadı" tablosunun tam olarak engellemek için var olduğu şey | yüksek | her red yolu `no_trade_reason` yazıyor; ulaşılmayan adaylar da işaretleniyor |
 | 36 | **`upsert_position` çakışmada giriş fiyatını güncellemiyordu.** Çakışma anahtarı `symbol`; aynı sembolde açılan **yeni** pozisyon eskisinin `entry_price`/`initial_stop`/`entry_ts`'ini miras alıyordu. R, MAE, MFE — hepsi başka bir işlemin girişine göre ölçülüyordu | kritik | tüm kimlik alanları güncelleniyor |
 | 37 | **Pozisyon `meta`'sı DB'den hiç geri yüklenmiyordu.** İçinde `stop_order_id` var: her restart'ta motor kendi koyduğu borsa stop'unun tutamağını kaybediyor, trailing ilerleyemiyordu. Ayrıca kendi stop'unu sonsuza kadar "orphan" diye raporluyordu | kritik | `meta` yükleniyor |
+| 40 | **Conviction-çöküş çıkışı hiç tetiklenmiyordu.** Belgelenen 4 katmanlı çıkış aslında 3 katmandı: `conviction_now=None` hem `runner.py:720` hem `backtest/engine.py:615` içinde sabit geçiliyordu. "Giriş sebebi öldü, stop'a kadar bekleme" mekanizması kapalıydı | yüksek | tutulan semboller için yeniden skorlanıyor; portföy-durumu engelleri nötrleniyor, engellenen skor **None** döner (değişmez 10 — sıfır her eşiğin altında olurdu ve her pozisyonu ilk barda kapatırdı) |
 | 39 | **`state.json` sadece bar kapanışında yazılıyordu.** Saatlik barda takılmış motor bekleyen motordan bir saat boyunca ayırt edilemiyordu; ölü-adam anahtarının eşiği de bu yüzden 90 dakikaya gevşetilmişti — yani yakalamak için var olduğu durumu 90 dakika boyunca kaçırıyordu, pozisyonlar o süre yönetilmeden | yüksek | bekleme döngüsünde 60s heartbeat; `healthcheck` eşiği 5400s → 600s |
 | 38 | Mutabakat borsada olmayan pozisyonu bellekten düşürüyor ama DB satırını bırakıyordu — her açılışta tekrar yükleniyor, tekrar düşürülüyor, tekrar uyarıyordu | orta | `delete_position` |
 | 34 | **Sıfırlama sonrası hayalet pozisyon.** `_resolve_duplicate` borsa geçmişindeki "Filled" emri benimsiyordu; ama o dolumun malı sıfırlamada satılmıştı. 1000 USDT'lik hesaba 1699 USDT'lik pozisyon yazıldı, nakit −699 oldu | kritik | dolumu benimsemeden önce envanter doğrulanıyor; yoksa bar atlanıyor |
 | 32 | Satılamayacak toz bakiye (0.00431 VVV, `min_amount` 0.01) her açılışta "unmanaged position" diye uyarıyordu — hiçbir eylemin temizleyemeyeceği bir uyarı, kanalı görmezden gelmeyi öğretir | düşük | `fetch_positions` `min_amount` altını atıyor |
 | 30 | **Motor kapalıyken değişen bakiye sessizce kabul ediliyordu.** Implausible-jump koruması sadece bir koşu *içinde* bar-bar karşılaştırıyor; 50.063 → 1.763 (%97 düşüş) yeniden başlatmada yeni taban olarak benimsendi. Restart arası bir değişimi piyasa açıklayamaz: para çekimi, elle işlem, yanlış hesap ya da sıfırlama | yüksek | `_check_balance_against_last_run` |
+
+### Dördüncü tur (2026-09-18, bar-arası katman kurulurken)
+
+Hepsi gerçek borsaya sorularak bulundu; hiçbiri test paketine takılmamıştı.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 41 | **Motor kendi borsa stop'unun dolduğunu bar kapanışına kadar öğrenmiyordu** — saatlik barda 1 saate kadar. O süre boyunca portföy yanlış, equity yanlış, pozisyon slotu boşa kilitli ve sonraki bar olmayan bir pozisyon için ikinci satış emri gönderiyor. `_manage_positions` borsaya sormuyor, `_reconcile` sadece açılışta çalışıyor | yüksek | `_detect_venue_exits`, 60s'de bir, iki okuma şartıyla |
+| 42 | **`_score_category` blok collapse uygulamıyordu** — değişmez kural 3 ihlali. Kategori içi yönlü indikatörlerin **ham ortalaması** alınıyordu, blok temsilcisi değil | orta | düzeltildi; **ölçülen etki ~sıfır** (PF 1.41 → 1.41, expectancy +0.364 → +0.362R). Gerçek sızıntı başka yerdeymiş: `vwap_distance`'ın blok arkadaşları (`rsi`, `bb_percent_b`, `donchian_pos`) **başka kategorilerde**, dolayısıyla kategori-içi collapse onları yakalayamaz. Asıl soru `vwap_distance`'ın `flow` sayılması — kategorizasyon sorunu, collapse sorunu değil. Sonucu değiştireceği için sessizce yapılmadı, işaretlendi |
+| 43 | **Bybit public spot WS 10 topic sınırı — sessiz askıda kalma.** 21 sembolün hepsi tek subscribe ile isteniyordu; 11'inci sembolde future hiç çözülmüyor. Hata yok, exception yok, reconnect yok. Tüm evren kararıyor ve loglarda hiçbir şey yazmıyor | yüksek | 10'luk parçalara bölündü, her parça bağımsız reconnect ediyor. Ölçüm: 21/21 sembol 3 saniyede |
+| 44 | **Spread ve hacim verisi hiç toplanmıyordu.** `ScanRow.spread_bps`/`volume_24h` hep 0, conviction'ın ceza dalları erişilemez, `NoTradeReason.SPREAD_TOO_WIDE` hiç atanmıyor, `universe.max_spread_bps: 8.0` hiçbir kod tarafından okunmuyor | orta | tek istekle 21 sembol için toplanıyor ve `scans` tablosuna yazılıyor. **Ceza dalları kapalı** (`microstructure_penalties: false`) — ölçülen spread 0.01–2.7bps, ceza tabanı 10bps, yani bugün hiçbir şeyi değiştirmezdi; bu da bir bulgu |
+| 45 | **Bot çalışırken alınan backtest ölçümü tekrarlanabilir değil.** İki koşu arasında 113 → 114 işlem, PF 1.41 → 1.39 farkı çıktı ve kod bit-bit aynıydı: motor her barda 63 parquet serisini yeniden yazıyor | orta | A/B'ler artık `--to <tarih>` ile sabitleniyor. Ölçüm disiplini sorunu, işlem güvenliği sorunu değil — ama yanlış atıf üretiyordu |
+
+| 46 | **Motor barları 7-38 dakika geç işliyordu.** Bekleme döngüsü `slept += step` ile *niyet edilen* süreyi topluyor, `time.sleep()` dışında geçen zamanı hiç saymıyordu. Telegram `getUpdates` bu makineden **3-8 saniye** sürüyor ve her 5s tick'te çağrılıyordu → her tur ~9s gerçek, 5s kayıtlı, döngü %80 aşıyor. Giriş fiyatı yarım saat bayat bir kapanıştan hesaplanıyordu ve **hiçbir logda tek satır yoktu** | yüksek | `_wait_for_next_bar`: bütün zaman aşımları `time.monotonic()`'e karşı; Telegram 15s'lik yavaş şeride alındı, poll timeout 5s→3s. Ölçüm: nabız aralığı ~110s → **64s** (hedef 60) |
+
+Bu sonuncusu, bir saat önce eklediğim ölü-adam nabzının kendisi tarafından
+yakalandı: nabız 60 saniyede bir atacaktı, 110 saniyede atıyordu. Bir ölçüm
+aracı kurup ilk işinin kendi çatısındaki bir arızayı göstermesi, aracın doğru
+kurulduğunun kanıtı.
+
+### Ölçülmüş borsa gerçekleri (2026-09-18, demo hesapta tek tek denendi)
+
+Varsayım değil, ccxt bayrağı değil — gerçek emirlerle sınandı. `fetchTradingFees`
+tam bu şekilde yanıltmıştı: ccxt "destekleniyor" dedi, Bybit **spot** reddetti.
+
+| deneme | sonuç |
+|---|---|
+| Açık stop varken kar-al emri | ❌ `170131 Insufficient balance` — stop 1.31 VVV'yi kilitliyor, serbest 0.003 |
+| Tek emirde stop + kar-al (OCO) | ❌ `InvalidOrder: only supports contract` |
+| Native trailing stop (spot) | ❌ aynı red |
+| `triggerDirection` ile trigger emri | ❌ `NotSupported: does not support triggerDirection for spot markets` |
+| `triggerPrice` + `orderFilter=StopOrder`, yön belirtmeden | ✅ kabul, `Untriggered` olarak duruyor, iptal edilebiliyor |
+| `publicGetV5MarketTickers` tek çağrı | ✅ 536 spot sembol; 21/21 evren için spread + `turnover24h` |
+| WS `watch_tickers`, 10 sembol / 11 sembol | ✅ 2sn / ❌ süresiz askıda |
+
+**Sonuç:** borsa tarafı kar-al ve trailing spot'ta **yapısal olarak imkânsız**.
+Bu yüzden stop borsada, hedef motorda (değişmez kural 39). Kurulu kırılım girişi
+ise mümkün — yön borsa tarafından çıkarsandığı için tetik fiyatının son fiyatın
+**üstünde** olduğu her yerleştirmede doğrulanıyor, yoksa satış-stop'u olarak
+okunup anında dolar.
 
 **Açık, düzeltilmedi:** `report.py` ve panel `run_id`/`mode` filtrelemiyor. `runs`
 tablosunda mod var (`paper` / `live`), ama equity eğrisi ve işlem istatistikleri
@@ -167,6 +249,11 @@ moda göre filtrelemek, ya da mod başına ayrı `runtime/` dizini.
 
 ### Eklenen özellikler
 
+`data/feed.py` bar-arası WebSocket fiyat akışı (ccxt.pro, 10'luk parçalar,
+düşerse bar-kapanışına döner) · `_detect_venue_exits` borsa stop'unun dolumunu
+60s'de fark eder · motor tarafı kar-al (`exits.target_atr_mult`, **kapalı**) ·
+kurulu kırılım girişi (`entries.armed_breakout`, **kapalı**) · spread/hacim
+toplama (`execution.microstructure_enabled`) · panelde varlık dökümü ·
 `ops/bot.sh` mod başına launchd üretimi + ön kontrol ·
 `ops/reset.sh` + `scripts/venue_reset.py` demo hesabı ve yerel geçmişi sıfırlama · `engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
 `execution/safety.py` anahtar izni + kayma ölçümü + imkânsız equity koruması ·
@@ -198,6 +285,7 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 | `risk/budget.py` `sizing.py` `leverage.py` | Sürekli merdiven, stop'tan boyut, promosyon kapısı |
 | `execution/broker.py` `paper_broker.py` `ccxt_broker.py` | Tek arayüz, üç uygulama |
 | `execution/reconcile.py` | Açılışta mutabakat; anlaşmazlıkta borsa kazanır |
+| `data/feed.py` | Bar-arası WS fiyat akışı. Yalnız son/yüksek/düşük |
 | `engine/runner.py` | Canlı döngü |
 | `engine/state.py` `watchdog.py` | Atomik snapshot, devre kesici, degraded mode |
 | `backtest/engine.py` `align.py` `metrics.py` | Replay, hizalama, metrikler |
@@ -279,14 +367,19 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 
 | kontrol | değer | |
 |---|---|---|
-| işlem ≥ 50 | 116 | ✅ |
-| profit factor ≥ 1.2 | 1.20 | ❌ |
+| işlem ≥ 50 | 113 | ✅ |
+| profit factor ≥ 1.2 | 1.41 | ✅ |
 | maks düşüş ≤ %20 | %11.6 | ✅ |
 | DSR anlamlı | p=1.000 | ❌ |
 | CPCV yollarının çoğu pozitif | %55.6 | ✅ |
-| PBO ≤ 0.5 | 1.00 | ❌ |
+| PBO ≤ 0.5 | 0.33 | ✅ |
 
-Ölçüm `--trials 9` ile. Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
+Altı kontrolden **beşi geçiyor**; kalan tek engel DSR. Conviction-çöküş çıkışının
+tamirinden sonra (bkz. denetim #40). DSR bu stratejiyle değil **deneme sayısıyla**
+ilgili — oradan çıkış ayar değil taze veri.
+
+Ölçüm `--trials 9` ile (10. deneme kurulu kırılım girişiydi ve **reddedildi**;
+aşağıya bakın). Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
 deneme sayısını eksik saymak kapıyı geçirmeye yeten farkı üretiyor. Sayaç
 `research/hypotheses.md`'de ve `ops/pre-install.sh` oradan okuyor.
 
@@ -334,8 +427,8 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 9** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 9` geçirin — DSR her denemeyi fiyatlıyor.
+**Kümülatif deneme: 10** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 10` geçirin — DSR her denemeyi fiyatlıyor.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir

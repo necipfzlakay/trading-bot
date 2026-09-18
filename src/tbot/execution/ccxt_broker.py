@@ -46,6 +46,26 @@ _STATUS_MAP = {
 }
 
 
+def _order_state(raw: dict) -> dict[str, float | str]:
+    """One v5 order reduced to the three things a caller ever acts on."""
+    filled = float(raw.get("cumExecQty") or 0.0)
+    try:
+        average = float(raw.get("avgPrice") or 0.0)
+    except (TypeError, ValueError):
+        average = 0.0
+    status = str(raw.get("orderStatus") or "")
+    return {
+        "status": status,
+        "filled": filled,
+        "average_price": average,
+        # Bybit spells a cancelled conditional order "Deactivated"; treating
+        # that as a fill would invent an exit that never happened.
+        "terminal": status
+        in ("Filled", "Cancelled", "Deactivated", "Rejected", "PartiallyFilledCanceled"),
+        "filled_terminal": status in ("Filled", "PartiallyFilledCanceled"),
+    }
+
+
 class CCXTBroker(Broker):
     """Bybit spot via ccxt, for demo and live alike."""
 
@@ -530,6 +550,202 @@ class CCXTBroker(Broker):
                 pass
             positions[symbol] = amount
         return positions
+
+    def fetch_balances_detail(self) -> dict[str, dict[str, float]]:
+        """Every non-zero holding as free / used / total, in one venue call.
+
+        ``used`` is not a curiosity on spot: a protective stop reserves the base
+        asset it would sell, so a correctly protected position reads as fully
+        used and zero free. Showing only one of the three numbers is how the
+        engine once concluded its own stop had closed a position it still held.
+        """
+        try:
+            raw = self.exchange.fetch_balance()
+        except ccxt.BaseError as exc:
+            log.error("balance_detail_failed", error=str(exc)[:200])
+            return {}
+
+        detail: dict[str, dict[str, float]] = {}
+        for kind in ("free", "used", "total"):
+            for coin, amount in (raw.get(kind) or {}).items():
+                try:
+                    value = float(amount)
+                except (TypeError, ValueError):
+                    continue
+                if value:
+                    detail.setdefault(coin, {"free": 0.0, "used": 0.0, "total": 0.0})[kind] = value
+        return detail
+
+    # -- microstructure ----------------------------------------------------
+
+    def fetch_microstructure(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+        """Spread and 24h turnover for each symbol, in a single request.
+
+        Bybit returns every spot ticker in one call, so this costs the same
+        whether the universe is one symbol or fifty. That matters: the reason
+        ``ScanRow.spread_bps`` sat at zero since the beginning was never that
+        the data was unavailable, only that nobody wired it up — and a config
+        key (``universe.max_spread_bps``) has been quietly deciding nothing
+        ever since.
+        """
+        try:
+            response = self.exchange.publicGetV5MarketTickers({"category": "spot"})
+        except ccxt.BaseError as exc:
+            log.warning("microstructure_fetch_failed", error=str(exc)[:160])
+            return {}
+
+        wanted = {sym.replace("/", ""): sym for sym in symbols}
+        out: dict[str, dict[str, float]] = {}
+        for row in (response.get("result") or {}).get("list") or []:
+            symbol = wanted.get(str(row.get("symbol") or ""))
+            if symbol is None:
+                continue
+            try:
+                bid = float(row.get("bid1Price") or 0.0)
+                ask = float(row.get("ask1Price") or 0.0)
+                turnover = float(row.get("turnover24h") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+            out[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                # Zero means "not measured", never "perfectly tight". A caller
+                # must be able to tell a missing reading from a good one.
+                "spread_bps": ((ask - bid) / mid * 10_000) if mid > 0 else 0.0,
+                "turnover_24h": turnover,
+            }
+        return out
+
+    # -- order state -------------------------------------------------------
+
+    def order_state(self, symbol: str, order_id: str) -> dict[str, float | str] | None:
+        """What became of one order: status, filled quantity, average price.
+
+        Checked against live orders first and the history second, because a
+        triggered stop leaves the live list the moment it fires. Without the
+        second lookup a filled stop is indistinguishable from one that was
+        cancelled, and the engine would have to guess which of the two emptied
+        its position.
+        """
+        market = symbol.replace("/", "")
+        for query in (
+            {"category": "spot", "symbol": market, "orderFilter": "tpslOrder"},
+            {"category": "spot", "symbol": market, "orderFilter": "StopOrder"},
+            {"category": "spot", "symbol": market},
+        ):
+            try:
+                response = self.exchange.privateGetV5OrderRealtime(query)
+            except ccxt.BaseError:
+                continue
+            for raw in (response.get("result") or {}).get("list") or []:
+                if str(raw.get("orderId") or "") == order_id:
+                    return _order_state(raw)
+
+        try:
+            response = self.exchange.privateGetV5OrderHistory(
+                {"category": "spot", "symbol": market, "orderId": order_id}
+            )
+        except ccxt.BaseError as exc:
+            log.warning("order_state_lookup_failed", symbol=symbol, error=str(exc)[:120])
+            return None
+        for raw in (response.get("result") or {}).get("list") or []:
+            if str(raw.get("orderId") or "") == order_id:
+                return _order_state(raw)
+        return None
+
+    # -- armed entries ------------------------------------------------------
+
+    def place_stop_entry(
+        self, symbol: str, quantity: float, trigger_price: float, client_id: str
+    ) -> str | None:
+        """Rest a buy order that fires when price trades up through a level.
+
+        This is the only honest way to act between bar closes: the level is
+        computed at the last close, handed to the venue, and the venue does the
+        watching. No indicator ever sees an unclosed bar.
+
+        Two venue facts, both measured rather than assumed:
+
+        * Bybit spot **refuses** ``triggerDirection`` outright (``NotSupported``
+          from ccxt). Direction is inferred from where the trigger sits relative
+          to the last price, which makes the check below load-bearing rather
+          than defensive: a trigger that has slipped *below* the market would be
+          read as a sell-stop and fire immediately, at the worst possible moment.
+        * The order rests under ``orderFilter='StopOrder'``, so cancelling it
+          needs that filter too.
+        """
+        self.load_markets()
+        try:
+            last = float(self.exchange.fetch_ticker(symbol)["last"])
+        except (ccxt.BaseError, KeyError, TypeError) as exc:
+            log.warning("armed_entry_no_price", symbol=symbol, error=str(exc)[:120])
+            return None
+
+        if trigger_price <= last:
+            log.info(
+                "armed_entry_skipped",
+                symbol=symbol,
+                trigger=trigger_price,
+                last=last,
+                reason="price is already through the level; a resting buy here "
+                "would be read as a sell-stop and fire at once",
+            )
+            return None
+
+        try:
+            amount = float(self.exchange.amount_to_precision(symbol, quantity))
+            trigger = float(self.exchange.price_to_precision(symbol, trigger_price))
+            response = self.exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side="buy",
+                amount=amount,
+                price=None,
+                params={
+                    "triggerPrice": trigger,
+                    "orderFilter": "StopOrder",
+                    "clientOrderId": client_id,
+                },
+            )
+        except ccxt.BaseError as exc:
+            log.warning("armed_entry_rejected", symbol=symbol, error=str(exc)[:180])
+            return None
+
+        order_id = str(response.get("id") or "")
+        log.info("armed_entry_placed", symbol=symbol, trigger=trigger_price, order_id=order_id)
+        return order_id
+
+    def cancel_stop_entry(self, symbol: str, order_id: str) -> bool:
+        """Withdraw an armed entry. Failure here must be treated as "still armed".
+
+        An armed order that outlives its bar fills at a level the strategy no
+        longer believes in, so a cancel that silently failed is worse than one
+        that never happened — the caller has to know.
+        """
+        try:
+            self.exchange.cancel_order(
+                id=order_id, symbol=symbol, params={"orderFilter": "StopOrder"}
+            )
+            return True
+        except ccxt.BaseError as exc:
+            message = str(exc)
+            # Already gone is the outcome we wanted, not a failure.
+            if "170213" in message or "not exists" in message or "too late" in message:
+                return True
+            log.warning("armed_entry_cancel_failed", symbol=symbol, error=message[:160])
+            return False
+
+    def resting_stop_entries(self, symbol: str) -> list[dict]:
+        """Armed entry orders the venue is currently holding for this symbol."""
+        try:
+            response = self.exchange.privateGetV5OrderRealtime(
+                {"category": "spot", "symbol": symbol.replace("/", ""), "orderFilter": "StopOrder"}
+            )
+            return (response.get("result") or {}).get("list") or []
+        except ccxt.BaseError as exc:
+            log.warning("armed_entry_lookup_failed", symbol=symbol, error=str(exc)[:120])
+            return []
 
     def fetch_ticker(self, symbol: str) -> dict:
         try:

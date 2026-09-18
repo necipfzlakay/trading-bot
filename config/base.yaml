@@ -182,3 +182,10 @@ engine:
   stale_data_tolerance_bars: 2.0
   reconcile_on_start: true
   state_snapshot_seconds: 30
+
+security:
+  # Dynamic IP here: a whitelist would lock the bot out mid-position every time
+  # the address changes. Risk accepted knowingly, and bounded — the key has no
+  # withdrawal permission (the bot refuses to start with one), so a leak costs
+  # unwanted trades on this account, never the balance.
+  ip_whitelist_acknowledged: true

@@ -57,6 +57,15 @@ class EngineState:
     # Measured execution cost against the backtest assumption. When this drifts
     # worse, earlier results were optimistic.
     slippage: dict[str, Any] = field(default_factory=dict)
+    # Every currency the account holds, as free / used / total plus what it is
+    # worth in the quote currency. ``used`` is not decoration: a protective stop
+    # reserves the base asset, so a properly protected position shows as fully
+    # used and zero free, and an observer who only sees "free" concludes the
+    # position is gone.
+    balances: list[dict[str, Any]] = field(default_factory=list)
+    # Between-bar price stream: connected, stale, how many symbols, how old the
+    # last message is. Empty dict means there is no feed in this mode.
+    feed: dict[str, Any] = field(default_factory=dict)
 
     @property
     def uptime_seconds(self) -> float:

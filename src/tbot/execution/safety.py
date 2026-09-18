@@ -116,8 +116,25 @@ def check_key_permissions(exchange) -> KeyPermissionReport:
     )
 
 
-def assert_key_is_safe(exchange, allow_withdraw: bool = False) -> KeyPermissionReport:
-    """Refuse to trade live with a key that can move funds off the exchange."""
+def assert_key_is_safe(
+    exchange,
+    allow_withdraw: bool = False,
+    ip_whitelist_acknowledged: bool = False,
+) -> KeyPermissionReport:
+    """Refuse to trade live with a key that can move funds off the exchange.
+
+    ``ip_whitelist_acknowledged`` downgrades the missing-whitelist warning to an
+    informational line. It does **not** change what is checked, and it cannot
+    touch the two conditions that actually refuse to start (withdrawal
+    permission, expired key) — those have no acknowledgement flag by design.
+
+    The reason it exists at all: a warning nothing can clear is a warning that
+    gets ignored, and then the next real one is ignored with it. On a dynamic
+    IP a whitelist is not merely inconvenient, it is wrong — it locks the bot
+    out every time the address changes, mid-position. An operator who has
+    weighed that has made a decision, and a decision should read as a decision
+    rather than as an outstanding defect.
+    """
     report = check_key_permissions(exchange)
 
     if report.error:
@@ -135,10 +152,20 @@ def assert_key_is_safe(exchange, allow_withdraw: bool = False) -> KeyPermissionR
         raise RuntimeError("This API key cannot trade — check its permissions on Bybit.")
 
     if not report.ip_restricted:
-        log.warning(
-            "key_not_ip_restricted",
-            advice="add an IP whitelist on Bybit; it costs nothing and blocks remote reuse",
-        )
+        if ip_whitelist_acknowledged:
+            log.info(
+                "key_not_ip_restricted_acknowledged",
+                residual_risk="a leaked key could be used from anywhere",
+                bounded_by="the key cannot withdraw, so the worst case is unwanted "
+                "trades on this account, not loss of funds",
+            )
+        else:
+            log.warning(
+                "key_not_ip_restricted",
+                advice="add an IP whitelist on Bybit; it costs nothing and blocks "
+                "remote reuse. On a dynamic IP set security.ip_whitelist_acknowledged "
+                "instead — a warning that cannot be cleared trains you to ignore the channel",
+            )
 
     if report.expires_ts:
         days = (report.expires_ts - datetime.now(UTC).timestamp() * 1000) / 86_400_000

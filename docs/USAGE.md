@@ -200,12 +200,26 @@ Ayrı bir terminalde:
 
 Ne göreceksin:
 - **Account** — equity, getiri, düşüş, risk çarpanı, conviction eşiği
+- **Holdings** — hangi para biriminden **ne kadar** var. Üç kolon, çünkü dürüst
+  cevabın üç parçası var:
+  - `free` — şu anda harcanabilir/satılabilir
+  - `locked` — bekleyen bir emir rezerve etmiş. **Koruyucu stop spot'ta tüm
+    varlığı kilitler**, yani düzgün korunan bir pozisyon `free = 0` görünür
+  - `total` — sahip olunan miktar, artı quote cinsinden değeri
+
+  Sadece `free` göstermek, korunan bir pozisyonu "hiç pozisyon yok" diye
+  raporlardı — motorun bir kez gerçekten düştüğü hata buydu (denetim #26)
 - **Equity** — sermaye eğrisi
 - **Open positions** — açık pozisyonlar, MFE/MAE, kaç bar tutuldu
 - **Scan** — *her sembol, her bar*: skor, eşik, ve geçemediyse **neden**
 - **Why no trade** — son 24 saatin red sebepleri, sayıyla
 - **MAE/MFE** — kapanan işlemlerin saçılımı; kazananlar sol üstte kümeleniyorsa
   stop gereğinden geniş demektir
+
+Başlıktaki **feed** rozeti bar-arası fiyat akışını gösterir:
+`feed 21 sym · 0.1s` bağlı; `feed stale — bar-close only` düşmüş demek. İkincisi
+bir arıza değil, bir **derece**: akış düşerse bot eski davranışına döner ve
+borsadaki koruyucu stop yerinde kalır. Feed hız kazandırır, güvenliği o sağlamaz.
 
 Panel motorun yazdığı dosyaları okuyor — ikinci bir doğruluk kaynağı yok,
 panelle bot çelişemez.
@@ -458,6 +472,51 @@ universe:
   symbols: []                   # elle liste yazarsan otomatik seçim kapanır
   min_volume_24h_usd: 5000000
 ```
+
+### Bar arası davranış
+
+```yaml
+execution:
+  venue_poll_seconds: 60        # borsaya "stop doldu mu" sorma sıklığı
+  microstructure_enabled: true  # spread + 24s hacim topla ve kaydet
+  microstructure_penalties: false   # ...ama skoru DEĞİŞTİRME (aşağıya bak)
+
+exits:
+  target_atr_mult: 0.0          # kar-al, giriş ATR'si cinsinden. 0 = KAPALI
+
+entries:
+  armed_breakout: false         # kırılım seviyesine önceden emir bırak. KAPALI
+  armed_max_distance_atr: 1.5   # bundan uzak seviye "yakın" sayılmaz
+```
+
+**Üç ayar kasıtlı olarak kapalı.** Mekanizmaları yazıldı, test edildi ve
+borsada doğrulandı — ama üçü de *hangi işlemlerin yapılacağını* değiştiriyor,
+yani birer hipotez. İstatistiksel bütçe tükendiği için (`research/hypotheses.md`)
+mevcut veri setinde açıp "daha iyi görünüyor" demek tam olarak DSR'ın
+cezalandırdığı şey.
+
+- `target_atr_mult` — seviye hiç aranmadı. Ayrıca **borsaya konamaz**: Bybit
+  spot'ta stop base varlığı kilitliyor, ikinci reduce-only emir `170131` alıyor.
+  Yani hedef yalnız bot çalışırken geçerli
+- `armed_breakout` — test edildi (10. deneme), **reddedildi**: kazancın %92'si
+  5 işlemin 2'sinden geliyordu
+- `microstructure_penalties` — ölçülen spread 0.01–2.7bps, ceza tabanı 10bps.
+  Bugün açmak hiçbir şeyi değiştirmezdi; evren genişlerse anlamlı olur
+
+Açmak isterseniz: önce `research/hypotheses.md`'ye yazın, sonra
+`scripts/cpcv_report.py --trials N+1` ile ölçün.
+
+### Feed (bar-arası fiyat akışı)
+
+Canlı/demo modda otomatik başlar, ayar gerekmez. Ne yapar: 21 sembolün son
+fiyatını ve **son bar kapanışından bu yana** görülen yüksek/düşüğü izler, ve
+bunları aynı `ExitManager`'a verir. İkinci bir çıkış mantığı yok.
+
+Ne yapmaz: oluşmakta olan barda indikatör hesaplamaz. Bar arası sorulan tek
+soru, bar kapanışında hesaplanmış bir seviyeye fiyatın değip değmediği.
+
+Düşerse: `bot.sh status` ve panel `feed stale` der, bot bar-kapanışı davranışına
+döner, borsadaki stop yerinde kalır. Bağımlılık değil, hızlanma.
 
 `risk_per_trade` değiştirirsen minimum bakiyeyi yeniden ölç:
 ```bash

@@ -112,6 +112,7 @@ class IndicatorCategory(StrEnum):
 class ExitReason(StrEnum):
     TRAILING_STOP = "trailing_stop"
     INITIAL_STOP = "initial_stop"
+    TAKE_PROFIT = "take_profit"
     REGIME_FLIP = "regime_flip"
     CONVICTION_COLLAPSE = "conviction_collapse"
     VOLATILITY_SHOCK = "volatility_shock"

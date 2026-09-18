@@ -29,6 +29,9 @@ class TelegramNotifier:
     chat_id: str
     enabled: bool = True
     timeout: float = 5.0
+    # Polling sits on the engine's wait loop, which also watches open
+    # positions. It gets a shorter leash than sending does.
+    poll_timeout: float = 3.0
     _offset: int = 0
 
     def send(self, text: str, silent: bool = False) -> bool:
@@ -134,7 +137,7 @@ class TelegramNotifier:
             response = httpx.get(
                 API.format(token=self.token, method="getUpdates"),
                 params={"offset": self._offset, "timeout": 0},
-                timeout=self.timeout,
+                timeout=self.poll_timeout,
             )
             if response.status_code != 200:
                 return []

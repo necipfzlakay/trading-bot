@@ -13,6 +13,13 @@ Ordering inside a bar is not arbitrary. Existing positions are managed *before*
 new ones are considered, so a stop that should have fired never competes for
 attention with a fresh setup; and state is written last, so an observer reading
 ``runtime/state.json`` always sees a consistent picture of a completed bar.
+
+Between bar closes the loop does three things and no more: it watches whether
+price has reached a level decided at the last close (``_check_intrabar_exits``),
+it asks the venue whether a protective stop has fired (``_detect_venue_exits``),
+and it writes a heartbeat. None of them computes an indicator on an unclosed
+bar — that would make the backtest unable to reproduce the live path, which is
+the one property every number in this repo depends on.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ from tbot.core.models import (
     Venue,
 )
 from tbot.data.backfill import Backfiller, BybitFetcher
+from tbot.data.feed import MarketFeed
 from tbot.data.integrity import MIN_BARS_BY_TIMEFRAME
 from tbot.data.store import ParquetStore
 from tbot.engine.portfolio import Portfolio
@@ -128,6 +136,24 @@ class Runner:
     _rejections: dict = field(default_factory=dict)
     _rejection_limit: int = 3
     slippage: SlippageTracker = field(init=False)
+    # Between-bar price stream. None in paper mode and whenever ccxt.pro is not
+    # importable — every read of it is guarded, because the engine has to work
+    # exactly as before when it is absent.
+    feed: MarketFeed | None = None
+    # Live spread and 24h turnover, refreshed once per bar. Empty until the
+    # first successful read; zero always means "not measured".
+    _microstructure: dict = field(default_factory=dict)
+    # The one armed entry order, if any: {"symbol", "order_id", "client_id",
+    # "trigger", "bar_ts", "stop", "quantity", "setup", "conviction", "regime",
+    # "risk_amount"}. At most one — see EntryConfig.armed_max_orders.
+    _armed: dict | None = None
+    # Symbols whose venue inventory has gone missing, and how many consecutive
+    # polls have said so. One reading is not evidence — a balance fetched
+    # seconds after an entry can lag — so nothing is acted on until it repeats.
+    _missing_inventory: dict = field(default_factory=dict)
+    # Last close per symbol, refreshed each bar. Lets the balances view price a
+    # holding without a network call.
+    _marks: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.conviction = ConvictionEngine(
@@ -201,7 +227,10 @@ class Runner:
 
         if isinstance(self.broker, CCXTBroker):
             # Refuse to trade with a key that can move funds off the exchange.
-            assert_key_is_safe(self.broker.exchange)
+            assert_key_is_safe(
+                self.broker.exchange,
+                ip_whitelist_acknowledged=self.config.security.ip_whitelist_acknowledged,
+            )
 
         if self.config.engine.reconcile_on_start:
             self._reconcile()
@@ -219,6 +248,7 @@ class Runner:
         self.state.cash = self.portfolio.cash
         self.state.starting_equity = self.portfolio.starting_cash
         self.state.open_positions = self._positions_view()
+        self.state.balances = self._balances_view()
         self.state.status = "running" if self.state.status != "safe_mode" else "safe_mode"
         self.writer.write(self.state)
 
@@ -239,13 +269,61 @@ class Runner:
                 self.config.mode.value, self.config.venue.value, balance, len(self.symbols)
             )
 
+        self._start_feed()
+
         try:
             self._loop()
         finally:
+            # An armed entry that outlives the engine fills into an account
+            # nobody is managing: no trailing stop, no exit check, and no
+            # protective stop at the venue either. The protective stop is the
+            # opposite case and stays exactly where it is — it is *for* the time
+            # the engine is down.
+            self._withdraw_armed_on_shutdown()
+            if self.feed is not None:
+                self.feed.stop()
             self.state.status = "stopped"
             self.writer.write(self.state)
             self.db.stop_run("clean" if self._running is False else "error")
             log.info("engine_stopped", bars=self.state.bars_processed)
+
+    def _withdraw_armed_on_shutdown(self) -> None:
+        armed = self._armed
+        if armed is None or not isinstance(self.broker, CCXTBroker):
+            return
+        if self.broker.cancel_stop_entry(armed["symbol"], armed["order_id"]):
+            log.info("armed_entry_withdrawn", symbol=armed["symbol"], reason="engine stopping")
+            self._armed = None
+        else:
+            log.error(
+                "armed_entry_left_resting",
+                symbol=armed["symbol"],
+                order_id=armed["order_id"],
+                consequence="it can fill while the engine is down, unmanaged and unprotected",
+            )
+            self.db.record_event(
+                "armed_entry_left_resting",
+                f"{armed['symbol']} armed order {armed['order_id']} could not be cancelled",
+                level="error",
+            )
+
+    def _start_feed(self) -> None:
+        """Open the between-bar price stream, if this mode has one.
+
+        Paper mode deliberately gets no feed: paper exists to walk the same path
+        as the backtest, and a paper run that reacted to prices the backtest
+        cannot see would stop being a comparison.
+        """
+        if self.config.mode is not Mode.LIVE:
+            return
+        feed = MarketFeed(list(self.symbols))
+        self.feed = feed if feed.start() else None
+        if self.feed is None:
+            log.warning(
+                "feed_disabled",
+                consequence="exits are evaluated at bar close only, as before; "
+                "the venue stop is unaffected",
+            )
 
     def _loop(self) -> None:
         timeframe = self.config.timeframes.trigger
@@ -262,29 +340,94 @@ class Runner:
                 # but keep checking for controls while waiting. Bars can be an
                 # hour apart, and an emergency flatten that waits for the next
                 # bar close is not an emergency control.
-                sleep_ms = ms_until_next_close(timeframe) + 2000
-                slept = 0.0
-                since_heartbeat = 0.0
-                while slept < sleep_ms / 1000 and self._running:
-                    self._poll_commands()
-                    self._apply_command_file()
-                    step = min(self.config.engine.loop_interval_seconds, sleep_ms / 1000 - slept)
-                    time.sleep(max(0.1, step))
-                    slept += step
-                    since_heartbeat += step
-
-                    # Without this, state.json is only touched on bar close, so
-                    # on an hourly timeframe a *wedged* engine looks identical to
-                    # a waiting one for up to an hour — and the dead-man switch
-                    # has to be slackened to match, which is the whole thing it
-                    # exists to catch. Positions go unmanaged for that window.
-                    if since_heartbeat >= HEARTBEAT_SECONDS:
-                        since_heartbeat = 0.0
-                        self.writer.write(self.state)
+                self._wait_for_next_bar(timeframe)
 
             except Exception as exc:  # noqa: BLE001 — the loop must survive anything
                 self._record_error(exc)
                 time.sleep(min(60, self.config.engine.loop_interval_seconds * 4))
+
+    def _wait_for_next_bar(self, timeframe: str) -> None:
+        """Idle until the next bar closes, staying useful the whole time.
+
+        **Every deadline here is measured against ``time.monotonic()``, never
+        accumulated.** The previous version added the *intended* step to a
+        counter and compared that to the target, so any work inside the loop
+        was invisible to it. Telegram's ``getUpdates`` costs 3-8 seconds from
+        this machine and was being called on every 5-second tick, so each
+        iteration really took about nine seconds while counting as five. The
+        loop overshot by roughly 80% and bars were processed **7 to 38 minutes
+        after they closed** — entries priced off a close that was half an hour
+        stale, and no log line anywhere saying so.
+
+        A clock that measures intentions instead of elapsed time is wrong in
+        exactly the way that is hardest to see: nothing errors, nothing retries,
+        the bot simply runs late and keeps reporting that it is fine.
+
+        Three cadences, all independent:
+
+        * every tick (``loop_interval_seconds``) — the between-bar exit check,
+          which only reads memory and so costs nothing
+        * ``execution.venue_poll_seconds`` — ask the venue whether a stop or an
+          armed entry has filled, and refresh the balances the panel shows
+        * ``telegram.poll_seconds`` — commands, deliberately in the slow lane
+        """
+        now = time.monotonic()
+        deadline = now + (ms_until_next_close(timeframe) + 2000) / 1000
+        next_tick = now
+        next_command_poll = now
+        next_venue_poll = now + self.config.execution.venue_poll_seconds
+        next_heartbeat = now + HEARTBEAT_SECONDS
+        interval = self.config.engine.loop_interval_seconds
+
+        while self._running:
+            now = time.monotonic()
+            if now >= deadline:
+                return
+
+            if now >= next_command_poll:
+                # Scheduled from *after* the call returns: a poll that takes
+                # four seconds must not immediately become due again.
+                self._poll_commands()
+                now = time.monotonic()  # that call can cost seconds; do not
+                next_command_poll = now + self.config.telegram.poll_seconds
+                # judge the deadlines below against the clock, not against when
+                # this iteration happened to begin.
+
+            self._apply_command_file()
+
+            # Cheap: reads the feed's in-memory quotes, no venue call. This is
+            # what closes the gap the operator asked about — a symbol that runs
+            # mid-bar is seen in seconds rather than at the next close.
+            self._check_intrabar_exits()
+
+            if now >= next_venue_poll:
+                # Expensive enough to rate-limit. Without it the engine learns
+                # its own stop filled only at the next close, and spends the gap
+                # with a wrong portfolio, a wrong equity, and a position slot
+                # locked against a holding that is gone.
+                self._detect_venue_exits()
+                self._detect_armed_fill()
+                # Same trip to the venue, so the holdings the panel shows are
+                # never an hour out of date.
+                self.state.balances = self._balances_view()
+                next_venue_poll = time.monotonic() + self.config.execution.venue_poll_seconds
+
+            if now >= next_heartbeat:
+                # Without this, state.json is only touched on bar close, so on
+                # an hourly timeframe a *wedged* engine looks identical to a
+                # waiting one for up to an hour — and the dead-man switch has to
+                # be slackened to match, which is the whole thing it exists to
+                # catch. Positions go unmanaged for that window.
+                self.state.open_positions = self._positions_view()
+                self.state.feed = self.feed.status() if self.feed else {}
+                self.writer.write(self.state)
+                next_heartbeat = time.monotonic() + HEARTBEAT_SECONDS
+
+            # Sleep only what is left of this tick. When the work above already
+            # overran the interval there is nothing to wait for, and pausing
+            # anyway is how the drift got in.
+            next_tick = max(next_tick + interval, time.monotonic())
+            time.sleep(max(0.0, min(next_tick, deadline) - time.monotonic()))
 
     # -- per bar -----------------------------------------------------------
 
@@ -302,13 +445,25 @@ class Runner:
         self._check_event_guard(frames)
 
         marks = {s: float(f["trigger"]["close"].iloc[-1]) for s, f in frames.items()}
+        self._marks.update(marks)
+
+        # A new bar has begun, so the running extremes the feed tracks belong to
+        # it and not to the bar that just closed. Without this the intra-bar
+        # check would keep comparing against a high set hours ago.
+        if self.feed is not None:
+            self.feed.reset_extremes()
 
         # Orders submitted on the previous bar fill against this bar's open.
         # Without this the paper simulator queues orders and never executes
         # them: the portfolio would show positions the broker never opened, with
         # no slippage and no fees — the exact opposite of what paper mode is for.
         self._drain_paper_fills(frames, bar_ts)
+        # Before anything reads the portfolio: an armed order may have filled
+        # since the last close, and that fill is a position the rest of this bar
+        # has to know about.
+        self._resolve_armed(bar_ts)
         self._manage_positions(frames, bar_ts)
+        self._refresh_microstructure(list(frames))
         scans = self._scan(frames, bar_ts)
         if self.state.equity < self.config.risk.min_equity:
             if self.state.status != "below_min_equity":
@@ -357,6 +512,7 @@ class Runner:
                     )
         elif not self._paused and not self.risk.state.degraded and self.state.status != "safe_mode":
             self._maybe_enter(frames, scans, bar_ts)
+            self._maybe_arm(frames, scans, bar_ts)
 
         point = self.portfolio.record_equity(bar_ts, marks)
         if equity_jump_is_implausible(self.state.equity, point.equity):
@@ -376,6 +532,13 @@ class Runner:
 
         self.conviction.note_bar(entered=any(s.no_trade_reason is None for s in scans))
         self._snapshot(bar_ts, scans, point)
+
+        # Both of these were written, documented in the config, and never
+        # called — the same shape as audit #7, back again. A notification path
+        # that exists but is unreachable is worse than none: the operator reads
+        # the config, believes they will be told, and is not.
+        self._notify_risk_change()
+        self._maybe_daily_summary(bar_ts)
 
         log.info(
             "bar_processed",
@@ -588,7 +751,13 @@ class Runner:
         self.notifier.daily_summary(
             {
                 "equity": self.state.equity,
-                "total_return": self.state.equity / self.config.starting_balance - 1.0,
+                # Invariant 33: against what the account was actually worth when
+                # this run began, never a config number. In live mode
+                # starting_balance is whatever the yaml happens to say, which is
+                # how the dashboard once reported a 1014 USDT account at +914%.
+                "total_return": (self.state.equity / self.state.starting_equity - 1.0)
+                if self.state.starting_equity
+                else 0.0,
                 "drawdown": self.risk.state.drawdown,
                 "risk_multiplier": self.risk.risk_multiplier,
                 "trades": summary["trades"],
@@ -717,7 +886,7 @@ class Runner:
                 atr=atr_now,
                 entry_atr=entry_atr,
                 regime=Regime(regime),
-                conviction_now=None,
+                conviction_now=self._conviction_for_open(symbol, data, Regime(regime), bar_ts),
                 collapse_threshold=self.config.conviction.collapse_threshold,
             )
 
@@ -734,6 +903,256 @@ class Runner:
                 # unprotected for its entire life.
                 self._place_protective_stop(position, bar_ts)
 
+    # -- between bars ------------------------------------------------------
+
+    def _check_intrabar_exits(self) -> None:
+        """Act on a level reached since the last close, without waiting for it.
+
+        This is the answer to "a coin ran 20% and the bar had not closed yet".
+        It reads only the feed's running high and low — the same two numbers the
+        backtester reads off a finished bar — and hands them to the same
+        ``ExitManager``. Nothing here computes an indicator, so the forming bar
+        never influences a decision and the backtest can still reproduce this
+        path exactly (invariant 1).
+
+        Silent no-op whenever the feed is absent or stale. Reaction speed is an
+        improvement; the protective stop at the venue is the protection.
+        """
+        if self.feed is None or not self.portfolio.positions or self._paused:
+            return
+
+        timeframe = self.config.timeframes.trigger
+        # The exit belongs to the bar now forming, not the one that closed. A
+        # distinct bar_ts keeps its client order id from colliding with an exit
+        # the bar-close path might build for the same position.
+        forming_bar = last_closed_bar(timeframe) + tf_ms(timeframe)
+
+        for symbol in list(self.portfolio.positions):
+            quote = self.feed.quote(symbol)
+            if quote is None:
+                continue
+            position = self.portfolio.positions.get(symbol)
+            if position is None:
+                continue
+
+            decision = self.exits.evaluate_intrabar(position, quote.high, quote.low)
+            if not decision.should_exit:
+                continue
+
+            log.info(
+                "intrabar_exit",
+                symbol=symbol,
+                reason=decision.reason.value if decision.reason else "unknown",
+                detail=decision.detail,
+                last=quote.last,
+                note="acted between bar closes; the bar-close path would have "
+                "reached the same decision up to one bar later",
+            )
+            self._close(symbol, decision.exit_price or quote.last, forming_bar, decision.reason)
+            self.state.open_positions = self._positions_view()
+            self.writer.write(self.state)
+
+    def _detect_venue_exits(self) -> None:
+        """Notice that the venue's own stop has fired, without waiting for the close.
+
+        The protective stop lives at the exchange precisely so it works when the
+        engine does not. The cost was that the engine did not find out: until
+        the next close it carried a position that no longer existed, reported an
+        equity that was wrong, held a slot against nothing, and would send a
+        second sell for inventory already gone.
+
+        Two readings are required before acting. A balance fetched seconds after
+        an entry can still lag, and inventing an exit is worse than noticing one
+        late.
+        """
+        if not isinstance(self.broker, CCXTBroker) or not self.portfolio.positions:
+            return
+
+        held = self.watchdog.call("fetch_positions", self.broker.fetch_positions)
+        if held is None:
+            return  # a failed read is not evidence of anything
+
+        for symbol in list(self.portfolio.positions):
+            position = self.portfolio.positions.get(symbol)
+            if position is None:
+                continue
+
+            remaining = float(held.get(symbol, 0.0))
+            if remaining >= position.quantity * 0.95:
+                self._missing_inventory.pop(symbol, None)
+                continue
+
+            seen = self._missing_inventory.get(symbol, 0) + 1
+            self._missing_inventory[symbol] = seen
+            if seen < 2:
+                continue
+
+            order_id = position.meta.get("stop_order_id")
+            state = (
+                self.broker.order_state(symbol, str(order_id))
+                if order_id and isinstance(self.broker, CCXTBroker)
+                else None
+            )
+
+            if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
+                fill_price = float(state.get("average_price") or 0.0) or position.current_stop
+                log.info(
+                    "venue_stop_filled",
+                    symbol=symbol,
+                    price=fill_price,
+                    quantity=state.get("filled"),
+                    note="detected between bars; the position is closed locally "
+                    "at the price the venue actually got",
+                )
+                self._close_from_venue_fill(symbol, fill_price)
+                self._missing_inventory.pop(symbol, None)
+                continue
+
+            # Inventory is gone but no stop of ours explains it. That is a
+            # disagreement with the venue, not a decision to make here: say so
+            # once and let the next bar's reconciliation settle it.
+            if seen == 2:
+                log.error(
+                    "position_inventory_missing",
+                    symbol=symbol,
+                    expected=position.quantity,
+                    held=remaining,
+                    stop_order=str(order_id or "none"),
+                    stop_status=str((state or {}).get("status") or "unknown"),
+                    consequence="the engine and the venue disagree about what is held",
+                )
+                self.db.record_event(
+                    "position_inventory_missing",
+                    f"{symbol}: engine holds {position.quantity:g}, venue shows {remaining:g}",
+                    level="error",
+                )
+                if self.notifier:
+                    self.notifier.notify_error(
+                        "Position missing at venue",
+                        f"{symbol}: the bot believes it holds {position.quantity:g} but the "
+                        f"venue shows {remaining:g}, and no stop of ours accounts for it.",
+                    )
+
+    def _close_from_venue_fill(self, symbol: str, price: float) -> None:
+        """Record an exit the venue performed on its own.
+
+        No order is sent: the sale already happened. Sending one would try to
+        sell inventory that is gone, which is the exact failure this detection
+        exists to prevent.
+        """
+        position = self.portfolio.positions.get(symbol)
+        if position is None:
+            return
+
+        spec = self.broker.market_spec(symbol)
+        fee = price * position.quantity * spec.taker_fee
+        reason = (
+            ExitReason.INITIAL_STOP
+            if position.current_stop <= position.initial_stop
+            else ExitReason.TRAILING_STOP
+        )
+        trade = self.portfolio.close_position(symbol, price, now_ms(), reason, fee)
+        if trade is None:
+            return
+
+        self.db.record_trade(trade)
+        self.db.delete_position(symbol)
+        self.risk.record_trade(trade)
+        self.state.open_positions = self._positions_view()
+        self.writer.write(self.state)
+
+        log.info(
+            "position_closed",
+            symbol=symbol,
+            r=round(trade.r_multiple, 3),
+            pnl=round(trade.pnl, 4),
+            reason=trade.exit_reason.value,
+            source="venue stop",
+        )
+        if self.notifier and self.config.telegram.notify_fills:
+            self.notifier.notify_exit(trade)
+
+    def _conviction_for_open(
+        self, symbol: str, data: dict, regime: Regime, bar_ts: int
+    ) -> float | None:
+        """Re-score an open position's thesis, or None when it cannot be judged.
+
+        This feeds the conviction-collapse exit: the entry reasons are gone even
+        though price has not yet moved against us. Without it the position holds
+        on to a dead thesis until the stop, which is the expensive way to find
+        out.
+
+        Two things make this subtle.
+
+        **Invariant 10 applies.** A score that could not be computed is "no
+        opinion", never zero — and zero sits below every collapse threshold, so
+        returning it would exit every position on its first bar.
+
+        **Portfolio-state blockers are deliberately neutralised.** ``already_open``,
+        ``portfolio_full`` and ``correlation_conflict`` answer "should I open
+        this?"; the question here is "is the reason I opened it still true?".
+        Leaving them set would zero the score for the tautological reason that
+        the position exists.
+        """
+        try:
+            enabled = self.config.indicators.enabled or None
+            trigger, setup, permission = data["trigger"], data["setup"], data["permission"]
+            ctx = ScoringContext(
+                symbol=symbol,
+                bar_ts=bar_ts,
+                regime=regime,
+                trigger_signals=_last_row(compute_signals(trigger, enabled)),
+                setup_signals=_last_row(compute_signals(setup, enabled)),
+                permission_signals=_last_row(compute_signals(permission, enabled)),
+                price=float(trigger["close"].iloc[-1]),
+                atr=float(
+                    ta.atr(
+                        setup["high"], setup["low"], setup["close"], self.config.exits.atr_period
+                    ).iloc[-1]
+                ),
+                already_open=False,
+                portfolio_full=False,
+                correlation_conflict=False,
+                llm_veto=self._llm_veto,
+            )
+            held = self.portfolio.positions.get(symbol)
+            if held is None:
+                return None
+            scored = self.conviction.score(ctx, held.side)
+        except Exception as exc:  # noqa: BLE001 — an exit check must never crash the bar
+            log.warning("conviction_rescore_failed", symbol=symbol, error=str(exc)[:160])
+            return None
+
+        # A blocked score is 0.0 and means "not scored", not "worthless".
+        if scored.no_trade_reason is not None:
+            return None
+        return scored.total
+
+    def _refresh_microstructure(self, symbols: list[str]) -> None:
+        """Read live spread and 24h turnover for the whole universe, once.
+
+        This closes a gap that had been open since the beginning: ``ScanRow``
+        has carried ``spread_bps`` and ``volume_24h`` fields all along, the
+        conviction engine has had penalty branches keyed on them, and
+        ``NoTradeReason.SPREAD_TOO_WIDE`` has existed as an enum member — but
+        nothing ever supplied a number, so every one of those was dead. A
+        setting that decides nothing while looking like it decides something is
+        worse than no setting.
+
+        One request covers every spot symbol, so the cost does not grow with the
+        universe. Collection is separate from *acting* on it — see
+        ``execution.microstructure_penalties``.
+        """
+        if not isinstance(self.broker, CCXTBroker):
+            return
+        if not self.config.execution.microstructure_enabled:
+            return
+        data = self.watchdog.call(
+            "fetch_microstructure", lambda: self.broker.fetch_microstructure(symbols)
+        )
+        if data:
+            self._microstructure = data
+
     def _scan(self, frames: dict, bar_ts: int) -> list[ScanRow]:
         correlations = self._correlations(frames)
         rows: list[ScanRow] = []
@@ -742,8 +1161,11 @@ class Runner:
         drawdown_bump = self.risk.state.threshold_bump
         streak_bump = self.risk.threshold_bump() - drawdown_bump
 
+        penalties_on = self.config.execution.microstructure_penalties
+
         for symbol, data in frames.items():
             trigger, setup, permission = data["trigger"], data["setup"], data["permission"]
+            micro = self._microstructure.get(symbol, {})
             regime = Regime(
                 classify_series(permission, timeframe=self.config.timeframes.permission).iloc[-1]
             )
@@ -761,6 +1183,14 @@ class Runner:
                         setup["high"], setup["low"], setup["close"], self.config.exits.atr_period
                     ).iloc[-1]
                 ),
+                # Penalties stay off until the collection phase has been
+                # looked at. Switching them on changes which trades happen, so
+                # it is a decision with evidence behind it, not a side effect of
+                # wiring up the data. Measured on the live universe: spreads run
+                # 0.01-2.7bps against a 10bps penalty floor, so today this would
+                # change nothing — which is itself the finding.
+                spread_bps=micro.get("spread_bps", 0.0) if penalties_on else 0.0,
+                volume_24h=micro.get("turnover_24h", 0.0) if penalties_on else 0.0,
                 already_open=self.portfolio.has_position(symbol),
                 portfolio_full=len(self.portfolio.positions) >= self.config.risk.max_positions,
                 correlation_conflict=correlation_conflict(
@@ -790,6 +1220,11 @@ class Runner:
                     score=conviction.total,
                     threshold=conviction.threshold,
                     no_trade_reason=reason,
+                    # Always recorded, whether or not it is allowed to decide
+                    # anything. Measuring first and acting second is the only
+                    # way to know later whether acting would have helped.
+                    spread_bps=micro.get("spread_bps", 0.0),
+                    volume_24h=micro.get("turnover_24h", 0.0),
                 )
             )
 
@@ -982,6 +1417,237 @@ class Runner:
                 candidate.name,
             )
         return True
+
+    # -- armed entries ------------------------------------------------------
+
+    def _maybe_arm(self, frames: dict, scans: list[ScanRow], bar_ts: int) -> None:
+        """Leave one resting buy order at a breakout level the strategy already likes.
+
+        This is what lets the bot act on a move that happens *between* closes.
+        The level comes from closed bars only; the venue does the watching.
+
+        **Exactly one at a time, deliberately.** The measured edge is
+        cross-sectional: every bar ranks the symbols against each other and the
+        highest takes the slot. Arming several would hand that choice to the
+        market — whichever level price happens to touch first, not whichever
+        symbol scored best — quietly replacing the selection mechanism that was
+        actually tested with a race.
+        """
+        if not self.config.entries.armed_breakout:
+            return
+        if not isinstance(self.broker, CCXTBroker) or self._armed is not None:
+            return
+        # An armed order is a position the bot has already committed to, so it
+        # occupies a slot. Otherwise a fill could push the book past its cap.
+        if len(self.portfolio.positions) >= self.config.risk.max_positions:
+            return
+
+        # Only symbols that cleared the score but had no trigger this bar: those
+        # are the ones whose breakout has not happened *yet*.
+        waiting = sorted(
+            (r for r in scans if r.no_trade_reason is NoTradeReason.NO_SETUP),
+            key=lambda r: -r.score,
+        )
+        for row in waiting:
+            if row.score < row.threshold or self.portfolio.has_position(row.symbol):
+                continue
+            data = frames.get(row.symbol)
+            if data is None:
+                continue
+            candidate = self._armable_candidate(data, row)
+            if candidate is None:
+                continue
+            if self._arm_entry(data, row, candidate, bar_ts):
+                return
+
+    def _armable_candidate(self, data: dict, row: ScanRow):
+        """The breakout level for this symbol, if one is close enough to matter."""
+        for setup in DEFAULT_SETUPS:
+            arm = getattr(setup, "arm", None)
+            if arm is None:
+                continue
+            candidate = arm(
+                data["setup"],
+                row.regime,
+                self.config.exits.initial_stop_atr_mult,
+                self.config.entries.armed_max_distance_atr,
+            )
+            if candidate is not None and candidate.stop_distance > 0:
+                return candidate
+        return None
+
+    def _arm_entry(self, data: dict, row: ScanRow, candidate, bar_ts: int) -> bool:
+        """Size the trade against the trigger level and rest the order."""
+        spec = self.broker.market_spec(row.symbol)
+        returns = data["trigger"]["close"].pct_change().tail(30).dropna().to_numpy()
+        gate = LeverageGate(self.config.promotion_path)
+
+        # Sized against the *trigger* price, not the close. The fill happens at
+        # the level, so that is the price the risk has to be measured from.
+        sizing = size_position(
+            equity=self.risk.state.equity,
+            risk_amount=self.risk.risk_amount(self.risk.state.equity),
+            entry_price=candidate.entry_price,
+            stop_price=candidate.stop_price,
+            spec=spec,
+            config=self.config.risk,
+            recent_returns=returns,
+            bars_per_year=BARS_PER_YEAR.get(self.config.timeframes.trigger, 8760),
+            available_cash=self.portfolio.cash,
+            leverage=gate.allowed_leverage(self.config.risk.max_leverage),
+            min_notional_buffer=self.config.execution.min_notional_buffer,
+        )
+        if not sizing.ok:
+            return False
+
+        client_id = client_order_id(candidate.name, row.symbol, bar_ts, "arm")
+        order_id = self.watchdog.call(
+            "place_stop_entry",
+            lambda: self.broker.place_stop_entry(
+                row.symbol, sizing.quantity, candidate.entry_price, client_id
+            ),
+        )
+        if not order_id:
+            return False
+
+        self._armed = {
+            "symbol": row.symbol,
+            "order_id": order_id,
+            "client_id": client_id,
+            "trigger": candidate.entry_price,
+            "stop": candidate.stop_price,
+            "quantity": sizing.quantity,
+            "setup": candidate.name,
+            "conviction": row.score,
+            "regime": row.regime.value,
+            "risk_amount": sizing.risk_amount,
+            "bar_ts": bar_ts,
+            "entry_atr": candidate.atr,
+        }
+        row.no_trade_reason = NoTradeReason.COOLDOWN_SAME_BAR
+        log.info(
+            "entry_armed",
+            symbol=row.symbol,
+            trigger=candidate.entry_price,
+            stop=candidate.stop_price,
+            quantity=sizing.quantity,
+            detail=candidate.trigger_detail,
+        )
+        return True
+
+    def _resolve_armed(self, bar_ts: int) -> None:
+        """Settle last bar's armed order: adopt a fill, otherwise withdraw it.
+
+        **An armed order lives exactly one bar** (invariant D41). The level was
+        computed from a channel that has since moved; leaving the order there
+        means filling, three bars later, at a price the strategy no longer has
+        an opinion about. So it is cancelled unless it filled — and the cancel
+        is *verified*, because a cancel that silently failed leaves a live order
+        the engine has stopped tracking, which is strictly worse than never
+        having cancelled.
+        """
+        armed = self._armed
+        if armed is None or not isinstance(self.broker, CCXTBroker):
+            return
+
+        state = self.broker.order_state(armed["symbol"], armed["order_id"])
+        if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
+            self._open_from_armed_fill(armed, state, bar_ts)
+            self._armed = None
+            return
+
+        if state and not state.get("terminal"):
+            if not self.broker.cancel_stop_entry(armed["symbol"], armed["order_id"]):
+                # Still live and we failed to withdraw it. Keep tracking it
+                # rather than forgetting it: next bar tries again, and until
+                # then the slot stays reserved.
+                log.error(
+                    "armed_entry_still_live",
+                    symbol=armed["symbol"],
+                    order_id=armed["order_id"],
+                    consequence="an order the engine no longer wants is resting at the venue",
+                )
+                return
+            log.info("armed_entry_expired", symbol=armed["symbol"], trigger=armed["trigger"])
+
+        self._armed = None
+
+    def _detect_armed_fill(self) -> None:
+        """Notice an armed order filling between closes, not an hour later.
+
+        Same blind spot as the protective stop, same fix: the venue acted, so
+        the engine has to ask. A position that exists at the venue but not in
+        the portfolio is unmanaged — no trailing stop, no exit check, and no
+        protective stop at the venue either.
+        """
+        armed = self._armed
+        if armed is None or not isinstance(self.broker, CCXTBroker):
+            return
+        state = self.broker.order_state(armed["symbol"], armed["order_id"])
+        if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
+            self._open_from_armed_fill(armed, state, armed["bar_ts"])
+            self._armed = None
+            self.state.open_positions = self._positions_view()
+            self.writer.write(self.state)
+
+    def _open_from_armed_fill(self, armed: dict, state: dict, bar_ts: int) -> None:
+        """Record the position an armed order opened at the venue."""
+        symbol = armed["symbol"]
+        if self.portfolio.has_position(symbol):
+            return
+
+        filled = float(state.get("filled") or 0.0)
+        price = float(state.get("average_price") or 0.0) or float(armed["trigger"])
+        spec = self.broker.market_spec(symbol)
+        fee = price * filled * spec.taker_fee
+
+        fill = Fill(
+            order_client_id=str(armed["client_id"]),
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=filled,
+            price=price,
+            fee=fee,
+            ts=now_ms(),
+        )
+        self.db.record_fill(fill)
+
+        # Preserve the stop *distance* the trade was sized with: the fill landed
+        # somewhere other than the trigger, and the risk carried must stay the
+        # risk that was budgeted.
+        actual_stop = price - (float(armed["trigger"]) - float(armed["stop"]))
+        position = self.portfolio.open_position(
+            fill=fill,
+            stop_price=actual_stop,
+            setup=str(armed["setup"]),
+            risk_amount=float(armed["risk_amount"]),
+            conviction=float(armed["conviction"]),
+            regime=Regime(armed["regime"]),
+        )
+        position.meta["entry_atr"] = float(armed.get("entry_atr") or 0.0)
+        self.db.upsert_position(position)
+        self._place_protective_stop(position, bar_ts)
+
+        log.info(
+            "position_opened",
+            symbol=symbol,
+            price=price,
+            quantity=filled,
+            stop=actual_stop,
+            conviction=armed["conviction"],
+            setup=armed["setup"],
+            source="armed entry",
+        )
+        if self.notifier and self.config.telegram.notify_fills:
+            self.notifier.notify_entry(
+                symbol,
+                "buy",
+                price,
+                filled,
+                actual_stop,
+                float(armed["conviction"]),
+                str(armed["setup"]),
+            )
 
     def _record_rejection(self, symbol: str, order) -> None:
         """Count venue refusals and stop retrying a symbol that always fails."""
@@ -1437,6 +2103,77 @@ class Runner:
             for p in self.portfolio.positions.values()
         ]
 
+    def _balances_view(self) -> list[dict]:
+        """Every currency the account holds, valued in the quote currency.
+
+        The operator's question was "how much of each do I actually have?", and
+        the honest answer has three parts, not one. ``free`` is what can be
+        spent or sold right now; ``used`` is reserved by a resting order — on
+        spot a protective stop locks the whole holding, so a properly protected
+        position reads as zero free; ``total`` is what is owned. Showing only
+        free would report a protected position as no position at all.
+
+        In paper mode the venue is a simulation, so the same three columns are
+        derived from the simulated cash and holdings rather than fetched.
+        """
+        quote = self.config.quote_currency
+        rows: list[dict] = []
+
+        if isinstance(self.broker, CCXTBroker):
+            detail = self.watchdog.call("fetch_balances_detail", self.broker.fetch_balances_detail)
+            if detail is None:
+                return self.state.balances  # keep the last good picture, do not blank it
+        else:
+            detail = {quote: {"free": self.portfolio.cash, "used": 0.0, "total": self.portfolio.cash}}
+            for symbol, position in self.portfolio.positions.items():
+                detail[symbol.split("/")[0]] = {
+                    "free": 0.0,
+                    "used": position.quantity,
+                    "total": position.quantity,
+                }
+
+        for coin, amounts in detail.items():
+            total = float(amounts.get("total") or 0.0)
+            if total <= 0:
+                continue
+            price = 1.0 if coin == quote else self._mark_for(f"{coin}/{quote}")
+            rows.append(
+                {
+                    "coin": coin,
+                    "free": round(float(amounts.get("free") or 0.0), 8),
+                    "used": round(float(amounts.get("used") or 0.0), 8),
+                    "total": round(total, 8),
+                    # None, not zero: an unknown price must not be displayed as a
+                    # holding worth nothing.
+                    "price": round(price, 8) if price else None,
+                    "value": round(total * price, 4) if price else None,
+                }
+            )
+
+        rows.sort(key=lambda r: -(r["value"] or 0.0))
+        return rows
+
+    def _mark_for(self, symbol: str) -> float:
+        """Last price known for a symbol, preferring data already in hand.
+
+        Order matters only for cost: the feed is free, the cached bar close is
+        free, and asking the venue is a network call, so it is the last resort.
+        """
+        if self.feed is not None:
+            quote = self.feed.quote(symbol)
+            if quote is not None and quote.last > 0:
+                return float(quote.last)
+        cached = self._marks.get(symbol)
+        if cached:
+            return float(cached)
+        if isinstance(self.broker, CCXTBroker):
+            ticker = self.broker.fetch_ticker(symbol)
+            try:
+                return float(ticker.get("last") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
     def _snapshot(self, bar_ts: int, scans: list[ScanRow], point) -> None:
         self.state.last_bar_ts = bar_ts
         self.state.bars_processed += 1
@@ -1453,6 +2190,8 @@ class Runner:
             self.state.status = "degraded" if self.risk.state.degraded else "running"
 
         self.state.open_positions = self._positions_view()
+        self.state.balances = self._balances_view()
+        self.state.feed = self.feed.status() if self.feed else {}
         self.state.scan_top = [
             {
                 "symbol": r.symbol,

@@ -311,6 +311,19 @@ class ExecutionConfig(BaseModel):
     min_notional_buffer: float = Field(default=1.15, ge=1.0, le=3.0)
     limit_offset_bps: float = Field(default=2.0, ge=0, le=100)
     max_retries: int = Field(default=3, ge=0, le=10)
+    # Read live spread and 24h turnover and record them on every scan row.
+    # Collection is free and always on in live mode; see the flag below for
+    # whether it is allowed to change a decision.
+    microstructure_enabled: bool = True
+    # Let spread and liquidity reach the conviction score. Off by default: the
+    # penalty branches have never run against real data, and switching them on
+    # changes the trade population without any measurement behind it. Phase one
+    # is to collect and look; phase two is a separate, recorded decision.
+    microstructure_penalties: bool = False
+    # How often the engine asks the venue whether a protective stop has filled,
+    # while it is waiting between bars. Without this the engine learns its own
+    # stop fired only at the next close — up to an hour on an hourly bar.
+    venue_poll_seconds: int = Field(default=60, ge=10, le=900)
 
 
 class ExitConfig(BaseModel):
@@ -330,6 +343,37 @@ class ExitConfig(BaseModel):
     # A sudden ATR expansion re-prices risk rather than waiting for the stop.
     vol_shock_atr_ratio: float = Field(default=2.5, gt=1.0)
     breakeven_at_r: float = Field(default=1.0, ge=0)
+    # Profit target, in ATR units above entry. **Zero disables it**, which is
+    # the default on purpose: the mechanism is free, the *level* is a free
+    # parameter and therefore a pre-registered trial. Turning this on without
+    # first writing the hypothesis down is exactly what DSR penalises.
+    #
+    # Note this can never be a venue order on Bybit spot — a resting stop locks
+    # the base asset, so a second reduce-only order is refused (170131,
+    # measured). The target is evaluated by the engine, which means it only
+    # works while the bot is running. That asymmetry is deliberate: a missed
+    # target costs opportunity, a missing stop costs capital.
+    target_atr_mult: float = Field(default=0.0, ge=0, le=20)
+
+
+class EntryConfig(BaseModel):
+    """How an entry reaches the venue once conviction has chosen the symbol."""
+
+    # Place the entry as a resting trigger order at the breakout level instead
+    # of buying at the close. This is the only way to act between bar closes
+    # without letting an unclosed bar reach an indicator (invariant 1).
+    #
+    # Off by default: it changes *which* trades happen, so it is a trial, not a
+    # repair. The mechanism is built and tested; the decision to use it is not
+    # made here.
+    armed_breakout: bool = False
+    # How far above the last close an armed level may sit. Beyond this the
+    # level is stale rather than imminent and the order would rest for nothing.
+    armed_max_distance_atr: float = Field(default=1.5, gt=0, le=10)
+    # At most one armed order at a time. More than one and the *market* picks
+    # which symbol fills — first to touch, not highest scored — silently
+    # replacing the cross-sectional selection that was actually measured.
+    armed_max_orders: int = Field(default=1, ge=1, le=3)
 
 
 class DataConfig(BaseModel):
@@ -389,6 +433,32 @@ class TelegramConfig(BaseModel):
     notify_risk_changes: bool = True
     notify_errors: bool = True
     daily_summary_hour_utc: int = Field(default=0, ge=0, le=23)
+    # How often the wait loop asks Telegram for commands. Measured from this
+    # machine, one getUpdates round trip costs 3-8 seconds; at the old cadence
+    # (every loop tick, 5s) the engine spent most of its waking life on it and
+    # overshot every bar close by up to 38 minutes. Commands are conveniences,
+    # so they get a slow lane.
+    poll_seconds: float = Field(default=15.0, ge=1.0, le=300.0)
+    # Separate from the send timeout: a slow poll must not be able to stall the
+    # loop that is watching open positions.
+    poll_timeout: float = Field(default=3.0, gt=0, le=30.0)
+
+
+class SecurityConfig(BaseModel):
+    """Acknowledgements, not switches.
+
+    Nothing here disables a check. The only setting is whether a risk the
+    operator has already weighed still reports as an open defect — because a
+    warning that cannot be cleared is one the operator learns to skip past, and
+    the next real warning goes with it.
+    """
+
+    # The bot warns when the API key has no IP whitelist. On a dynamic address
+    # a whitelist locks the bot out mid-position every time the IP changes, so
+    # declining it can be the correct call. The risk is bounded by the key
+    # itself: withdrawal permission is refused outright and cannot be
+    # acknowledged away, so a leak costs unwanted trades, not the balance.
+    ip_whitelist_acknowledged: bool = False
 
 
 class EngineConfig(BaseModel):
@@ -420,11 +490,13 @@ class Config(BaseModel):
     indicators: IndicatorConfig = Field(default_factory=IndicatorConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     exits: ExitConfig = Field(default_factory=ExitConfig)
+    entries: EntryConfig = Field(default_factory=EntryConfig)
     data: DataConfig = Field(default_factory=DataConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     runtime_dir: Path = Path("runtime")
     log_level: str = "INFO"

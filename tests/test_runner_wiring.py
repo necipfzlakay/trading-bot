@@ -1005,3 +1005,52 @@ def test_heartbeat_interval_is_far_below_the_dead_man_threshold():
     assert HEARTBEAT_SECONDS <= 60
     assert healthcheck.DEFAULT_MAX_AGE_SECONDS >= HEARTBEAT_SECONDS * 5, "room for missed beats"
     assert healthcheck.DEFAULT_MAX_AGE_SECONDS <= 1800, "a stall must be caught in minutes"
+
+
+def test_no_notification_path_is_defined_but_never_called():
+    """Catch the whole bug class, not the two instances of it found so far.
+
+    Audit #7 found three notification methods that existed, were advertised in
+    the config, and were never invoked. They were wired up. Today
+    ``_notify_risk_change`` and ``_maybe_daily_summary`` were found in exactly
+    that state again — defined, documented, unreachable.
+
+    This is worse than having no notification: the operator reads
+    ``notify_risk_changes: true``, believes they will be told when exposure
+    drops, and is not. Silence reads as "nothing happened".
+
+    So rather than testing the two, test the shape: every ``_notify_*`` and
+    ``_maybe_*`` method on Runner must be called from somewhere in the module.
+    """
+    import ast
+    import inspect
+
+    from tbot.engine import runner as runner_module
+
+    tree = ast.parse(inspect.getsource(runner_module))
+    runner_class = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "Runner"
+    )
+
+    defined = {
+        node.name
+        for node in runner_class.body
+        if isinstance(node, ast.FunctionDef)
+        and (node.name.startswith("_notify_") or node.name.startswith("_maybe_"))
+    }
+    assert defined, "the naming convention this test relies on has changed"
+
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    orphans = sorted(defined - called)
+    assert not orphans, (
+        f"defined but never called: {orphans}. A notification the config "
+        f"advertises and the engine never sends is a promise the operator "
+        f"relies on and does not get."
+    )

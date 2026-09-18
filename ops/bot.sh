@@ -180,10 +180,14 @@ try:
     broker = build_broker(cfg, secrets, symbols[:3] or ["BTC/USDT"])
     print(f"  {GOOD} broker ready")
     if isinstance(broker, CCXTBroker):
-        report = assert_key_is_safe(broker.exchange)
+        acknowledged = cfg.security.ip_whitelist_acknowledged
+        report = assert_key_is_safe(broker.exchange, ip_whitelist_acknowledged=acknowledged)
         print(f"  {GOOD} API key permissions: {report.summary()}")
         if not report.ip_restricted:
-            print(f"  {WARN} key is not IP-restricted — add a whitelist on Bybit")
+            if acknowledged:
+                print(f"  {GOOD} no IP whitelist (acknowledged) — key cannot withdraw")
+            else:
+                print(f"  {WARN} key is not IP-restricted — add a whitelist on Bybit")
 except Exception as exc:
     print(f"  {BAD} {exc}")
     fail = 1

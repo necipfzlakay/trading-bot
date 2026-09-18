@@ -119,6 +119,10 @@ class Backtester:
         self.exits = ExitManager(config.exits, edge_decay_bars)
         self.risk = RiskBudget(config.risk)
         self._funnel: Counter = Counter()
+        # The one armed entry order, mirroring the live engine. Off unless
+        # ``entries.armed_breakout`` says otherwise, so the default backtest is
+        # the same one that has been measured all along.
+        self._armed: dict | None = None
         self.ranker = CrossSectionalRanker(
             top_percentile=config.conviction.top_percentile,
             min_universe=config.conviction.min_universe_for_ranking,
@@ -295,6 +299,10 @@ class Backtester:
                 for fill in broker.process_bar(symbol, candle):
                     self._apply_fill(portfolio, broker, fill, d, idx, bar_ts)
 
+            # -- an armed order may have filled on this bar, and that fill is a
+            #    position everything below has to know about
+            self._resolve_armed(portfolio, broker, data, cursors, bar_ts)
+
             # -- manage open positions before considering new ones
             for symbol in list(portfolio.positions):
                 d = data.get(symbol)
@@ -323,6 +331,9 @@ class Backtester:
                 if self._try_enter(portfolio, broker, d, idx, bar_ts, score):
                     entries_this_bar += 1
                     break
+
+            if entries_this_bar == 0:
+                self._maybe_arm(portfolio, bar_rows, bar_ts)
 
             self.conviction.note_bar(entered=entries_this_bar > 0)
             point = portfolio.record_equity(bar_ts, marks)
@@ -555,6 +566,147 @@ class Backtester:
         self._funnel["entered"] += 1
         return True
 
+    def _maybe_arm(self, portfolio: Portfolio, bar_rows: list, bar_ts: int) -> None:
+        """Mirror of ``Runner._maybe_arm``. One order, best candidate, one bar.
+
+        Symmetry here is not tidiness. If the live engine rests an order the
+        backtest never rests, the two take different trades and every measured
+        number stops describing the thing that is running.
+        """
+        if not self.config.entries.armed_breakout or self._armed is not None:
+            return
+        if len(portfolio.positions) >= self.config.risk.max_positions:
+            return
+
+        waiting = sorted(
+            (
+                (row, d, idx)
+                for row, d, idx in bar_rows
+                if row.no_trade_reason is NoTradeReason.NO_SETUP and row.score >= row.threshold
+            ),
+            key=lambda item: -item[0].score,
+        )
+        for row, d, idx in waiting:
+            if portfolio.has_position(d.symbol):
+                continue
+            history = d.setup_frame.iloc[: max(0, d.setup_map[idx] + 1)]
+            if len(history) < 220:
+                continue
+            regime = Regime(d.regime[idx]) if d.regime[idx] else Regime.UNKNOWN
+            candidate = None
+            for setup in DEFAULT_SETUPS:
+                arm = getattr(setup, "arm", None)
+                if arm is None:
+                    continue
+                candidate = arm(
+                    history,
+                    regime,
+                    self.config.exits.initial_stop_atr_mult,
+                    self.config.entries.armed_max_distance_atr,
+                )
+                if candidate is not None and candidate.stop_distance > 0:
+                    break
+                candidate = None
+            if candidate is None:
+                continue
+
+            returns = (
+                d.frame["close"].pct_change().iloc[max(0, idx - 30) : idx + 1].dropna().to_numpy()
+            )
+            sizing = size_position(
+                equity=self.risk.state.equity,
+                risk_amount=self.risk.risk_amount(self.risk.state.equity),
+                entry_price=candidate.entry_price,
+                stop_price=candidate.stop_price,
+                spec=d.spec,
+                config=self.config.risk,
+                recent_returns=returns,
+                bars_per_year=BARS_PER_YEAR.get(self.config.timeframes.trigger, 8760),
+                available_cash=portfolio.cash,
+                min_notional_buffer=self.config.execution.min_notional_buffer,
+            )
+            if not sizing.ok:
+                continue
+
+            self._armed = {
+                "symbol": d.symbol,
+                "trigger": candidate.entry_price,
+                "stop": candidate.stop_price,
+                "quantity": sizing.quantity,
+                "setup": candidate.name,
+                "conviction": row.score,
+                "regime": regime.value,
+                "risk_amount": sizing.risk_amount,
+                "bar_ts": bar_ts,
+                "entry_atr": candidate.atr,
+            }
+            self._funnel["armed"] += 1
+            return
+
+    def _resolve_armed(
+        self,
+        portfolio: Portfolio,
+        broker: PaperBroker,
+        data: dict,
+        cursors: dict,
+        bar_ts: int,
+    ) -> None:
+        """Fill an armed order if this bar traded through its level, else expire it.
+
+        The fill price is ``max(trigger, open)``. A bar that gaps straight past
+        the level does not fill at the level — the first price available is the
+        open, and it is worse. Assuming the trigger price in that case is the
+        same optimism that makes a backtest beat the live account it was
+        supposed to predict.
+
+        One bar and no more (invariant D41): the channel that produced the level
+        has moved, so an order left resting would fill at a price this strategy
+        has no opinion about.
+        """
+        armed = self._armed
+        if armed is None:
+            return
+        self._armed = None  # one bar, whatever happens below
+
+        if armed["bar_ts"] >= bar_ts:
+            self._armed = armed  # armed on this very bar; it gets the next one
+            return
+
+        d = data.get(armed["symbol"])
+        idx = cursors.get(armed["symbol"], 0)
+        if d is None or idx >= len(d.frame) or int(d.frame["ts"].iloc[idx]) != bar_ts:
+            return
+        if portfolio.has_position(armed["symbol"]):
+            return
+
+        row = d.frame.iloc[idx]
+        high, open_ = float(row["high"]), float(row["open"])
+        trigger = float(armed["trigger"])
+        if high < trigger:
+            self._funnel["armed_expired"] += 1
+            return
+
+        order = broker.build_order(
+            strategy=str(armed["setup"]),
+            symbol=armed["symbol"],
+            bar_ts=bar_ts,
+            action="armed-entry",
+            side=Side.BUY,
+            quantity=float(armed["quantity"]),
+            order_type=OrderType.MARKET,
+        )
+        order.meta = {
+            "stop": float(armed["stop"]),
+            "planned_entry": trigger,
+            "setup": str(armed["setup"]),
+            "conviction": float(armed["conviction"]),
+            "regime": str(armed["regime"]),
+            "risk_amount": float(armed["risk_amount"]),
+        }
+        fill = broker.force_fill_at(order, max(trigger, open_), bar_ts)
+        self._apply_fill(portfolio, broker, fill, d, idx, bar_ts)
+        self._funnel["armed_filled"] += 1
+
     def _apply_fill(
         self, portfolio: Portfolio, broker: PaperBroker, fill, d: SymbolData, idx: int, bar_ts: int
     ) -> None:
@@ -612,7 +764,7 @@ class Backtester:
             atr=atr_now,
             entry_atr=entry_atr,
             regime=regime,
-            conviction_now=None,
+            conviction_now=self._conviction_for_open(d, idx, bar_ts, position.side, regime),
             collapse_threshold=self.config.conviction.collapse_threshold,
         )
 
@@ -628,6 +780,42 @@ class Backtester:
 
         if decision.new_stop is not None:
             position.current_stop = decision.new_stop
+
+    def _conviction_for_open(
+        self, d: SymbolData, idx: int, bar_ts: int, side: Side, regime: Regime
+    ) -> float | None:
+        """Re-score an open position's thesis. Mirrors ``Runner._conviction_for_open``.
+
+        Must stay symmetric with the live path: if one of them feeds the
+        conviction-collapse exit and the other passes None, the backtest and the
+        engine take different trades and Gate 2 measures a divergence that is
+        entirely our own doing.
+
+        Portfolio-state blockers are neutralised for the same reason as live —
+        they answer "should I open this?", not "is this still true?" — and a
+        blocked score reads as no opinion, never as zero.
+        """
+        try:
+            ctx = ScoringContext(
+                symbol=d.symbol,
+                bar_ts=bar_ts,
+                regime=regime,
+                trigger_signals=_row_dict(d.trigger_signals, idx),
+                setup_signals=_row_dict(d.setup_signals, idx),
+                permission_signals=_row_dict(d.permission_signals, idx),
+                atr=float(d.atr[idx]) if not np.isnan(d.atr[idx]) else 0.0,
+                price=float(d.frame["close"].iloc[idx]),
+                already_open=False,
+                portfolio_full=False,
+                correlation_conflict=False,
+            )
+            scored = self.conviction.score(ctx, side)
+        except Exception:  # noqa: BLE001 — an exit check must never stop the replay
+            return None
+
+        if scored.no_trade_reason is not None:
+            return None
+        return scored.total
 
     def _close_remaining(
         self, portfolio: Portfolio, data: dict[str, SymbolData], cursors: dict[str, int], ts: int

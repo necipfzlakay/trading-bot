@@ -105,6 +105,60 @@ class DonchianBreakout(Setup):
             atr=float(atr_value),
         )
 
+    def arm(
+        self, df: pd.DataFrame, regime: Regime, atr_mult: float, max_distance_atr: float
+    ) -> SetupCandidate | None:
+        """The level this setup *would* break out through, before it happens.
+
+        ``detect`` fires after the close is already above the channel, which
+        means the move that defined the breakout is over by the time the bot can
+        act — on an hourly bar, up to an hour of it. The level itself, though,
+        is known at the previous close: it is the channel high, and the channel
+        deliberately excludes the forming bar. So it can be handed to the venue
+        as a resting order and the venue does the watching.
+
+        This is the only way to act between closes without breaking invariant 1.
+        No indicator sees an unclosed bar; a number computed on closed bars is
+        simply left with the exchange.
+
+        Returns None when price is already through the level (there is nothing
+        to wait for — ``detect`` covers that case) or when it sits so far below
+        that the order would rest for nothing.
+        """
+        if not self._allowed(regime) or len(df) < self.period + 20:
+            return None
+
+        upper, _, lower = ta.donchian(df["high"], df["low"], self.period)
+        atr_series = ta.atr(df["high"], df["low"], df["close"], 14)
+
+        close = float(df["close"].iloc[-1])
+        band = float(upper.iloc[-1])
+        atr_value = float(atr_series.iloc[-1])
+        if np.isnan(band) or np.isnan(atr_value) or atr_value <= 0:
+            return None
+        if close > band:
+            return None  # already broken out; that is ``detect``'s job, not this
+        if band - close > max_distance_atr * atr_value:
+            return None  # too far to be imminent
+
+        stop = band - atr_mult * atr_value
+        channel_stop = float(lower.iloc[-1])
+        stop = max(stop, channel_stop) if channel_stop < band else stop
+        if stop >= band:
+            return None
+
+        return SetupCandidate(
+            name=f"{self.name}_armed",
+            side=Side.BUY,
+            entry_price=band,
+            stop_price=stop,
+            trigger_detail=(
+                f"armed at {self.period}-bar high {band:.4f}, "
+                f"{(band - close) / atr_value:.2f} ATR above close {close:.4f}"
+            ),
+            atr=atr_value,
+        )
+
 
 class MomentumContinuation(Setup):
     """Sustained strength while the trend is intact.

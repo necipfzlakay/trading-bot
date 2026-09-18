@@ -42,6 +42,7 @@ footer{margin-top:16px;color:var(--dim);font-size:11px}
   <span class="pill" id="status">…</span>
   <span class="pill" id="mode"></span>
   <span class="pill" id="uptime"></span>
+  <span class="pill" id="feed"></span>
   <span class="pill dim" id="updated"></span>
 </header>
 
@@ -49,6 +50,16 @@ footer{margin-top:16px;color:var(--dim);font-size:11px}
   <div class="card wide">
     <h2>Account</h2>
     <div class="kpis" id="kpis"></div>
+  </div>
+
+  <div class="card wide">
+    <h2>Holdings — what the account actually contains</h2>
+    <div class="scroll"><table id="balances"></table></div>
+    <div class="dim" style="font-size:11px;margin-top:6px">
+      <b>free</b> can be spent or sold right now · <b>locked</b> is reserved by a resting order —
+      a protective stop reserves the whole holding, so a properly protected position shows
+      zero free · <b>total</b> is what is owned. Read live from the venue.
+    </div>
   </div>
 
   <div class="card wide">
@@ -147,6 +158,15 @@ async function refresh(){
   $('uptime').textContent = s.uptime_human ? `up ${s.uptime_human}` : '';
   $('updated').textContent = s.updated_iso ? `bar ${s.last_bar_iso||'—'}` : '';
 
+  // The between-bar feed is an improvement, never a dependency: when it is
+  // stale the bot falls back to bar-close behaviour and the venue stop is
+  // untouched. Say which of the two is happening rather than implying trouble.
+  const f = s.feed || {};
+  const fp = $('feed');
+  if(!Object.keys(f).length){ fp.textContent=''; fp.className='pill'; }
+  else if(f.stale){ fp.textContent='feed stale — bar-close only'; fp.className='pill degraded'; }
+  else { fp.textContent=`feed ${f.symbols||0} sym · ${fmt(f.age_seconds,1)}s`; fp.className='pill running'; }
+
   // Measured against where this run actually started, not a hardcoded figure.
   // This read 100 for a long time, which showed a 1014 USDT account as +914%.
   const base = s.starting_equity || 0;
@@ -161,6 +181,18 @@ async function refresh(){
     ['Leverage', fmt(s.leverage_allowed,1)+'×', ''],
     ['Restarts', s.restarts||0, (s.restarts||0)>5?'warn':''],
   ].map(([l,v,k])=>`<div class="kpi"><div class="label">${l}</div><div class="value ${k}">${v}</div></div>`).join('');
+
+  // Three columns, not one. Showing only "free" would report a position that
+  // is correctly protected — its stop reserves the base asset — as no position.
+  table($('balances'), ['coin','free','locked','total','price','value'], s.balances, b=>{
+    const locked = b.used > 0;
+    return `<tr><td><b>${b.coin}</b></td>
+      <td>${fmt(b.free, 6)}</td>
+      <td class="${locked?'warn':'dim'}">${fmt(b.used, 6)}</td>
+      <td>${fmt(b.total, 6)}</td>
+      <td class="dim">${b.price==null?'—':fmt(b.price, 6)}</td>
+      <td>${b.value==null?'—':fmt(b.value, 2)}</td></tr>`;
+  });
 
   table($('positions'), ['symbol','setup','entry','stop','bars','MFE R','MAE R','conviction'],
     s.open_positions, p=>`<tr><td>${p.symbol}</td><td class="dim">${p.setup}</td>

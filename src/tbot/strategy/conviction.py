@@ -365,7 +365,13 @@ class ConvictionEngine:
         component_name: str,
     ) -> ConvictionComponent:
         want = side.sign
-        directional: list[float] = []
+        # Collapsed by redundancy block, exactly as ``_score_confluence`` does.
+        # Averaging raw indicators here violated invariant 3 in a place nobody
+        # looked: ``flow_confirmation`` is worth 15 points, and ``vwap_distance``
+        # (rho 0.96 with price, same block as five others) was casting a full
+        # separate vote inside it. Correlated indicators leaning the same way are
+        # one opinion held loudly, whichever component is counting them.
+        per_block: dict[int, float] = {}
         gates: list[float] = []
         signals: list[IndicatorSignal] = []
 
@@ -373,10 +379,22 @@ class ConvictionEngine:
             spec = REGISTRY.get(name)
             if spec is None or spec.category is not category or np.isnan(value):
                 continue
+            # Gates deliberately bypass ``allowed``. The selection that fills it
+            # comes from tail analysis, which ranks symbols by *forward return* —
+            # a directional test. A gate never claims a direction; it asks
+            # whether there is participation behind the move. Dropping
+            # ``rel_volume`` because it failed a test of something it does not
+            # do would be eliminating it on the wrong evidence. Measured both
+            # ways: silencing the gates costs PF 1.41 -> 1.38.
             if name not in allowed and spec.role is SignalRole.DIRECTIONAL:
                 continue
             if spec.role is SignalRole.DIRECTIONAL:
-                directional.append(value * want)
+                block = self.block_lookup.get(name, hash(name))
+                oriented = value * want
+                # Strongest opinion in the block, not the average: averaging
+                # duplicates dilutes the very signal that defined the block.
+                if abs(oriented) > abs(per_block.get(block, 0.0)):
+                    per_block[block] = oriented
             else:
                 gates.append(value)
             signals.append(
@@ -388,6 +406,7 @@ class ConvictionEngine:
                 )
             )
 
+        directional = list(per_block.values())
         if not directional and not gates:
             return ConvictionComponent(
                 name=component_name,
@@ -405,7 +424,7 @@ class ConvictionEngine:
             name=component_name,
             score=score,
             max_score=max_score,
-            detail=f"{len(directional)} directional, {len(gates)} gates, base={base:+.2f}",
+            detail=f"{len(directional)} blocks, {len(gates)} gates, base={base:+.2f}",
             signals=signals,
         )
 
