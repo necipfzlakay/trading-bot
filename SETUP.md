@@ -3,6 +3,25 @@
 Kod tarafı bitti. Aşağıdakiler senin makinende, senin onayınla yapılması gereken
 şeyler — hiçbiri kod yazmayı gerektirmiyor.
 
+## 0. Önce bunu çalıştır
+
+```
+./ops/pre-install.sh
+```
+
+Ortam, bağımlılıklar, `.env`, testler, veri, ölçümler, backtest, Kapı 1 ve
+motorun duman testi — hepsi tek koşuda, her adım kontrol edilerek. Sonunda
+aşağıdakilerden **hangilerinin gerçekten sana kaldığını** listeler; çoğu
+zaman liste kısadır.
+
+Bu dosyadaki §3 (Bybit anahtarı), §4 (Telegram) ve §5 (LLM) script'in
+yapamayacağı şeyler — hesap açmak ve anahtar üretmek gerekiyor. §1 ve §2 sudo
+istiyor ya da dışarıya bir şey gönderiyor. §6 (7/24) ve §9 (gerçek para) ise
+`ops/bot.sh` ile yapılıyor ama ayrı ve kasıtlı kararlar, o yüzden kurulumun
+parçası değiller.
+
+Ayrıntılı kullanım: **[docs/USAGE.md](docs/USAGE.md)**.
+
 ## 1. Xcode lisansı (git için — zorunlu)
 
 Git sistem genelinde bloke, çünkü Xcode Command Line Tools lisansı kabul
@@ -78,26 +97,28 @@ rolleri `true` yap.
 > alanların çıkmasını zorla engelliyor — sadece anonim piyasa verisi ve yüzdesel
 > istatistik gidiyor. Yine de bilerek karar ver.
 
-## 6. 7/24 çalıştırma (launchd)
+## 6. 7/24 çalıştırma
+
+Elle python çalıştırmana gerek yok:
 
 ```
-./ops/install.sh
+./ops/bot.sh start paper       # veya demo / live
+./ops/bot.sh status
+./ops/bot.sh stop
 ```
 
-Bu iki launchd agent kurar: bot ve panel. `KeepAlive=true` — süreç nasıl ölürse
-ölsün geri gelir, girişte otomatik başlar.
+Moda göre launchd agent'larını üretir, **kurmadan önce o modun gerçekten
+başlayabildiğini doğrular**, yükler ve motorun doğru modda ayağa kalktığını
+bekler. Üç servis: bot, panel, sağlık kontrolü. `KeepAlive=true` — süreç nasıl
+ölürse ölsün geri gelir, girişte otomatik başlar.
 
-Durdurmak (tasarımdaki "elle kapatma" bu):
-```
-launchctl unload -w ~/Library/LaunchAgents/com.tbot.bot.plist
-```
+Ön kontrol olmadan bu tehlikeli: `KeepAlive` altında başlayamayan bir config
+30 saniyede bir sonsuza kadar denenir. Script bunu kurmadan önce yakalıyor,
+kalkamazsa da agent'ı geri kaldırıyor.
 
-Durum kontrolü:
-```
-launchctl list | grep tbot
-tail -f runtime/logs/bot.jsonl
-open http://127.0.0.1:8787
-```
+`./ops/install.sh` eski isim olarak duruyor, `bot.sh start paper`'a yönlendiriyor.
+
+Ayrıntı: **[docs/USAGE.md](docs/USAGE.md)** §7.
 
 ## 7. Ne kadar para gerekiyor?
 
@@ -205,13 +226,25 @@ Muhafazakâr taraf, doğrusu bu. Canlıda gerçek kayma ölçülüyor
 
 ## 9. Gerçek para (Kapı 3 geçilmeden yapma)
 
-`config/live.yaml` kullanır ve ek olarak environment değişkeni ister:
+```
+./ops/bot.sh start live
+```
+
+İki kapı var ve ikisi de kasıtlı:
+
+1. **Kapı 1 geçilmiş olmalı.** `runtime/gate1.json` FAIL diyorsa script kurulumu
+   reddediyor. Şu an FAIL diyor.
+2. **Onay cümlesini elle yazman gerekiyor.** Bayrak yok — bayrak bir script'in
+   yanlışlıkla geçebileceği şeydir.
+
+Ayrıca API anahtarının çekim yetkisi varsa kurulum reddediliyor, ve bakiye
+`min_equity`'nin altındaysa uyarıyor.
+
+Tek seferlik elle çalıştırmak istersen bariyer hâlâ environment değişkeni:
 
 ```
 TBOT_CONFIRM_LIVE=yes .venv/bin/python scripts/run.py --config config/live.yaml
 ```
-
-Bu bariyer kasıtlı. Yanlışlıkla gerçek parayla emir göndermeyi imkânsız kılıyor.
 
 ---
 

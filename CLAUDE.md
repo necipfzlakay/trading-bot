@@ -90,7 +90,7 @@ Sistemi baştan sona tarayıp uç durumları test ettim. Bulunanlar:
 
 ### Eklenen özellikler
 
-`engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
+`ops/bot.sh` mod başına launchd üretimi + ön kontrol · `engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
 `execution/safety.py` anahtar izni + kayma ölçümü + imkânsız equity koruması ·
 `scripts/healthcheck.py` dead-man + DB yedeği · `scripts/divergence.py` Kapı 2 ·
 `scripts/plateau.py` parametre platosu · `scripts/polarity.py` türev sinyal yönü ·
@@ -130,6 +130,10 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 ## Komutlar
 
 ```bash
+./ops/pre-install.sh                                      # tüm kurulum + ölçüm
+./ops/bot.sh start paper|demo|live                        # 7/24 (launchd üretir)
+./ops/bot.sh status | stop | restart | logs -f
+
 python scripts/backfill.py --years 3 --with-derivatives   # veri (resumable)
 python scripts/ic_report.py --timeframe 1d                # indikatör ölçümü
 python scripts/backtest.py                                # backtest + rapor
@@ -197,12 +201,16 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 
 | kontrol | değer | |
 |---|---|---|
-| işlem ≥ 50 | 18 | ❌ |
-| profit factor ≥ 1.2 | 1.00 | ❌ |
-| maks düşüş ≤ %20 | %5.0 | ✅ |
-| DSR anlamlı | p=0.508 | ❌ |
-| CPCV yollarının çoğu pozitif | %20 | ❌ |
+| işlem ≥ 50 | 116 | ✅ |
+| profit factor ≥ 1.2 | 1.20 | ❌ |
+| maks düşüş ≤ %20 | %11.6 | ✅ |
+| DSR anlamlı | p=1.000 | ❌ |
+| CPCV yollarının çoğu pozitif | %55.6 | ✅ |
 | PBO ≤ 0.5 | 1.00 | ❌ |
+
+Ölçüm `--trials 9` ile. Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
+deneme sayısını eksik saymak kapıyı geçirmeye yeten farkı üretiyor. Sayaç
+`research/hypotheses.md`'de ve `ops/pre-install.sh` oradan okuyor.
 
 ### İki yapısal bulgu (v1 → v2)
 
@@ -225,7 +233,7 @@ kıtlık-bolluk üretiyor; göreli sıralama fırsat sayısını sabit tutuyor.
 Düzeltince: 63→116 işlem, PF 0.97→1.34, expectancy −0.004→+0.280R.
 `conviction.selection: cross_sectional` artık varsayılan.
 
-Al-tut karşılaştırması: strateji **+%0.95**, BTC al-tut **+%192**.
+Al-tut karşılaştırması: strateji **+%4.73**, BTC al-tut **+%194.9**.
 
 **3. Volatilite ölçekleyici hiç çalışmamış.** `vol_target_annual: 0.35` bir hisse
 portföyü hedefi; evrenin medyan yıllık volatilitesi **%79**. Ölçekleyici sürekli
@@ -240,15 +248,17 @@ olmadan şanslı bir alt küme seçiyordu. Düzeltme ölçümü güvenilir yapt�
 
 9 denemeden sonra DSR'ın beklenen maks Sharpe eşiği ~1.5; gözlenen 0.24. Bu veri
 setinde (21 sembol × 3 yıl) **daha fazla ayar yapıp sonuca güvenmek matematiksel
-olarak mümkün değil.** CPCV (%44) ve PBO (0.67) aynı şeyi bağımsız söylüyor.
+olarak mümkün değil.** PBO (1.00) aynı şeyi bağımsız söylüyor: her bölünmede
+içeride en iyi olan konfigürasyon dışarıda medyanın altında kalıyor.
 
 Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var ve
 ödendi. Çıkış yolu ayar değil **taze veri**: paper ileri testi (maliyeti sıfır,
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 7** (bkz. `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 7` geçirin — DSR her denemeyi fiyatlıyor.
+**Kümülatif deneme: 9** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 9` geçirin — DSR her denemeyi fiyatlıyor.
+`ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir
 stratejiyi kârlı göstermek yerine reddetti. Sıradaki iş strateji araştırma

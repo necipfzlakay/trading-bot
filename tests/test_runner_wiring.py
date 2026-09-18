@@ -258,6 +258,61 @@ def test_unreadable_permissions_do_not_block_startup():
     assert report.error is not None
 
 
+def test_key_expiry_accepts_every_shape_bybit_sends():
+    """Bybit returns expiredAt as ISO-8601, epoch seconds or epoch millis.
+
+    This was a real outage: the ISO form raised ValueError outside the API
+    call's try block, so assert_key_is_safe crashed and demo/live could never
+    start — under launchd that is a restart loop, not a single failure.
+    """
+    from tbot.execution.safety import _parse_expiry
+
+    iso = _parse_expiry("2026-12-19T06:53:56Z")
+    assert iso is not None
+    assert _parse_expiry("1766127236") == 1766127236 * 1000  # seconds
+    assert _parse_expiry("1766127236000") == 1766127236000  # milliseconds
+    assert _parse_expiry(None) is None
+    assert _parse_expiry("") is None
+    assert _parse_expiry("0") is None
+
+
+def test_unparseable_expiry_does_not_break_the_permission_check():
+    """The expiry is informational; the withdrawal check is not."""
+    from tbot.execution.safety import assert_key_is_safe
+
+    class Exchange:
+        def privateGetV5UserQueryApi(self):
+            return {
+                "result": {
+                    "permissions": {"Spot": ["SpotTrade"], "Wallet": []},
+                    "ips": ["1.2.3.4"],
+                    "expiredAt": "whenever",
+                }
+            }
+
+    report = assert_key_is_safe(Exchange())
+    assert report.safe_for_trading
+    assert report.expires_ts is None
+
+
+def test_expired_key_is_refused():
+    """An expired key means rejected orders and unmanaged open positions."""
+    from tbot.execution.safety import assert_key_is_safe
+
+    class Exchange:
+        def privateGetV5UserQueryApi(self):
+            return {
+                "result": {
+                    "permissions": {"Spot": ["SpotTrade"], "Wallet": []},
+                    "ips": ["1.2.3.4"],
+                    "expiredAt": "2020-01-01T00:00:00Z",
+                }
+            }
+
+    with pytest.raises(RuntimeError, match="expired"):
+        assert_key_is_safe(Exchange())
+
+
 def test_slippage_tracker_measures_cost_against_the_assumption():
     from tbot.execution.safety import SlippageTracker
 

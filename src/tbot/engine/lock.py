@@ -49,8 +49,8 @@ class SingleInstanceLock:
                 f"Two engines on one account would double every position and each would "
                 f"reconcile the other's fills as unexplained.\n"
                 f"Stop the other one first:\n"
-                f"  launchctl unload -w ~/Library/LaunchAgents/com.tbot.bot.plist\n"
-                f"  # or: kill {holder}"
+                f"  ./ops/bot.sh stop\n"
+                f"  # or, if it was started by hand: kill {holder}"
             ) from None
 
         handle.seek(0)

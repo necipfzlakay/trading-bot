@@ -1267,7 +1267,7 @@ class Runner:
             elif command in ("status", "pnl", "positions"):
                 self.notifier.send(f"<pre>{self._status_text()}</pre>")
             elif command == "stop":
-                self.notifier.send("🛑 Stopping. Restart with launchctl or scripts/run.py.")
+                self.notifier.send("🛑 Stopping. Restart with ./ops/bot.sh start <mode>.")
                 self._running = False
 
     def _status_text(self) -> str:

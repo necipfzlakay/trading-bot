@@ -9,13 +9,24 @@ kabul etmeye değil, reddetmeye ayarlı. Şu anda kendi stratejisini reddediyor
 ## Hızlı başlangıç
 
 ```bash
-.venv/bin/python -m pytest -q                            # 334 test
-.venv/bin/python scripts/backfill.py --with-derivatives  # veri (~15 dk, bir kez)
-.venv/bin/python scripts/ic_report.py --timeframe 1d     # indikatör ölçümü
-.venv/bin/python scripts/backtest.py                     # backtest
-.venv/bin/python scripts/run.py --config config/paper.yaml   # çalıştır
-.venv/bin/python scripts/dashboard.py                    # panel :8787
+./ops/pre-install.sh          # kurulum + ölçüm + kontrol (bir kez)
+./ops/bot.sh start paper      # 7/24 çalıştır — bot + panel + sağlık kontrolü
+./ops/bot.sh status           # ne oluyor
+./ops/bot.sh stop             # durdur
 ```
+
+`pre-install.sh` ortamı kurar, veriyi indirir, indikatörleri ölçer, backtest ve
+Kapı 1'i çalıştırır, sonra motorun açılış yolunu kilide kadar yürüyerek her
+adımın **gerçekten** işe yaradığını doğrular. İlk koşu ~20 dakika, yarıda
+kesilirse kaldığı yerden devam eder. Botu başlatmaz — o ayrı bir karar.
+
+`bot.sh` launchd agent'larını moda göre üretir (`paper` · `demo` · `live`),
+**kurmadan önce o modun başlayabildiğini doğrular**, sonra motorun gerçekten
+kalktığını bekler. Elle python çalıştırmak gerekmiyor. Gerçek para Kapı 1 ve
+elle yazılan bir onay cümlesi istiyor.
+
+Tek tek çalıştırmak, ne olduğunu görmek veya bir adımı tekrarlamak için:
+**[docs/USAGE.md](docs/USAGE.md)**.
 
 ## Dokümanlar
 
@@ -26,7 +37,6 @@ kabul etmeye değil, reddetmeye ayarlı. Şu anda kendi stratejisini reddediyor
 | [docs/INDICATORS.md](docs/INDICATORS.md) | 22 indikatör: ne ölçüyorlar, hangisi işe yaradı |
 | [CLAUDE.md](CLAUDE.md) | Mimari, değişmez kurallar, denetim geçmişi |
 | [research/hypotheses.md](research/hypotheses.md) | Denenen/denenecek hipotezler + deneme sayacı |
-Mimari, değişmez kurallar, ölçüm bulguları: **[CLAUDE.md](CLAUDE.md)**
 
 ## Neyi farklı yapıyor
 
@@ -59,14 +69,15 @@ işler ve backtest o alt kümeyi tarif etmez. `risk.min_equity` bunu zorluyor.
 
 | kontrol | değer | |
 |---|---|---|
-| işlem ≥ 50 | 18 | ❌ |
-| profit factor ≥ 1.2 | ~1.0 | ❌ |
-| maks düşüş ≤ %20 | %4.2 | ✅ |
-| DSR anlamlı | p=0.51 | ❌ |
-| CPCV yollarının çoğu pozitif | %20 | ❌ |
+| işlem ≥ 50 | 116 | ✅ |
+| profit factor ≥ 1.2 | 1.20 | ❌ |
+| maks düşüş ≤ %20 | %11.6 | ✅ |
+| DSR anlamlı | p=1.000 | ❌ |
+| CPCV yollarının çoğu pozitif | %55.6 | ✅ |
 | PBO ≤ 0.5 | 1.00 | ❌ |
 
-Strateji **+%2.27**, BTC al-tut **+%192**.
+Strateji **+%4.73**, BTC al-tut **+%194.9**. `--trials 9` ile ölçüldü — 9 deneme
+sonrası DSR'ın beklediği "şans eseri en iyi Sharpe" gözlenenin çok üstünde.
 
 Altyapı tamamlandı ve çalışıyor. Strateji tamamlanmadı — açık hipotezler
 `research/hypotheses.md`'de, her biri denendiğinde `--trials` sayacına eklenmeli.

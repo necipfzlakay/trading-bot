@@ -19,12 +19,15 @@ git config user.email "$(git config --global user.email || echo akaynecip@gmail.
 
 # runtime/ holds the database, logs, parquet archive and state; .env holds keys.
 # Both are excluded by .gitignore — verify before the first push.
-if git check-ignore -q .env runtime; then
-  echo "ok: .env and runtime/ are ignored"
-else
-  echo "STOP: .env or runtime/ is not ignored. Fix .gitignore before pushing." >&2
-  exit 1
-fi
+# One path per call: `check-ignore -q` refuses several at once and exits 128,
+# which would read as "not ignored" and block every push.
+for path in .env runtime; do
+  if ! git check-ignore -q "$path"; then
+    echo "STOP: $path is not ignored. Fix .gitignore before pushing." >&2
+    exit 1
+  fi
+done
+echo "ok: .env and runtime/ are ignored"
 
 git add -A
 git commit -m "feat: autonomous crypto trading bot with measured indicator selection

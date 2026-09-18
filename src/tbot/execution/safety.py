@@ -17,6 +17,7 @@ backtest cannot show:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -39,13 +40,46 @@ class KeyPermissionReport:
     def safe_for_trading(self) -> bool:
         return self.can_trade and not self.can_withdraw
 
+    @property
+    def expires_iso(self) -> str:
+        if not self.expires_ts:
+            return "never"
+        return datetime.fromtimestamp(self.expires_ts / 1000, tz=UTC).strftime("%Y-%m-%d")
+
     def summary(self) -> str:
         if self.error:
             return f"could not read key permissions: {self.error}"
         parts = [f"trade={self.can_trade}", f"withdraw={self.can_withdraw}"]
         if self.ip_restricted:
             parts.append("ip-restricted")
+        parts.append(f"expires={self.expires_iso}")
         return " ".join(parts)
+
+
+# Bybit has returned this field as an ISO-8601 string, as epoch seconds and as
+# epoch milliseconds depending on the endpoint and the account type. It is
+# informational, so an unrecognised shape must never break the permission check
+# that surrounds it — that check is the one standing between a leaked key and an
+# emptied account.
+def _parse_expiry(raw) -> int | None:
+    """Epoch milliseconds, or None if the venue sent something unexpected."""
+    if raw in (None, "", 0, "0"):
+        return None
+
+    text = str(raw).strip()
+    try:
+        if text.replace(".", "", 1).isdigit():
+            value = float(text)
+            # Seconds and milliseconds are told apart by magnitude: anything
+            # below ~1e11 is a second-resolution timestamp for any plausible date.
+            return int(value * 1000) if value < 1e11 else int(value)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return int(parsed.timestamp() * 1000)
+    except (ValueError, OverflowError):
+        log.warning("key_expiry_unparsed", value=text[:64])
+        return None
 
 
 def check_key_permissions(exchange) -> KeyPermissionReport:
@@ -77,7 +111,7 @@ def check_key_permissions(exchange) -> KeyPermissionReport:
         can_withdraw=any("Withdraw" in str(p) for p in wallet),
         read_only=str(result.get("readOnly", "")) in ("1", "True", "true"),
         ip_restricted=bool(result.get("ips") and result["ips"] != ["*"]),
-        expires_ts=int(result["expiredAt"]) if result.get("expiredAt") else None,
+        expires_ts=_parse_expiry(result.get("expiredAt")),
         raw=result,
     )
 
@@ -105,6 +139,16 @@ def assert_key_is_safe(exchange, allow_withdraw: bool = False) -> KeyPermissionR
             "key_not_ip_restricted",
             advice="add an IP whitelist on Bybit; it costs nothing and blocks remote reuse",
         )
+
+    if report.expires_ts:
+        days = (report.expires_ts - datetime.now(UTC).timestamp() * 1000) / 86_400_000
+        if days <= 0:
+            raise RuntimeError(
+                f"This API key expired on {report.expires_iso}. Orders would be rejected "
+                f"and open positions would stop being managed. Create a new key first."
+            )
+        if days <= 14:
+            log.warning("key_expires_soon", days=round(days, 1), expires=report.expires_iso)
 
     log.info("key_permissions_ok", summary=report.summary())
     return report
