@@ -984,3 +984,24 @@ def test_position_meta_survives_a_restart(tmp_path):
     restored = json_mod.loads(raw["meta"]) if raw.get("meta") else {}
     assert restored.get("stop_order_id") == "2306901319086247168"
     assert restored.get("entry_atr") == pytest.approx(2.42)
+
+
+def test_heartbeat_interval_is_far_below_the_dead_man_threshold():
+    """The dead-man switch can only be as sharp as the heartbeat feeding it.
+
+    state.json used to be written on bar close alone, so on an hourly timeframe
+    a wedged engine was indistinguishable from a waiting one for an hour — and
+    the staleness threshold had to be 90 minutes to match. That is 90 minutes
+    of open positions nobody is managing.
+    """
+    import importlib
+    import sys
+    from pathlib import Path
+
+    from tbot.engine.runner import HEARTBEAT_SECONDS
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    healthcheck = importlib.import_module("healthcheck")
+    assert HEARTBEAT_SECONDS <= 60
+    assert healthcheck.DEFAULT_MAX_AGE_SECONDS >= HEARTBEAT_SECONDS * 5, "room for missed beats"
+    assert healthcheck.DEFAULT_MAX_AGE_SECONDS <= 1800, "a stall must be caught in minutes"

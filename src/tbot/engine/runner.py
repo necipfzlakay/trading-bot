@@ -85,6 +85,11 @@ ROOT_DIR = Path(__file__).resolve().parents[3]
 BARS_PER_YEAR = {"1h": 8760, "4h": 2190, "1d": 365}
 
 
+# Frequent enough that a stall is caught in minutes, rare enough that the
+# atomic write costs nothing next to a bar that is an hour long.
+HEARTBEAT_SECONDS = 60
+
+
 @dataclass(slots=True)
 class Runner:
     """Owns the live loop and everything it touches."""
@@ -259,12 +264,23 @@ class Runner:
                 # bar close is not an emergency control.
                 sleep_ms = ms_until_next_close(timeframe) + 2000
                 slept = 0.0
+                since_heartbeat = 0.0
                 while slept < sleep_ms / 1000 and self._running:
                     self._poll_commands()
                     self._apply_command_file()
                     step = min(self.config.engine.loop_interval_seconds, sleep_ms / 1000 - slept)
                     time.sleep(max(0.1, step))
                     slept += step
+                    since_heartbeat += step
+
+                    # Without this, state.json is only touched on bar close, so
+                    # on an hourly timeframe a *wedged* engine looks identical to
+                    # a waiting one for up to an hour — and the dead-man switch
+                    # has to be slackened to match, which is the whole thing it
+                    # exists to catch. Positions go unmanaged for that window.
+                    if since_heartbeat >= HEARTBEAT_SECONDS:
+                        since_heartbeat = 0.0
+                        self.writer.write(self.state)
 
             except Exception as exc:  # noqa: BLE001 — the loop must survive anything
                 self._record_error(exc)

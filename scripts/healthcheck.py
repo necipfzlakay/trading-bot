@@ -30,9 +30,11 @@ from tbot.core.clock import iso, now_ms
 from tbot.core.config import load_secrets
 from tbot.notify.telegram import TelegramNotifier
 
-# Kept generous by default: the engine only writes on bar close, so a 1h
-# timeframe legitimately goes an hour between updates.
-DEFAULT_MAX_AGE_SECONDS = 5400
+# The engine heartbeats state.json every 60s while it waits for the next bar,
+# so staleness now means something is actually wrong rather than "the bar is
+# long". Ten missed heartbeats is the threshold; it used to be 90 minutes,
+# which is how long a wedged engine could leave positions unmanaged.
+DEFAULT_MAX_AGE_SECONDS = 600
 
 
 def check_freshness(cfg, max_age: int) -> tuple[bool, str, dict]:

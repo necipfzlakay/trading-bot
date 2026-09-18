@@ -97,6 +97,9 @@ testi oku — hepsinin kendini koruyan bir testi var.
     ölçümü başka bir işleme ait olur. → `upsert_position`
 36. **`meta` kalıcıdır.** `stop_order_id`'yi taşır; kaybolursa motor kendi
     borsa stop'unu ne taşıyabilir ne tanıyabilir. → `_reconcile`
+37. **Motor beklerken de nabız atar.** `HEARTBEAT_SECONDS=60`; ölü-adam
+    anahtarı ancak nabız kadar keskin olabilir. Bar uzunluğu, arıza tespit
+    süresini belirlememeli.
 
 ## Denetim (2026-09-17) — bulunan ve kapatılan
 
@@ -150,6 +153,7 @@ Bunların hiçbiri teste takılmamıştı; üçü de gerçek Bybit demo koşusun
 | 35 | **`_enter` beş yerden sessizce çıkıyordu** — tarama satırının sebebi hiç güncellenmiyordu, elenen sembol panelde `eligible` görünüyordu. "Neden işlem yapmadı" tablosunun tam olarak engellemek için var olduğu şey | yüksek | her red yolu `no_trade_reason` yazıyor; ulaşılmayan adaylar da işaretleniyor |
 | 36 | **`upsert_position` çakışmada giriş fiyatını güncellemiyordu.** Çakışma anahtarı `symbol`; aynı sembolde açılan **yeni** pozisyon eskisinin `entry_price`/`initial_stop`/`entry_ts`'ini miras alıyordu. R, MAE, MFE — hepsi başka bir işlemin girişine göre ölçülüyordu | kritik | tüm kimlik alanları güncelleniyor |
 | 37 | **Pozisyon `meta`'sı DB'den hiç geri yüklenmiyordu.** İçinde `stop_order_id` var: her restart'ta motor kendi koyduğu borsa stop'unun tutamağını kaybediyor, trailing ilerleyemiyordu. Ayrıca kendi stop'unu sonsuza kadar "orphan" diye raporluyordu | kritik | `meta` yükleniyor |
+| 39 | **`state.json` sadece bar kapanışında yazılıyordu.** Saatlik barda takılmış motor bekleyen motordan bir saat boyunca ayırt edilemiyordu; ölü-adam anahtarının eşiği de bu yüzden 90 dakikaya gevşetilmişti — yani yakalamak için var olduğu durumu 90 dakika boyunca kaçırıyordu, pozisyonlar o süre yönetilmeden | yüksek | bekleme döngüsünde 60s heartbeat; `healthcheck` eşiği 5400s → 600s |
 | 38 | Mutabakat borsada olmayan pozisyonu bellekten düşürüyor ama DB satırını bırakıyordu — her açılışta tekrar yükleniyor, tekrar düşürülüyor, tekrar uyarıyordu | orta | `delete_position` |
 | 34 | **Sıfırlama sonrası hayalet pozisyon.** `_resolve_duplicate` borsa geçmişindeki "Filled" emri benimsiyordu; ama o dolumun malı sıfırlamada satılmıştı. 1000 USDT'lik hesaba 1699 USDT'lik pozisyon yazıldı, nakit −699 oldu | kritik | dolumu benimsemeden önce envanter doğrulanıyor; yoksa bar atlanıyor |
 | 32 | Satılamayacak toz bakiye (0.00431 VVV, `min_amount` 0.01) her açılışta "unmanaged position" diye uyarıyordu — hiçbir eylemin temizleyemeyeceği bir uyarı, kanalı görmezden gelmeyi öğretir | düşük | `fetch_positions` `min_amount` altını atıyor |
