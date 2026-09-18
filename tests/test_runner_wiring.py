@@ -644,3 +644,38 @@ def test_replacing_a_stop_at_a_different_level_releases_the_old_one():
     assert broker.place_stop("VVV/USDT", 65.62431, 23.35, "cid") == "new-stop"
     assert cancelled == ["old-stop"]
     assert placed["amount"] == pytest.approx(65.62431), "must protect the whole holding"
+
+
+def test_balance_that_changed_while_the_engine_was_down_is_reported(tmp_path):
+    """The bar-to-bar guard cannot see across a restart.
+
+    Observed: the account went from 50063 to 1763 between runs and the engine
+    adopted the new figure without a word, because startup treats the venue
+    balance as the baseline. Across a restart no market move explains a jump
+    like that — it is a withdrawal, a manual trade, or the wrong account.
+    """
+    from tbot.engine.runner import Runner
+    from tbot.engine.state import EngineState, StateWriter
+
+    writer = StateWriter(tmp_path / "state.json")
+    writer.write(EngineState(mode="live", venue="bybit-demo", status="running", equity=50063.15))
+
+    recorded = []
+
+    class DB:
+        def record_event(self, kind, message, level="info"):
+            recorded.append((kind, level, message))
+
+    runner = Runner.__new__(Runner)
+    runner.writer = writer
+    runner.db = DB()
+    runner.notifier = None
+
+    runner._check_balance_against_last_run(1763.15)
+    assert recorded and recorded[0][0] == "balance_changed_while_down"
+    assert recorded[0][1] == "error"
+
+    # A normal session's worth of movement must stay quiet, or the alert is noise.
+    recorded.clear()
+    runner._check_balance_against_last_run(50063.15 * 0.95)
+    assert not recorded

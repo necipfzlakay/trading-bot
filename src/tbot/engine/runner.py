@@ -208,6 +208,7 @@ class Runner:
             # limit and the equity curve on the same real number.
             self.portfolio.seed_from_venue(balance)
             balance = self.portfolio.equity({})
+            self._check_balance_against_last_run(balance)
         self.risk.update_equity(balance)
         self.state.equity = balance
         self.state.cash = self.portfolio.cash
@@ -1173,6 +1174,33 @@ class Runner:
         )
         if not report.clean and self.notifier:
             self.notifier.notify_error("Reconciliation mismatch", report.summary())
+
+    def _check_balance_against_last_run(self, balance: float) -> None:
+        """Say something when the account is not the size we last left it.
+
+        The implausible-jump guard only compares bar to bar **within** a run, so
+        a balance that changed while the engine was down slid in silently as the
+        new normal — a 97% drop was adopted without a word. Between runs the
+        cause is never a market move: it is a withdrawal, a manual trade, the
+        wrong account, or a reset. None of those should be quiet.
+        """
+        previous = self.writer.read() or {}
+        last = float(previous.get("equity") or 0.0)
+        if last <= 0 or balance <= 0:
+            return
+
+        change = (balance - last) / last
+        if abs(change) < 0.25:
+            return
+
+        message = (
+            f"account was {last:.2f} when the engine last ran and is {balance:.2f} now "
+            f"({change:+.1%}) — no market move explains that across a restart"
+        )
+        log.warning("balance_changed_while_down", previous=last, current=balance, change=change)
+        self.db.record_event("balance_changed_while_down", message, level="error")
+        if self.notifier:
+            self.notifier.notify_error("Account size changed", message)
 
     def _equity_now(self) -> float:
         """Account equity, read from the venue in live mode.

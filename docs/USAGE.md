@@ -388,6 +388,41 @@ simülatörde.
 
 ---
 
+## 11b. Baştan başlamak
+
+Hesap ve yerel geçmiş dağıldıysa:
+
+```bash
+./ops/reset.sh --usdt 1000
+```
+
+Botu durduruyor, Bybit demo'da tüm emirleri (koruyucu stop'lar dahil) iptal
+ediyor, tüm varlıkları USDT'ye satıyor, bakiyeyi hedefe çekiyor, sonra yerel
+işlem geçmişini siliyor. Veritabanını silmeden önce `runtime/backups/`'a
+yedekliyor.
+
+**Bakiye ayarı gerçekten Bybit tarafında.** `/v5/account/demo-apply-money`
+(`adjustType` 0 ekler, 1 azaltır). Yerelden ayarlanamaz — değişmez kural 19:
+canlı/demo modda `starting_balance` yok sayılır, bakiye borsadan okunur.
+
+Varsayılan olarak **korunanlar**: `runtime/data/` (3 yıllık arşiv),
+`indicator_selection.json`, `universe.json`, `reports/`. Onlarda kirli bir şey
+yok ve yeniden üretmek ~20 dakika.
+
+```bash
+./ops/reset.sh --local-only     # borsaya dokunma
+./ops/reset.sh --venue-only     # yerel geçmişi koru
+./ops/reset.sh --all            # arşiv ve ölçümler dahil her şey
+```
+
+`RESET` yazmanı istiyor. Gerçek parada **çalışmıyor** — venue tarafı
+`bybit-demo` dışında her şeyi reddediyor ve bunu değiştiren bir bayrak yok.
+
+Minimum notional altındaki toz bakiye satılamaz, raporda `left:` diye görünür.
+Zararsız.
+
+---
+
 ## 12. Gerçek para
 
 Kapı 1 + Kapı 2 + 4 hafta demo geçilmeden **yapma**. Sonra:

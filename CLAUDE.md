@@ -73,6 +73,11 @@ testi oku — hepsinin kendini koruyan bir testi var.
     değiştirilecekse yapılır. → `place_stop` adopt/replace
 27. **Kod değişikliği otomatik yüklenmez.** launchd çökmede geri getirir,
     dosya değişince getirmez. → `bot.sh status` bayat kod uyarısı
+28. **Koşular arası bakiye değişimi sessiz kalamaz.** Restart'ta borsadaki
+    bakiye son kalıcı equity ile karşılaştırılır; %25'ten büyük fark alarm
+    üretir. → `_check_balance_against_last_run`
+29. **Sıfırlama gerçek paraya dokunamaz.** `scripts/venue_reset.py` yalnızca
+    `bybit-demo` kabul eder ve bunu değiştiren bayrak yoktur.
 
 ## Denetim (2026-09-17) — bulunan ve kapatılan
 
@@ -121,6 +126,7 @@ Bunların hiçbiri teste takılmamıştı; üçü de gerçek Bybit demo koşusun
 | 27 | **Önce iptal, sonra yerleştir** — çalışan stop iptal edildi, yerine koyma başarısız oldu, pozisyon korumasız kaldı. Üstelik stop client id'si deterministik olduğu için tekrar deneme `170141 Duplicate clientOrderId` alıyordu | kritik | var olan stop **benimseniyor**; iptal sadece gerçekten değiştirilecekse; retry id'si benzersiz |
 | 28 | Açık pozisyonlar `state.json`'a sadece bar kapanışında yazılıyordu — açılıştan ilk bara kadar (1h'e kadar) panel ve `status` "pozisyon yok" diyordu | orta | `_positions_view` açılışta da yayımlanıyor |
 | 29 | Kod değişince launchd yeniden başlatmıyor; bot sessizce eski kodu çalıştırmaya devam ediyordu | orta | `bot.sh status` kaynak dosya mtime'ını süreç başlangıcıyla karşılaştırıyor |
+| 30 | **Motor kapalıyken değişen bakiye sessizce kabul ediliyordu.** Implausible-jump koruması sadece bir koşu *içinde* bar-bar karşılaştırıyor; 50.063 → 1.763 (%97 düşüş) yeniden başlatmada yeni taban olarak benimsendi. Restart arası bir değişimi piyasa açıklayamaz: para çekimi, elle işlem, yanlış hesap ya da sıfırlama | yüksek | `_check_balance_against_last_run` |
 
 **Açık, düzeltilmedi:** `report.py` ve panel `run_id`/`mode` filtrelemiyor. `runs`
 tablosunda mod var (`paper` / `live`), ama equity eğrisi ve işlem istatistikleri
@@ -130,7 +136,8 @@ moda göre filtrelemek, ya da mod başına ayrı `runtime/` dizini.
 
 ### Eklenen özellikler
 
-`ops/bot.sh` mod başına launchd üretimi + ön kontrol · `engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
+`ops/bot.sh` mod başına launchd üretimi + ön kontrol ·
+`ops/reset.sh` + `scripts/venue_reset.py` demo hesabı ve yerel geçmişi sıfırlama · `engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
 `execution/safety.py` anahtar izni + kayma ölçümü + imkânsız equity koruması ·
 `scripts/healthcheck.py` dead-man + DB yedeği · `scripts/divergence.py` Kapı 2 ·
 `scripts/plateau.py` parametre platosu · `scripts/polarity.py` türev sinyal yönü ·
