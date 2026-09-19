@@ -755,3 +755,61 @@ def test_collapse_exit_is_disabled_by_a_zero_threshold():
     )
     assert armed.should_exit
     assert armed.reason is ExitReason.CONVICTION_COLLAPSE
+
+
+def test_missing_entry_atr_is_backfilled_not_silently_ignored(runner):
+    """A position without entry_atr loses two exit layers without saying so.
+
+    Reconciliation adopts holdings the engine did not open, and rows written
+    before meta was persisted (audit #37) come back carrying only their stop
+    fields. The old fallback used the current ATR, which makes the
+    volatility-shock ratio exactly 1.0 — a check that can never fire — and
+    leaves target_price returning None, so a configured profit target would
+    not exist either. Both look like a managed position.
+    """
+    from tbot.core.models import Position, Side
+
+    position = Position(
+        symbol="BTC/USDT",
+        side=Side.BUY,
+        quantity=0.5,
+        entry_price=100.0,
+        entry_ts=0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        setup="adopted",
+        risk_amount=5.0,
+    )
+    runner.portfolio.positions["BTC/USDT"] = position
+    assert "entry_atr" not in position.meta
+
+    value = runner._entry_atr_for(position, atr_now=4.0)
+
+    assert value == pytest.approx(4.0)
+    assert position.meta["entry_atr"] == pytest.approx(4.0)
+
+    # And with a target configured it is now computable rather than None.
+    manager = ExitManager(ExitConfig(target_atr_mult=2.0))
+    assert manager.target_price(position) == pytest.approx(108.0)
+
+
+def test_a_stored_entry_atr_is_never_overwritten(runner):
+    """Backfill fills a gap; it must not rewrite history on every bar."""
+    from tbot.core.models import Position, Side
+
+    position = Position(
+        symbol="BTC/USDT",
+        side=Side.BUY,
+        quantity=0.5,
+        entry_price=100.0,
+        entry_ts=0,
+        initial_stop=90.0,
+        current_stop=90.0,
+        setup="test",
+        risk_amount=5.0,
+    )
+    position.meta["entry_atr"] = 2.5
+    runner.portfolio.positions["BTC/USDT"] = position
+
+    assert runner._entry_atr_for(position, atr_now=99.0) == pytest.approx(2.5)
+    assert position.meta["entry_atr"] == pytest.approx(2.5)

@@ -873,7 +873,7 @@ class Runner:
                 self.config.exits.atr_period,
             )
             atr_now = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
-            entry_atr = float(position.meta.get("entry_atr", atr_now) or atr_now)
+            entry_atr = self._entry_atr_for(position, atr_now)
             regime = classify_series(
                 data["permission"], timeframe=self.config.timeframes.permission
             ).iloc[-1]
@@ -1071,6 +1071,48 @@ class Runner:
         )
         if self.notifier and self.config.telegram.notify_fills:
             self.notifier.notify_exit(trade)
+
+    def _entry_atr_for(self, position, atr_now: float) -> float:
+        """The ATR this position was opened against, backfilled if it is missing.
+
+        A position can reach the portfolio without one: reconciliation adopts
+        holdings the engine did not open, and rows written before ``meta`` was
+        persisted (audit #37) came back with only their stop fields.
+
+        Missing, it used to fall back to ``atr_now`` **silently**, which quietly
+        killed two exit layers at once:
+
+        * the volatility-shock check becomes ``atr_now / atr_now == 1.0`` and can
+          never reach its ratio, so that layer simply never fires;
+        * ``ExitManager.target_price`` returns None, so a configured profit
+          target would not exist for this position either.
+
+        Both failures are invisible — the position looks managed and is missing
+        exits. Backfilling from the current ATR is an approximation and said to
+        be one; it is the difference between an approximate exit and no exit.
+        """
+        stored = float(position.meta.get("entry_atr", 0.0) or 0.0)
+        if stored > 0:
+            return stored
+        if atr_now <= 0:
+            return 0.0
+        position.meta["entry_atr"] = atr_now
+        self.db.upsert_position(position)
+        log.warning(
+            "entry_atr_backfilled",
+            symbol=position.symbol,
+            value=atr_now,
+            reason="position carried no entry ATR (adopted, or written before "
+            "meta was persisted)",
+            consequence="volatility-shock and take-profit exits were inert for it "
+            "until now; the backfilled value is today's ATR, not the one at entry",
+        )
+        self.db.record_event(
+            "entry_atr_backfilled",
+            f"{position.symbol}: entry_atr missing, backfilled with {atr_now:.6f}",
+            level="warning",
+        )
+        return atr_now
 
     def _conviction_for_open(
         self, symbol: str, data: dict, regime: Regime, bar_ts: int
