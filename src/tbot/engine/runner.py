@@ -1315,7 +1315,13 @@ class Runner:
             return False
 
         spec = self.broker.market_spec(row.symbol)
-        returns = data["trigger"]["close"].pct_change().tail(30).dropna().to_numpy()
+        returns = (
+            data["trigger"]["close"]
+            .pct_change()
+            .tail(self.config.risk.vol_lookback_bars)
+            .dropna()
+            .to_numpy()
+        )
         gate = LeverageGate(self.config.promotion_path)
 
         sizing = size_position(
@@ -1524,7 +1530,13 @@ class Runner:
     def _arm_entry(self, data: dict, row: ScanRow, candidate, bar_ts: int) -> bool:
         """Size the trade against the trigger level and rest the order."""
         spec = self.broker.market_spec(row.symbol)
-        returns = data["trigger"]["close"].pct_change().tail(30).dropna().to_numpy()
+        returns = (
+            data["trigger"]["close"]
+            .pct_change()
+            .tail(self.config.risk.vol_lookback_bars)
+            .dropna()
+            .to_numpy()
+        )
         gate = LeverageGate(self.config.promotion_path)
 
         # Sized against the *trigger* price, not the close. The fill happens at

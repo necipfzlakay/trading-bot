@@ -37,7 +37,16 @@ timeframes:
   trigger: 1h # giriş zamanlaması
 
 risk:
-  risk_per_trade: 0.0075 # equity'nin %0.75'i = 1R
+  # equity'nin %1.2'si = 1R. 0.75'ten yükseltildi çünkü operatör pozisyon
+  # büyüklüğünü istedi: $1000 hesapta $33'lük pozisyon yerine ~$50.
+  #
+  # Bu bir risk TERCİHİ, bir optimizasyon değil. Ölçülen bedel (sabit arşiv,
+  # bot durdurulmuş): maks düşüş %11.9 -> %15.8. Kapı 1 sınırı %20, yani hâlâ
+  # altında ama payı daraldı. Getiri farkları (+%5.26 / +%6.70 / +%6.04) üç
+  # seviyede de gürültü — bootstrap CI sıfırı içeriyor, aralarında seçim
+  # yapmak tam olarak DSR'ın cezalandırdığı şey olurdu. Seviye, istenen
+  # pozisyon boyutundan türedi; en iyi test edenden değil.
+  risk_per_trade: 0.012
   max_positions: 3
   max_correlation: 0.85 # BTC ile ρ>0.85 olanlar tek pozisyon sayılır
   max_portfolio_exposure: 1.0
@@ -72,7 +81,12 @@ risk:
   # evrenin daha sakin bir alt kümesi olur.
   # scripts/capital_check.py ile ölçüldü: %0.75 risk + 5 USDT borsa minimumunda
   # 183 kurulumların %95'ini, 306 ise %99'unu kapsıyor.
-  min_equity: 183.0
+  # Yeniden ölçüldü (scripts/capital_check.py) çünkü risk_per_trade değişti:
+  # 0.75%'te 179 idi, 1.2%'de 112. Daha yüksek risk daha büyük pozisyon demek,
+  # büyük pozisyon borsanın $5 minimumunu daha kolay geçiyor — yani taban
+  # DÜŞÜYOR. Altında bot stratejinin küçüğünü işlemez, evrenin daha sakin bir
+  # alt kümesini işler ve backtest ona uymaz.
+  min_equity: 112.0
 
   # Üst üste zarar işlem yasağı değil, conviction eşiği yükselmesi.
   loss_streak_start: 3
@@ -82,7 +96,15 @@ risk:
   # oranıyla çalışır, mutlak seviye dayatmaz. Ölçüm: 21 çiftin medyanı %79.
   # Eski 0.35 (hisse portföyü değeri) ölçekleyiciyi tabanda kilitliyordu.
   vol_target_annual: 0.80
-  vol_lookback_bars: 30
+  # 240 trigger bars, not 30. Thirty hourly bars is thirty hours, far too
+  # short for an annualised estimate: measured across the universe the 30-bar
+  # reading spans 4.0x from its 10th to 90th percentile against 3.2x at 240,
+  # and the position scale it produces jumps a median 0.87% per bar (p95 10.2%)
+  # against 0.09% (p95 1.3%). Same position, resized hourly by estimator noise.
+  #
+  # This key sat here reading 30 while the engine had 30 hard-coded in two
+  # places and never consulted the file. It is wired up now.
+  vol_lookback_bars: 240
   vol_scale_min: 0.4
   vol_scale_max: 2.0
 

@@ -526,7 +526,10 @@ class Backtester:
             self._funnel["stop_above_price"] += 1
             return False
 
-        returns = d.frame["close"].pct_change().iloc[max(0, idx - 30) : idx + 1].dropna().to_numpy()
+        window = self.config.risk.vol_lookback_bars
+        returns = (
+            d.frame["close"].pct_change().iloc[max(0, idx - window) : idx + 1].dropna().to_numpy()
+        )
 
         sizing = size_position(
             equity=self.risk.state.equity,
@@ -610,8 +613,13 @@ class Backtester:
             if candidate is None:
                 continue
 
+            window = self.config.risk.vol_lookback_bars
             returns = (
-                d.frame["close"].pct_change().iloc[max(0, idx - 30) : idx + 1].dropna().to_numpy()
+                d.frame["close"]
+                .pct_change()
+                .iloc[max(0, idx - window) : idx + 1]
+                .dropna()
+                .to_numpy()
             )
             sizing = size_position(
                 equity=self.risk.state.equity,

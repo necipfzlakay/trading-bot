@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tbot.core.clock import tf_ms
@@ -65,7 +65,25 @@ class Secrets(BaseSettings):
 # --------------------------------------------------------------------------
 
 
-class UniverseConfig(BaseModel):
+class StrictModel(BaseModel):
+    """Base for every config section: an unknown key is an error, not a shrug.
+
+    Pydantic ignores extra keys by default, which turns a setting nobody reads
+    into one that looks read. This repo has now shipped two of them:
+    ``universe.max_spread_bps`` sat in the file deciding nothing, and
+    ``risk.vol_lookback_bars`` sat there for just as long — the volatility
+    window was hard-coded to 30 in the engine while the config said 30 beside
+    it, so nobody noticed until the number had to change and changing it did
+    nothing.
+
+    A typo now fails at startup, where it is cheap, instead of silently
+    reverting a setting to a default nobody looked up.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class UniverseConfig(StrictModel):
     """Which symbols get scanned.
 
     ``symbols`` pins an explicit list; leaving it empty auto-selects the most
@@ -95,7 +113,7 @@ class UniverseConfig(BaseModel):
     )
 
 
-class TimeframeConfig(BaseModel):
+class TimeframeConfig(StrictModel):
     """The three-layer hierarchy. Higher layers veto lower ones, never the reverse."""
 
     permission: str = "1d"
@@ -125,7 +143,7 @@ class DrawdownTier(BaseModel):
     threshold_bump: float = Field(ge=0.0, le=50.0)
 
 
-class RiskConfig(BaseModel):
+class RiskConfig(StrictModel):
     """Capital preservation. The only layer allowed to say no unconditionally."""
 
     risk_per_trade: float = Field(default=0.0075, gt=0, le=0.05)
@@ -208,6 +226,16 @@ class RiskConfig(BaseModel):
     vol_lookback_bars: int = Field(default=30, ge=5)
     vol_scale_min: float = Field(default=0.4, gt=0, le=1.0)
     vol_scale_max: float = Field(default=2.0, ge=1.0, le=5.0)
+    # How many trigger bars the realised-volatility estimate looks back over.
+    #
+    # This was hard-coded at 30 in two places in the runner. Thirty hourly bars
+    # is thirty hours, which is far too short to estimate an annualised number:
+    # measured across the universe, the 30-bar estimate spans 4.0x from its
+    # 10th to its 90th percentile against 3.2x at 240 bars, and the resulting
+    # position scale jumps a median 0.87% per bar (p95 10.2%) against 0.09%
+    # (p95 1.3%) at 240. Same positions, sized differently hour to hour for no
+    # reason but estimator noise.
+    vol_lookback_bars: int = Field(default=240, ge=10, le=2000)
 
     # Rolling performance window — the unit of evaluation is trades, not days.
     rolling_windows: list[int] = Field(default_factory=lambda: [20, 50, 100])
@@ -233,7 +261,7 @@ class RiskConfig(BaseModel):
         return tiers
 
 
-class ConvictionConfig(BaseModel):
+class ConvictionConfig(StrictModel):
     """Selectivity. High base threshold; sitting in cash is a valid outcome."""
 
     # Calibrated against the measured score distribution rather than picked:
@@ -286,7 +314,7 @@ class ConvictionConfig(BaseModel):
         return self
 
 
-class IndicatorConfig(BaseModel):
+class IndicatorConfig(StrictModel):
     """Which indicators may vote, and the evidence bar they must clear."""
 
     # Below this absolute Information Coefficient an indicator is noise and is
@@ -300,7 +328,7 @@ class IndicatorConfig(BaseModel):
     enabled: list[str] = Field(default_factory=list)  # empty = registry default
 
 
-class ExecutionConfig(BaseModel):
+class ExecutionConfig(StrictModel):
     order_type: Literal["market", "limit"] = "market"
     # Backtest/paper cost assumptions. Live fees are fetched from the exchange
     # and override these; if the real cost is worse, the backtest was optimistic.
@@ -326,7 +354,7 @@ class ExecutionConfig(BaseModel):
     venue_poll_seconds: int = Field(default=60, ge=10, le=900)
 
 
-class ExitConfig(BaseModel):
+class ExitConfig(StrictModel):
     """No fixed holding times. Levels come from excursion analysis of real trades."""
 
     initial_stop_atr_mult: float = Field(default=2.0, gt=0, le=10)
@@ -356,7 +384,7 @@ class ExitConfig(BaseModel):
     target_atr_mult: float = Field(default=0.0, ge=0, le=20)
 
 
-class EntryConfig(BaseModel):
+class EntryConfig(StrictModel):
     """How an entry reaches the venue once conviction has chosen the symbol."""
 
     # Place the entry as a resting trigger order at the breakout level instead
@@ -376,7 +404,7 @@ class EntryConfig(BaseModel):
     armed_max_orders: int = Field(default=1, ge=1, le=3)
 
 
-class DataConfig(BaseModel):
+class DataConfig(StrictModel):
     backfill_years: float = Field(default=3.0, gt=0, le=10)
     parquet_dir: Path = Path("runtime/data")
     fetch_derivatives: bool = True
@@ -385,13 +413,13 @@ class DataConfig(BaseModel):
     rest_rate_limit_ms: int = Field(default=120, ge=0)
 
 
-class LLMRoleConfig(BaseModel):
+class LLMRoleConfig(StrictModel):
     enabled: bool = False
     max_calls_per_day: int = Field(default=20, ge=0)
     model: str = ""
 
 
-class LLMConfig(BaseModel):
+class LLMConfig(StrictModel):
     """Advisory only. The iron rule is enforced in code, not by prompt wording.
 
     An LLM may reduce risk (veto a new entry) and may produce text. It can never
@@ -421,13 +449,13 @@ class LLMConfig(BaseModel):
     event_guard_min_trial_days: int = Field(default=90, ge=1)
 
 
-class WebConfig(BaseModel):
+class WebConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8787, ge=1024, le=65535)
     enabled: bool = True
 
 
-class TelegramConfig(BaseModel):
+class TelegramConfig(StrictModel):
     enabled: bool = False
     notify_fills: bool = True
     notify_risk_changes: bool = True
@@ -444,7 +472,7 @@ class TelegramConfig(BaseModel):
     poll_timeout: float = Field(default=3.0, gt=0, le=30.0)
 
 
-class SecurityConfig(BaseModel):
+class SecurityConfig(StrictModel):
     """Acknowledgements, not switches.
 
     Nothing here disables a check. The only setting is whether a risk the
@@ -461,7 +489,7 @@ class SecurityConfig(BaseModel):
     ip_whitelist_acknowledged: bool = False
 
 
-class EngineConfig(BaseModel):
+class EngineConfig(StrictModel):
     loop_interval_seconds: float = Field(default=5.0, gt=0, le=300)
     # Restart storm detection: beyond this, drop to safe mode instead of thrashing.
     max_restarts_per_hour: int = Field(default=10, ge=1)

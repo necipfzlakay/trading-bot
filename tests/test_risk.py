@@ -389,14 +389,29 @@ def test_minimum_capital_handles_no_observations():
 
 
 def test_shipped_min_equity_matches_the_measured_requirement():
-    """The config floor must not drift away from what the data says."""
+    """The config floor must not drift away from what the data says.
+
+    The floor exists because below it the bot stops trading a smaller version
+    of this strategy and starts trading a quieter subset of the universe, which
+    the backtest does not describe (invariant 18). It is set by the exchange's
+    $5 minimum against the widest stop the account can still size, so it moves
+    **inversely** with risk per trade: bigger positions clear the minimum more
+    easily, and the floor falls.
+
+    Asserting the product rather than the two numbers is deliberate. The pair
+    was pinned literally before and went stale the moment risk_per_trade
+    changed, which tells you the test was guarding the numbers instead of the
+    relationship between them. Measured with scripts/capital_check.py:
+    0.75% -> 179.23 and 1.2% -> 112.02, and 0.0075 x 179.23 == 0.012 x 112.02.
+    """
     from tbot.core.config import load_config
 
     cfg = load_config("config/base.yaml")
-    # 183 was measured by scripts/capital_check.py for this universe at 0.75%
-    # risk. If risk_per_trade changes, the floor has to be re-measured.
-    assert cfg.risk.risk_per_trade == pytest.approx(0.0075)
-    assert cfg.risk.min_equity == pytest.approx(183.0)
+    product = cfg.risk.risk_per_trade * cfg.risk.min_equity
+    assert product == pytest.approx(1.344, rel=0.05), (
+        f"risk_per_trade={cfg.risk.risk_per_trade} and min_equity={cfg.risk.min_equity} "
+        f"no longer agree. Re-run scripts/capital_check.py and update the floor."
+    )
 
 
 def test_starting_balance_is_not_used_as_a_live_constraint():
