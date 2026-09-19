@@ -15,6 +15,9 @@ Binds to localhost only. Nothing here is built to face a network.
 from __future__ import annotations
 
 import json
+import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -29,10 +32,42 @@ STATIC = Path(__file__).parent / "static"
 def create_app(config: Config | None = None) -> FastAPI:
     cfg = config or load_config("config/base.yaml")
     secrets = load_secrets()
-    app = FastAPI(title="tbot dashboard", docs_url=None, redoc_url=None)
+
+    # One connection for the life of the process, not one per request. A fresh
+    # Database per request leaked a file descriptor every time — the panel polls
+    # several endpoints a second, so it walked into the launchd file limit (256)
+    # in a couple of minutes and then went blind: "[Errno 24] Too many open
+    # files" on state.json, "unable to open database file" on every query.
+    # KeepAlive restarted it and the climb began again.
+    #
+    # Opening it once also stops the panel writing to the engine's database on
+    # every request: Database.__init__ runs the schema script and stamps the
+    # schema version. A read-mostly dashboard should do that once, at most.
+    if sqlite3.threadsafety < 3:
+        # The endpoints are sync, so FastAPI runs them in a threadpool and they
+        # share this connection. That is only safe when SQLite is serialised.
+        # Fail at startup rather than return quietly corrupted reads.
+        raise RuntimeError(
+            f"sqlite3.threadsafety is {sqlite3.threadsafety}; the dashboard shares "
+            "one connection across FastAPI's threadpool and needs a serialised build (3)"
+        )
+    handle: Database | None = None
 
     def db() -> Database:
-        return Database(cfg.db_path)
+        nonlocal handle
+        if handle is None:
+            handle = Database(cfg.db_path)
+        return handle
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        if handle is not None:
+            handle.close()
+
+    app = FastAPI(
+        title="tbot dashboard", docs_url=None, redoc_url=None, lifespan=lifespan
+    )
 
     def check_token(token: str | None) -> None:
         """Guards the two control endpoints only; reads are open on localhost."""

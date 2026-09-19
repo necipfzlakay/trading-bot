@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 398 test
+.venv/bin/python -m pytest -q             # 402 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -258,6 +258,18 @@ Denetim #47 ve #49 birlikte bir ders: **kendi tamirimin ölçümüne en az başk
 kadar şüpheyle bakmalıyım.** #40'ı "canlandırdım" diye yazdım, sonuç iyi göründü,
 ve iyi görünen sonucu kimse soruşturmaz — tam olarak `hypotheses.md`'ye "iyileşen
 bir tamir daha fazla şüphe hak eder" diye yazdığım şeyi kendim yapmadım.
+
+### Beşinci tur (2026-09-19, demo koşusu sürerken rutin kontrolde)
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 52 | **Panel her istekte yeni SQLite bağlantısı açıyor, hiçbirini kapatmıyordu.** `web/app.py` içindeki `db()` her çağrıda `Database(cfg.db_path)` kuruyordu. Ölçüldü: **~1 fd/sn**; launchd'in `maxfiles` soft limiti **256**. Panel birkaç dakikada kör oluyor — `[Errno 24] Too many open files` state.json'da (200 kez), `unable to open database file` her sorguda (629 kez) — KeepAlive kaldırıyor ve tırmanış baştan başlıyor. `web.err.log` 5.0 MB traceback. Ayrıca `Database.__init__` şema scriptini + `meta` UPSERT'ünü çalıştırdığı için **okuma amaçlı panel motorun DB'sine istek başına yazıyordu** | yüksek | süreç ömrü boyunca tek bağlantı; `lifespan` ile kapatılıyor; `sqlite3.threadsafety < 3` ise açılışta reddediliyor (endpoint'ler sync, FastAPI threadpool'unda paylaşılıyor). Ölçüm: 960 istek sonrası fd sabit, `web.err.log` 0 bayt. → `test_web.py` |
+
+Bunun hiçbir işlem güvenliği etkisi yok — panel ayrı süreç ve salt-okur. Ama
+**gözlem katmanının kendisi arızalıydı** ve bunu hiçbir şey raporlamıyordu:
+`bot.sh status` motora bakıyor, `healthcheck.py` motora bakıyor, panelin
+çöküşünü yalnız kendi stderr'i biliyordu. Denetim #24'ün ("`bot.jsonl` hiç
+yazılmıyordu") aynı sınıftan bir tekrarı: ölçüm aracının ölçülmemesi.
 
 ### Ölçülmüş borsa gerçekleri (2026-09-18, demo hesapta tek tek denendi)
 
