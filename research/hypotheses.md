@@ -28,7 +28,78 @@ bir sonrakinin barını yükseltiyor.
 | 12 | Kısmi kâr alma (+1R/+1.5R/+2R'de %50 sat) sonucu iyileştirir | MFE/yakalama ölçümü | **test edildi, REDDEDİLDİ** — üç seviyede de PF ve getiri düştü. Düşüşü azaltıyor (%15.8→%12.8) ama getiriyi de azaltıyor | 3 |
 | 13 | `risk_per_trade` 0.75%→1.2% (operatör pozisyon boyutu istedi) | tercih | **uygulandı** — maks düşüş %11.9→%15.8. Sharpe ~ölçek-bağımsız olduğu için DSR'a etkisi küçük | 1 |
 
-**Kümülatif deneme: 15.** Bir sonraki CPCV koşusunda `--trials 15` geçirin.
+| 14 | Kurulum kapısı gereksiz — kesitsel sıralama tek başına yeter (açık hipotez #4) | mimari denetim | **test edildi, REDDEDİLDİ** — 3.6x işlem (103→367) ama Kapı 1'de 5/6 → **2/6**, PBO 0.33 → **0.67** | 1 |
+| 15 | Taker akış dengesizliği (CVD) kısa vadede edge taşır | fiyattan bağımsız tek kaynak | **taranıp REDDEDİLDİ** — üst desil lift +0.8 puan, gereken +13. Strateji koşulmadı | 0 (indikatör taraması) |
+
+**Kümülatif deneme: 16.** Bir sonraki CPCV koşusunda `--trials 16` geçirin.
+
+## 14. deneme: kurulum kapısı gerçekten gerekliymiş
+
+Açık hipotez #4 aylardır bekliyordu: kuyruk analizi "üst desil" demişti, "üst
+desil VE bir kurulum tetiklensin" dememişti. Ve kapı ezici bir filtre — skoru
+geçen 17.909 adayın 17.749'u (%99,1) burada ölüyor. Kaldırılınca:
+
+| | kurulum şart | kapı kapalı |
+|---|---|---|
+| işlem | 103 | **367** |
+| işlem/ay | 2,9 | **10,2** |
+| kazanma oranı | %17,5 | %22,6 |
+| expectancy | +0,195R | +0,158R |
+| profit factor | **1,19** | 1,05 |
+| getiri | **+%6,04** | +%0,77 |
+| maks düşüş | **%15,8** | %20,9 |
+| maruziyet | %29,3 | %63,4 |
+
+Kapı 1 kararı acımasız:
+
+| kontrol | kurulum şart | kapı kapalı |
+|---|---|---|
+| işlem ≥ 50 | ✅ 113 | ✅ 382 |
+| PF ≥ 1.2 | ✅ 1.42 | ❌ 1.18 |
+| maks düşüş ≤ %20 | ✅ %11.6 | ❌ %20.9 |
+| DSR | ❌ | ❌ |
+| CPCV çoğunluk + | ✅ %55.6 | ✅ %60.0 |
+| PBO ≤ 0.5 | ✅ **0.33** | ❌ **0.67** |
+| | **5/6** | **2/6** |
+
+PBO'nun 0.33'ten 0.67'ye fırlaması belirleyici: kapı olmadan, içeride en iyi
+görünen konfigürasyon dışarıda medyanın altında kalıyor — klasik aşırı uyum
+imzası.
+
+**Bir çelişki ve dürüst yorumu.** Kapı kapalıyken `ranked_entry` işlemleri
+ort. +0,214R yaparken kurulum tetiklenenler −0,356R yaptı. Bu ilk bakışta
+"kapı zararlı" gibi okunuyor. Ama iki koşunun örneklemi karşılaştırılabilir
+değil: kapı kapalıyken maruziyet %63'e çıkıyor, portföy sürekli dolu oluyor
+ve kurulum tetikleyen adaylar farklı anlarda/hiç giremiyor. Kapı 1 bütünsel
+kararı veriyor ve o karar net.
+
+**Sonuç: kapı kalıyor.** Ve kullanıcının "günde en az bir işlem" hedefi bu
+yoldan karşılanamıyor — ayda 2,9'dan 10,2'ye çıkmak mümkün, ama bedeli
+stratejinin ölçülmüş kalitesi.
+
+## 15. Akış verisi taraması: kısa vade kapandı
+
+Faz 3'ün tek gerçek umudu fiyattan türemeyen bir sinyaldi. Taker alım/satım
+dengesizliği (`scripts/flow_screen.py`, Binance kline 10. alan, 8 sembol ×
+12 ay × 63.027 gözlem):
+
+| | isabet |
+|---|---|
+| taban | %29,9 |
+| imbalance üst %20 | %30,8 |
+| imbalance üst %10 | %30,7 |
+| imbalance üst %5 | %30,1 |
+| imbalance üst %1 | **%28,4** ← tabandan kötü |
+| **gereken** | **%43,3** |
+
+Lift **+0,8 puan**, gereken **+13 puan**. Üstelik monotonik değil: en uç
+yüzdelik tabandan kötü. 24 bar ileri getiriyle korelasyon **+0,011**.
+
+Fiyat indikatörlerinin en iyisi (+2,6 puan) bundan daha güçlü. Yani elimizdeki
+tek fiyat-dışı bilgi kaynağı da bu ufukta boş.
+
+**Kısa vadeli al-sat fikri, kanıtla kapandı.** Deneme sayılmadı çünkü strateji
+koşulmadı — bu bir indikatör taraması, funding polaritesiyle aynı kategori.
 
 ## 12. deneme: kısmi kâr alma — neden reddedildi
 
@@ -235,7 +306,7 @@ bir bedeli var ve o bedel ödendi.
    oyluyor olabilir. Kategoriyi değiştirmek işlem popülasyonunu değiştirir →
    bir deneme. **Kasıtlı olarak çalıştırılmadı.**
 
-4. **Kurulum kapısı gereksiz olabilir — HENÜZ TEST EDİLMEDİ.** Kesitsel modda
+4. **Kurulum kapısı gereksiz olabilir — TEST EDİLDİ, kapı kalıyor (deneme 14).** Kesitsel modda
    huni `no_setup_at_entry: 17556` gösteriyor: sıralama üst desili geçiriyor,
    sonra ayrıca bir kurulumun tetiklenmesi gerekiyor. Ama ölçüm "üst desil"
    dedi, "üst desil VE bir kurulum tetiklensin" demedi. Bu, kesitsel düzeltmeyle

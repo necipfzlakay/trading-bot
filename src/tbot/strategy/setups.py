@@ -259,6 +259,48 @@ class RangeDipBuy(Setup):
         )
 
 
+def fallback_candidate(
+    df: pd.DataFrame, regime: Regime, atr_mult: float
+) -> SetupCandidate | None:
+    """Entry at the close with a volatility stop, when no setup fired.
+
+    This exists to make open hypothesis #4 testable rather than arguable. The
+    measurement that justifies this strategy is **cross-sectional**: each bar
+    ranks the symbols against each other and the top decile is where the excess
+    return was found. It never said "top decile *and* a trigger fires". The
+    setup gate is an extra condition layered on top of the evidence, and it is
+    by far the binding one — of 17,909 candidates that clear the score, 17,749
+    (99.1%) die here.
+
+    So: the same entry the ranking already chose, priced at the close, stopped
+    at a multiple of ATR. If the gate was carrying its weight, removing it will
+    make results worse and the question is settled.
+
+    Requires the regime to permit the side, exactly as a real setup does.
+    """
+    if regime not in (Regime.TREND_UP, Regime.RANGE) or len(df) < 220:
+        return None
+
+    atr_series = ta.atr(df["high"], df["low"], df["close"], 14)
+    close = float(df["close"].iloc[-1])
+    atr_value = float(atr_series.iloc[-1])
+    if np.isnan(atr_value) or atr_value <= 0:
+        return None
+
+    stop = close - atr_mult * atr_value
+    if stop >= close:
+        return None
+
+    return SetupCandidate(
+        name="ranked_entry",
+        side=Side.BUY,
+        entry_price=close,
+        stop_price=stop,
+        trigger_detail=f"cross-sectional rank, no setup trigger (ATR {atr_value:.6f})",
+        atr=atr_value,
+    )
+
+
 DEFAULT_SETUPS: tuple[Setup, ...] = (
     MomentumContinuation(),
     DonchianBreakout(),

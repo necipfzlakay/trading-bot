@@ -130,6 +130,14 @@ testi oku — hepsinin kendini koruyan bir testi var.
     `extra="forbid"`. İki kez ölü ayar üretti (`max_spread_bps`,
     `vol_lookback_bars`): dosyada duruyor, hiçbir kod okumuyor, ve okunuyormuş
     gibi görünüyor. → `StrictModel`
+52. **Kurulum kapısı ölçüldü ve kalıyor.** Kesitsel sıralama tek başına
+    yetmiyor: kapı kaldırılınca işlem 3.6x artıyor (103→367, ayda 2.9→10.2)
+    ama Kapı 1'de 5/6 → 2/6 ve PBO 0.33 → 0.67. Açık hipotez #4 kapandı.
+53. **Kısa vadeli al-sat bu evrende ölü, üç ayrı ölçümle.** +2%/−1% bariyerde
+    maliyeti karşılamak için isabet %43.3 gerekiyor; taban %31.9, en iyi fiyat
+    sinyali %34.5, taker akış dengesizliği %30.7. Edge gerçek ama komisyonun
+    sekizde biri. → `research/short_term_feasibility.md`
+
 51. **Kuyruğu kesen her şey pahalıdır.** Kârın tamamı MFE 3R+ gören ~%20'lik
     işlemden geliyor (21 işlem +460, diğer 82 işlem −385). Erken çıkan her
     mekanizma — conviction çöküşü, kısmi kâr alma — vasatlarda kurtardığından
@@ -398,11 +406,11 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 
 | kontrol | değer | |
 |---|---|---|
-| işlem ≥ 50 | 113 | ✅ |
-| profit factor ≥ 1.2 | 1.42 | ✅ |
-| maks düşüş ≤ %20 | %11.6 | ✅ |
+| işlem ≥ 50 | 116 | ✅ |
+| profit factor ≥ 1.2 | 1.36 | ✅ |
+| maks düşüş ≤ %20 | %15.8 | ✅ |
 | DSR anlamlı | p=1.000 | ❌ |
-| CPCV yollarının çoğu pozitif | %55.6 | ✅ |
+| CPCV yollarının çoğu pozitif | %51.1 | ✅ |
 | PBO ≤ 0.5 | 0.33 | ✅ |
 
 Altı kontrolden **beşi geçiyor**; kalan tek engel DSR. `--trials 11`, bot
@@ -416,7 +424,7 @@ iyi kod değil. Bu, DSR'ın hâlâ neden reddettiğini de açıklıyor.
 DSR bu stratejiyle değil **deneme sayısıyla** ilgili — oradan çıkış ayar değil
 taze veri.
 
-Ölçüm `--trials 11` ile. Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
+Ölçüm `--trials 16` ile, bot durdurulmuş, tekrarlanabilir. Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
 deneme sayısını eksik saymak kapıyı geçirmeye yeten farkı üretiyor. Sayaç
 `research/hypotheses.md`'de ve `ops/pre-install.sh` oradan okuyor.
 
@@ -464,8 +472,8 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 15** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 15` geçirin — DSR her denemeyi fiyatlıyor.
+**Kümülatif deneme: 16** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 16` geçirin — DSR her denemeyi fiyatlıyor.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir

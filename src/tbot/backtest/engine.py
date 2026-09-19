@@ -51,7 +51,7 @@ from tbot.strategy.conviction import UNSCORED_REASONS, ConvictionEngine, Scoring
 from tbot.strategy.exits import ExitManager
 from tbot.strategy.ranking import CrossSectionalRanker
 from tbot.strategy.regime import classify_series
-from tbot.strategy.setups import DEFAULT_SETUPS, detect_all
+from tbot.strategy.setups import DEFAULT_SETUPS, detect_all, fallback_candidate
 
 log = get_logger("backtest.engine")
 
@@ -479,7 +479,7 @@ class Backtester:
         )
 
         reason = conviction.no_trade_reason
-        if reason is None and len(history) >= 220:
+        if reason is None and self.config.entries.require_setup and len(history) >= 220:
             candidates = detect_all(
                 history, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
             )
@@ -513,11 +513,19 @@ class Backtester:
         candidates = detect_all(
             history, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
         )
-        if not candidates:
+        if candidates:
+            candidate = candidates[0]
+        elif self.config.entries.require_setup:
             self._funnel["no_setup_at_entry"] += 1
             return False
-
-        candidate = candidates[0]
+        else:
+            candidate = fallback_candidate(
+                history, regime, self.config.exits.initial_stop_atr_mult
+            )
+            if candidate is None:
+                self._funnel["no_setup_at_entry"] += 1
+                return False
+            self._funnel["ranked_entry"] += 1
         price = float(d.frame["close"].iloc[idx])
         # The setup was detected on the slower chart; the stop must be expressed
         # relative to the price we will actually pay.

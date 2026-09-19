@@ -4,8 +4,10 @@
 **Soru:** "Bir işleme gir, %1-2-4-10 ne yakalarsan al ve çık. Günde en az bir işlem.
 Günlük %1-10 portföy artışı." Bu mekanizma kurulabilir mi?
 
-**Cevap:** Mekanizma kurulabilir, **ama ölçüm onun para kaybedeceğini söylüyor** —
-ve kaybın büyüklüğü tahmin edilebilir. Aşağıdaki sayıların hepsi bu repodaki
+**Cevap: hayır, ve artık üç ayrı ölçümle kapandı.** Mekanizma kurulabilir ama
+para kaybeder, ve kaybın büyüklüğü önceden hesaplanabilir. Fiyat indikatörleri,
+sembol seçimi ve akış verisi — üçü de aynı duvara çarptı: edge var, komisyonun
+sekizde biri kadar. Aşağıdaki sayıların hepsi bu repodaki
 veriyle, 21 sembol × 3 yıl × 26.325 saatlik bar üzerinde ölçüldü.
 
 ---
@@ -118,40 +120,48 @@ taşıyor, sonra günlük ATR'den hesaplanan geniş trail yetişemiyor.
 - Backtest + paper + canlı simetrik
 - **Varsayılan kapalı.** Seviye = serbest parametre = ön-kayıtlı hipotez
 
-### FAZ 2 — Daha fazla işlem, edge'in olduğu ufukta
+### FAZ 2 — SONUÇLANDI: kapı yerini hak ediyor
 
-Kullanıcının 3. maddesi. İkisi de `hypotheses.md`'de zaten yazılı ve
-"taze veride ilk test edilecek" diye işaretli:
+Hipotez #4 test edildi. Kurulum kapısı kaldırılınca işlem 103 → **367** (ayda
+2,9 → 10,2), ama Kapı 1'de **5/6 → 2/6** ve PBO **0,33 → 0,67**. Aşırı uyum
+imzası geri geldi. Detay: `research/hypotheses.md`, deneme 14.
 
-- **Hipotez #4:** kurulum kapısı gereksiz olabilir. Ölçüm "üst desil" dedi,
-  "üst desil VE bir kurulum tetiklensin" demedi. %99,1'i burada ölüyor
-- **Hipotez #5:** rejim kapısı çok dar olabilir (TREND_UP barların %7–17'si)
+Hipotez #5 (rejim kapısı) ölçüldü ve **zaten dar değil**: `regime_allows`
+hem TREND_UP hem RANGE'e long izni veriyor, yani barların %55,5'i. Engellenen
+%44,5 = TREND_DOWN (%16,5) + UNKNOWN (%19,9) + HIGH_VOL (%8,1). Bunları açmak
+"düşen bıçağı yakala" demek; ayrı bir hipotez olarak dursun, önceliği yok.
 
-Kaba tahmin: kurulum kapısı kalkarsa bar başına ~0,69 uygun aday × 3 slot ×
-medyan 48 bar tutuş → **günde ~1–1,5 işlem**. Kullanıcının hedefini karşılar.
+### FAZ 3 — SONUÇLANDI: yeni bilgi de yok
 
-⚠️ Her biri bir deneme ve bütçe tükendi (11 deneme, DSR p=1.000). Bu yüzden
-sıra önemli: önce mekanizma, sonra demo'da taze veriyle karar.
+`scripts/flow_screen.py` ile ölçüldü (Binance kline 10. alan `takerBuyBaseVolume`,
+8 sembol × 12 ay × 63.027 gözlem). Aynı bariyer testi, aynı maliyet:
 
-### FAZ 3 — Kısa vadeyi mümkün kılacak tek şey: yeni bilgi
+| | isabet |
+|---|---|
+| taban | %29,9 |
+| imbalance üst %20 | %30,8 |
+| imbalance üst %10 | %30,7 |
+| imbalance üst %1 | **%28,4** ← tabandan kötü |
+| **gereken** | **%43,3** |
 
-Mevcut sinyallerle kısa vade ölü. Onu değiştirebilecek üç şey var, üçü de
-**önce ölçüm, sonra kod**:
+Lift **+0,8 puan**, gereken **+13**. 24 bar ileri getiriyle korelasyon **+0,011**.
+Üstelik monotonik bile değil — en uç yüzdelik tabandan kötü performans veriyor.
 
-1. **Akış verisi (CVD / taker imbalance).** Fiyattan türemeyen tek kaynak.
-   `hypotheses.md` B1'de duruyor. Binance kline `takerBuyBaseVolume` ile
-   2017'ye kadar bedava taranabilir — canlı yola dokunmadan
-2. **Gün içi veri.** Arşivde 15m/5m **yok**, sadece 1h ve üstü. Kısa vadeyi
-   1h barla test etmek zaten yaklaşık; gerçek test için backfill gerekir
-3. **Daha volatil evren.** Günlük medyan hareket %0,21 (BTC) ile %0,72 (FLOCK)
-   arasında. Maliyet sabit olduğu için hareketin büyümesi oranı doğrudan
-   iyileştirir — ama likidite ve spread cezası devreye girer (A5 verisi artık
-   toplanıyor, bu ölçüm için hazır)
+Fiyat indikatörlerinin en iyisi (+2,6 puan) bundan güçlü. Yani **elimizdeki tek
+fiyat-dışı bilgi kaynağı da bu ufukta boş.**
 
-**Ayrı bir motor ne zaman mantıklı:** Faz 3 bir edge bulursa. Şu an ikinci bir
-motor kurmak, ölçülmüş bir oranda para kaybeden bir makine kurmak olur.
-Altyapı hazır (ayrı config + ayrı `runtime/` dizini yeterli), eksik olan
-**kod değil, edge.**
+Kalan iki yol ve neden takip edilmiyorlar:
+
+- **Gün içi veri (5m/15m).** Test edilebilir ama maliyet tablosu zaten cevabı
+  veriyor: 15m'de medyan hareket %0,24, gidiş-dönüş maliyet %0,30 — maliyet
+  hareketten büyük. Daha kısa ufuk oranı **kötüleştirir**, iyileştirmez
+- **Daha volatil evren.** Hareket/maliyet oranını iyileştirir ama spread ve
+  likidite cezaları devreye girer. Ölçülen spread aralığı zaten 0,01–2,7bps,
+  yani bu evren likidite tarafında zaten iyi; daha volatil olan daha ince olur
+
+**Karar: kısa vadeli al-sat kolu kapatıldı, kanıtla.** Üç farklı sinyal sınıfı
+(fiyat indikatörleri, sembol seçimi, akış verisi) aynı duvara çarptı: edge var
+ama komisyonun sekizde biri kadar.
 
 ---
 

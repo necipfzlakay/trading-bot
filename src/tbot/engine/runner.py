@@ -85,7 +85,7 @@ from tbot.risk.sizing import correlation_conflict, size_position
 from tbot.strategy.conviction import UNSCORED_REASONS, ConvictionEngine, ScoringContext
 from tbot.strategy.exits import ExitManager
 from tbot.strategy.regime import classify_series
-from tbot.strategy.setups import DEFAULT_SETUPS, detect_all
+from tbot.strategy.setups import DEFAULT_SETUPS, detect_all, fallback_candidate
 
 log = get_logger("engine.runner")
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -1369,8 +1369,12 @@ class Runner:
             self.db.record_conviction(conviction)
 
             reason = conviction.no_trade_reason
-            if reason is None and not detect_all(
-                setup, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
+            if (
+                reason is None
+                and self.config.entries.require_setup
+                and not detect_all(
+                    setup, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
+                )
             ):
                 reason = NoTradeReason.NO_SETUP
 
@@ -1420,12 +1424,19 @@ class Runner:
         setups = detect_all(
             setup_frame, row.regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
         )
-        if not setups:
+        if setups:
+            candidate = setups[0]
+        elif self.config.entries.require_setup:
             # Scored well enough, but no entry trigger fired on this bar.
             row.no_trade_reason = NoTradeReason.NO_SETUP
             return False
-
-        candidate = setups[0]
+        else:
+            candidate = fallback_candidate(
+                setup_frame, row.regime, self.config.exits.initial_stop_atr_mult
+            )
+            if candidate is None:
+                row.no_trade_reason = NoTradeReason.NO_SETUP
+                return False
         price = float(data["trigger"]["close"].iloc[-1])
         stop = price - candidate.stop_distance
         if stop >= price:

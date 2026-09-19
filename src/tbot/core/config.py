@@ -428,6 +428,14 @@ class EntryConfig(StrictModel):
     # which symbol fills — first to touch, not highest scored — silently
     # replacing the cross-sectional selection that was actually measured.
     armed_max_orders: int = Field(default=1, ge=1, le=3)
+    # Require a setup to trigger before entering, on top of clearing the
+    # cross-sectional rank. Open hypothesis #4 in research/hypotheses.md says
+    # this may be an unmeasured extra condition: the tail study ranked symbols
+    # against each other and took the top decile, it did not say "top decile
+    # AND a trigger". The gate is the binding filter by a wide margin - 99.1%
+    # of scored candidates die on it - so whether it earns its place decides
+    # how often this bot trades at all.
+    require_setup: bool = True
 
 
 class DataConfig(StrictModel):
