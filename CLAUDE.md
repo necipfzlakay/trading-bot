@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 402 test
+.venv/bin/python -m pytest -q             # 403 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -306,7 +306,11 @@ düşerse bar-kapanışına döner) · `_detect_venue_exits` borsa stop'unun dol
 kurulu kırılım girişi (`entries.armed_breakout`, **kapalı**) · spread/hacim
 toplama (`execution.microstructure_enabled`) · panelde varlık dökümü ·
 `ops/bot.sh` mod başına launchd üretimi + ön kontrol ·
-`ops/reset.sh` + `scripts/venue_reset.py` demo hesabı ve yerel geçmişi sıfırlama · `engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
+`ops/reset.sh` + `scripts/venue_reset.py` demo hesabı ve yerel geçmişi sıfırlama ·
+panel: eksenli equity grafiği (başlangıç çizgisi, üstü yeşil / altı kırmızı), uyarı
+şeridi (degraded / nabız durdu / feed bayat / kayma), açık pozisyonda anlık R ve
+stop mesafesi, engellenmiş sembol `—` gösteriyor (`/api/meta`), pause/resume/flatten
+düğmeleri · `engine/lock.py` tek instance · `risk/capital.py` hesap büyüklüğü teşhisi ·
 `execution/safety.py` anahtar izni + kayma ölçümü + imkânsız equity koruması ·
 `scripts/healthcheck.py` dead-man + DB yedeği · `scripts/divergence.py` Kapı 2 ·
 `scripts/plateau.py` parametre platosu · `scripts/polarity.py` türev sinyal yönü ·

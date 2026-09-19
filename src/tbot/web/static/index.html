@@ -2,49 +2,141 @@
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>tbot</title>
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--border:#21262d;--text:#e6edf3;--dim:#8b949e;
---green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel-2:#1c2129;--border:#21262d;--border-2:#30363d;
+  --text:#e6edf3;--dim:#8b949e;--faint:#6e7681;
+  --green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff;--violet:#a371f7;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --gap:12px;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,sans-serif;padding:16px}
-h1{font-size:16px;margin:0;letter-spacing:.5px}
-h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);margin:0 0 10px}
-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.pill{font:11px var(--mono);padding:3px 9px;border-radius:999px;border:1px solid var(--border);background:var(--panel)}
-.pill.running{border-color:var(--green);color:var(--green)}
-.pill.degraded,.pill.safe_mode{border-color:var(--amber);color:var(--amber)}
-.pill.stopped,.pill.not_started{border-color:var(--red);color:var(--red)}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;min-width:0}
+html{color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+  padding:0 16px env(safe-area-inset-bottom,0px);
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:1500px;margin:0 auto}
+
+/* ---- header ---------------------------------------------------------- */
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:8px;
+  flex-wrap:wrap;padding:12px 0;margin-bottom:var(--gap);
+  padding-top:calc(12px + env(safe-area-inset-top,0px));
+  background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+h1{font:600 15px/1 var(--mono);margin:0;letter-spacing:.5px}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);
+  margin:0 0 10px;display:flex;align-items:baseline;gap:8px}
+h2 small{font:400 11px/1 var(--mono);color:var(--faint);text-transform:none;letter-spacing:0}
+.pill{font:11px/1.45 var(--mono);padding:3px 9px;border-radius:999px;
+  border:1px solid var(--border-2);background:var(--panel);color:var(--dim);white-space:nowrap}
+.pill.running,.pill.ok{border-color:#2ea04340;color:var(--green);background:#2ea04314}
+.pill.degraded,.pill.safe_mode,.pill.warn{border-color:#d2992240;color:var(--amber);background:#d2992214}
+.pill.stopped,.pill.not_started,.pill.bad{border-color:#f8514940;color:var(--red);background:#f8514914}
+.spacer{flex:1 1 auto;min-width:0}
+
+/* ---- controls -------------------------------------------------------- */
+.ctl{display:flex;gap:6px;align-items:center}
+button{font:11px var(--mono);color:var(--dim);background:var(--panel);cursor:pointer;
+  border:1px solid var(--border-2);border-radius:6px;padding:4px 10px}
+button:hover{color:var(--text);border-color:var(--faint)}
+button.danger:hover{color:var(--red);border-color:#f8514966;background:#f8514912}
+button[disabled]{opacity:.4;cursor:not-allowed}
+input[type=password]{font:11px var(--mono);width:120px;padding:4px 8px;border-radius:6px;
+  background:var(--bg);color:var(--text);border:1px solid var(--border-2)}
+
+/* ---- alert strip ----------------------------------------------------- */
+#alerts{display:flex;flex-direction:column;gap:6px;margin-bottom:var(--gap)}
+#alerts:empty{display:none}
+.alert{display:flex;gap:10px;align-items:baseline;font:12px var(--mono);
+  padding:9px 12px;border-radius:8px;border:1px solid}
+.alert b{font-weight:600;letter-spacing:.4px;text-transform:uppercase;font-size:10px}
+.alert.bad{border-color:#f8514955;background:#f8514912;color:#ffb4ae}
+.alert.warn{border-color:#d2992255;background:#d2992212;color:#e9c46a}
+.alert span{color:var(--dim)}
+
+/* ---- layout ---------------------------------------------------------- */
+.grid{display:grid;gap:var(--gap);grid-template-columns:repeat(2,minmax(0,1fr));
+  align-items:start;margin-bottom:var(--gap)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  padding:14px;min-width:0}
 .card.wide{grid-column:1/-1}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px}
-.kpi .label{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
-.kpi .value{font:20px/1.2 var(--mono);margin-top:2px}
-.pos{color:var(--green)}.neg{color:var(--red)}.warn{color:var(--amber)}.dim{color:var(--dim)}
+@media(max-width:820px){.grid{grid-template-columns:minmax(0,1fr)}}
+
+/* ---- KPIs ------------------------------------------------------------ */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:1px;
+  background:var(--border);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.kpi{background:var(--panel-2);padding:10px 12px;min-width:0}
+.kpi .label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .value{font:19px/1.25 var(--mono);margin-top:3px;letter-spacing:-.5px}
+.kpi .sub{font:10px/1.3 var(--mono);color:var(--faint);margin-top:1px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pos{color:var(--green)}.neg{color:var(--red)}.warn{color:var(--amber)}
+.dim{color:var(--dim)}.faint{color:var(--faint)}
+
+/* ---- tables ---------------------------------------------------------- */
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px}
 table{width:100%;border-collapse:collapse;font:12px var(--mono)}
-th{text-align:left;color:var(--dim);font-weight:500;padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
-td{padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
-tr:last-child td{border-bottom:none}
-.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
-.bar{height:5px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:3px;min-width:60px}
-.bar>i{display:block;height:100%;background:var(--blue)}
+th{text-align:left;color:var(--faint);font-weight:500;letter-spacing:.3px;
+  padding:0 8px 6px;border-bottom:1px solid var(--border-2);white-space:nowrap}
+td{padding:6px 8px;border-bottom:1px solid #21262d80;white-space:nowrap}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#ffffff07}
+tbody tr.muted td{color:var(--faint)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+th.num{text-align:right}
+.sym{font-weight:600}
+/* One column soaks up the leftover width; without it the browser shares it
+   out evenly and the numbers drift into separate postcodes on a wide screen. */
+.fill{width:100%}
+
+/* ---- inline meters --------------------------------------------------- */
+.bar{height:4px;background:#ffffff10;border-radius:3px;overflow:hidden;min-width:70px}
+.bar>i{display:block;height:100%;background:var(--blue);border-radius:3px}
 .bar>i.ok{background:var(--green)}
-canvas{width:100%;height:190px;display:block}
-footer{margin-top:16px;color:var(--dim);font-size:11px}
-.empty{color:var(--dim);font-style:italic;padding:8px 0}
+.bar.none{background:repeating-linear-gradient(90deg,#ffffff0d 0 4px,transparent 4px 8px)}
+
+/* ---- charts ---------------------------------------------------------- */
+.chartbox{position:relative}
+canvas{width:100%;display:block}
+#equity{height:200px}
+#excursion{height:260px}
+.tip{position:absolute;pointer-events:none;opacity:0;transition:opacity .1s;
+  font:11px var(--mono);background:#000000d9;border:1px solid var(--border-2);
+  border-radius:6px;padding:5px 8px;white-space:pre;transform:translate(-50%,-115%);z-index:5}
+
+/* ---- misc ------------------------------------------------------------ */
+.note{font-size:11px;line-height:1.55;color:var(--faint);margin-top:8px}
+.note b{color:var(--dim);font-weight:600}
+.empty{color:var(--faint);font-style:italic;font:12px var(--mono);padding:2px 0}
+footer{color:var(--faint);font-size:11px;padding:14px 0 24px}
+code{font:11px var(--mono);color:var(--dim)}
 </style>
 </head>
 <body>
+<div class="wrap">
+
 <header>
   <h1>tbot</h1>
   <span class="pill" id="status">…</span>
   <span class="pill" id="mode"></span>
   <span class="pill" id="uptime"></span>
   <span class="pill" id="feed"></span>
-  <span class="pill dim" id="updated"></span>
+  <span class="pill" id="bar"></span>
+  <span class="pill" id="beat"></span>
+  <span class="spacer"></span>
+  <div class="ctl">
+    <input type="password" id="token" placeholder="token" autocomplete="off" spellcheck="false">
+    <button id="pause">pause</button>
+    <button id="resume">resume</button>
+    <button id="flatten" class="danger">flatten</button>
+  </div>
 </header>
+
+<div id="alerts"></div>
 
 <div class="grid">
   <div class="card wide">
@@ -53,18 +145,16 @@ footer{margin-top:16px;color:var(--dim);font-size:11px}
   </div>
 
   <div class="card wide">
-    <h2>Holdings — what the account actually contains</h2>
-    <div class="scroll"><table id="balances"></table></div>
-    <div class="dim" style="font-size:11px;margin-top:6px">
-      <b>free</b> can be spent or sold right now · <b>locked</b> is reserved by a resting order —
-      a protective stop reserves the whole holding, so a properly protected position shows
-      zero free · <b>total</b> is what is owned. Read live from the venue.
+    <h2>Equity <small id="eqrange"></small></h2>
+    <div class="chartbox">
+      <canvas id="equity"></canvas>
+      <div class="tip" id="eqtip"></div>
     </div>
-  </div>
-
-  <div class="card wide">
-    <h2>Equity</h2>
-    <canvas id="equity"></canvas>
+    <div class="note">
+      The dashed line is where this run started. The axis is labelled because the
+      shape of a line says nothing without one — a 0.4% day and a 40% day draw
+      the same picture.
+    </div>
   </div>
 
   <div class="card wide">
@@ -73,12 +163,26 @@ footer{margin-top:16px;color:var(--dim);font-size:11px}
   </div>
 
   <div class="card wide">
-    <h2>Scan — every symbol, every bar</h2>
+    <h2>Holdings <small>what the account actually contains</small></h2>
+    <div class="scroll"><table id="balances"></table></div>
+    <div class="note">
+      <b>free</b> can be spent or sold right now · <b>locked</b> is reserved by a resting order —
+      a protective stop reserves the whole holding, so a properly protected position shows
+      zero free · <b>total</b> is what is owned. Read live from the venue.
+    </div>
+  </div>
+
+  <div class="card wide">
+    <h2>Scan <small id="scanmeta">every symbol, every bar</small></h2>
     <div class="scroll"><table id="scan"></table></div>
+    <div class="note">
+      A symbol vetoed before scoring shows <b>—</b>, not a zero: the engine formed
+      no opinion about it. Only a number in the score column was actually measured.
+    </div>
   </div>
 
   <div class="card">
-    <h2>Why no trade (24h)</h2>
+    <h2>Why no trade <small>24h</small></h2>
     <div class="scroll"><table id="reasons"></table></div>
   </div>
 
@@ -87,149 +191,375 @@ footer{margin-top:16px;color:var(--dim);font-size:11px}
     <div class="scroll"><table id="trades"></table></div>
   </div>
 
-  <div class="card wide">
-    <h2>MAE / MFE — exit calibration</h2>
-    <canvas id="excursion"></canvas>
-    <div class="dim" style="font-size:11px;margin-top:6px">
-      Each dot is a closed trade: x = worst point reached (MAE), y = best point reached (MFE), both in R.
-      Winners clustered at low MAE mean the stop is wider than it needs to be.
+  <div class="card wide" id="excursion-card">
+    <h2>MAE / MFE <small>exit calibration</small></h2>
+    <div class="chartbox"><canvas id="excursion"></canvas></div>
+    <div class="note">
+      Each dot is a closed trade: x = worst point reached (MAE), y = best point
+      reached (MFE), both in R. Winners clustered at low MAE mean the stop is
+      wider than it needs to be.
     </div>
   </div>
 </div>
 
-<footer>Reads <code>runtime/state.json</code> and <code>runtime/tbot.db</code> directly — same source as the engine. Auto-refresh 10s.</footer>
+<footer>
+  Reads <code>runtime/state.json</code> and <code>runtime/tbot.db</code> directly —
+  same source as the engine. Auto-refresh 10s.
+</footer>
 
+</div>
 <script>
 const $ = id => document.getElementById(id);
-const fmt = (v, d=2) => v==null||isNaN(v) ? '—' : Number(v).toFixed(d);
-const pct = v => v==null||isNaN(v) ? '—' : (v*100).toFixed(1)+'%';
-const cls = v => v>0 ? 'pos' : v<0 ? 'neg' : '';
-const time = ts => ts ? new Date(ts).toISOString().slice(5,16).replace('T',' ') : '—';
+const nz = v => v!=null && !isNaN(v);
+const fmt = (v,d=2) => nz(v) ? Number(v).toFixed(d) : '—';
+const sign = (v,d=2) => nz(v) ? (v>0?'+':'') + Number(v).toFixed(d) : '—';
+const cls = v => !nz(v) ? '' : v>0 ? 'pos' : v<0 ? 'neg' : 'dim';
+const esc = s => String(s??'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+
+// A return of -0.036% rendered as "-0.0%" and coloured red is noise pretending
+// to be a signal. Widen the precision until the number says something.
+function pct(v, min=1){
+  if(!nz(v)) return '—';
+  const a = Math.abs(v*100);
+  const d = a>=min ? 1 : a>=0.01 ? 2 : 3;
+  return (v*100).toFixed(d)+'%';
+}
+function ago(ms){
+  if(!nz(ms)) return '—';
+  const s = Math.max(0,(Date.now()-ms)/1000);
+  if(s<60) return Math.round(s)+'s ago';
+  if(s<3600) return Math.round(s/60)+'m ago';
+  return (s/3600).toFixed(1)+'h ago';
+}
+const stamp = ts => ts ? new Date(ts).toISOString().slice(5,16).replace('T',' ') : '—';
 
 async function get(url){ try{ const r = await fetch(url); return r.ok ? await r.json() : null; }catch{ return null; } }
 
 function table(el, cols, rows, render){
-  if(!rows || !rows.length){ el.innerHTML = `<tr><td class="empty">no data yet</td></tr>`; return; }
-  el.innerHTML = `<thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>`
+  if(!rows || !rows.length){
+    el.innerHTML = `<tr><td class="empty">no data yet</td></tr>`; return;
+  }
+  el.innerHTML = `<thead><tr>${cols.map(c=>
+      `<th class="${c.num?'num':''} ${c.cl||''}" ${c.w?`style="width:${c.w}"`:''}>${esc(c.t??c)}</th>`).join('')}</tr></thead>`
     + `<tbody>${rows.map(render).join('')}</tbody>`;
 }
 
-function line(canvas, values, color){
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth, h = canvas.clientHeight;
+/* ---- equity chart ------------------------------------------------------
+   Axis labels and a baseline, because an unlabelled auto-scaled line makes
+   every wiggle look like a crisis. The y range is padded around the data and
+   always includes the starting equity, so "above water / below water" is
+   readable at a glance instead of inferred from a number elsewhere.        */
+let eqPts = [];
+function equityChart(canvas, rows, base){
+  const dpr = devicePixelRatio||1, w = canvas.clientWidth, h = canvas.clientHeight;
   canvas.width = w*dpr; canvas.height = h*dpr;
-  const c = canvas.getContext('2d'); c.scale(dpr,dpr); c.clearRect(0,0,w,h);
-  if(!values || values.length < 2) return;
-  const min = Math.min(...values), max = Math.max(...values), span = (max-min)||1;
-  const x = i => i/(values.length-1)*(w-8)+4;
-  const y = v => h-6-((v-min)/span)*(h-16);
-  c.strokeStyle = color; c.lineWidth = 1.5; c.beginPath();
-  values.forEach((v,i)=> i ? c.lineTo(x(i),y(v)) : c.moveTo(x(i),y(v)));
-  c.stroke();
-  c.lineTo(x(values.length-1), h); c.lineTo(x(0), h); c.closePath();
-  c.fillStyle = color+'18'; c.fill();
+  const c = canvas.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0); c.clearRect(0,0,w,h);
+  eqPts = [];
+  if(!rows || rows.length<2){
+    c.fillStyle='#6e7681'; c.font='12px ui-monospace,monospace';
+    c.fillText('not enough bars yet', 12, h/2); return;
+  }
+  const PL=58, PR=10, PT=10, PB=20;
+  const vals = rows.map(r=>r.equity);
+  let lo = Math.min(...vals, base||Infinity), hi = Math.max(...vals, base||-Infinity);
+  const pad = (hi-lo)*0.12 || Math.max(hi*0.001, 0.01);
+  lo -= pad; hi += pad;
+  const t0 = rows[0].ts, t1 = rows[rows.length-1].ts, span = (t1-t0)||1;
+  const X = t => PL + (t-t0)/span*(w-PL-PR);
+  const Y = v => PT + (hi-v)/(hi-lo)*(h-PT-PB);
+
+  const dec = (hi-lo) < 1 ? 3 : (hi-lo) < 20 ? 2 : 0;
+  c.font='10px ui-monospace,monospace'; c.textBaseline='middle';
+  for(let i=0;i<=3;i++){
+    const v = hi - (hi-lo)*i/3, y = Y(v);
+    c.strokeStyle='#ffffff09'; c.beginPath(); c.moveTo(PL,y); c.lineTo(w-PR,y); c.stroke();
+    c.fillStyle='#6e7681'; c.textAlign='right'; c.fillText(v.toFixed(dec), PL-8, y);
+  }
+  if(nz(base) && base>lo && base<hi){
+    const y = Y(base);
+    c.save(); c.setLineDash([4,4]); c.strokeStyle='#8b949e77'; c.lineWidth=1;
+    c.beginPath(); c.moveTo(PL,y); c.lineTo(w-PR,y); c.stroke(); c.restore();
+    c.fillStyle='#8b949e'; c.textAlign='left'; c.fillText('start', PL+4, y-8);
+  }
+  c.textBaseline='alphabetic'; c.fillStyle='#6e7681';
+  c.textAlign='left';  c.fillText(stamp(t0), PL, h-6);
+  c.textAlign='right'; c.fillText(stamp(t1), w-PR, h-6);
+
+  const last = vals[vals.length-1];
+  const col = '#58a6ff';
+  const verdict = !nz(base) ? col : last>=base ? '#3fb950' : '#f85149';
+  const curve = () => {
+    c.beginPath();
+    rows.forEach((r,i)=> i ? c.lineTo(X(r.ts),Y(r.equity)) : c.moveTo(X(r.ts),Y(r.equity)));
+  };
+  const area = yBase => { curve(); c.lineTo(X(t1),yBase); c.lineTo(X(t0),yBase); c.closePath(); };
+
+  if(nz(base) && base>lo && base<hi){
+    const yb = Y(base);
+    c.save(); c.beginPath(); c.rect(PL,PT,w-PL-PR,yb-PT); c.clip();
+    area(yb); c.fillStyle='#3fb95026'; c.fill(); c.restore();
+    c.save(); c.beginPath(); c.rect(PL,yb,w-PL-PR,(h-PB)-yb); c.clip();
+    area(yb); c.fillStyle='#f8514926'; c.fill(); c.restore();
+  }else{
+    area(h-PB); c.fillStyle=col+'1f'; c.fill();
+  }
+  curve(); c.strokeStyle=col; c.lineWidth=1.5; c.lineJoin='round'; c.stroke();
+  c.beginPath(); c.arc(X(t1),Y(last),3,0,7); c.fillStyle=verdict; c.fill();
+
+  rows.forEach(r=> eqPts.push({x:X(r.ts), y:Y(r.equity), r}));
+}
+
+function bindTip(canvas, tip, dec){
+  canvas.onmousemove = e => {
+    if(!eqPts.length) return;
+    const b = canvas.getBoundingClientRect(), mx = e.clientX-b.left;
+    let best = eqPts[0];
+    for(const p of eqPts) if(Math.abs(p.x-mx) < Math.abs(best.x-mx)) best = p;
+    tip.style.left = best.x+'px'; tip.style.top = best.y+'px'; tip.style.opacity = 1;
+    tip.textContent = `${stamp(best.r.ts)}\n${fmt(best.r.equity,dec)}  dd ${pct(best.r.drawdown)}`;
+  };
+  canvas.onmouseleave = () => tip.style.opacity = 0;
 }
 
 function scatter(canvas, points){
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const dpr = devicePixelRatio||1, w = canvas.clientWidth, h = canvas.clientHeight;
   canvas.width = w*dpr; canvas.height = h*dpr;
-  const c = canvas.getContext('2d'); c.scale(dpr,dpr); c.clearRect(0,0,w,h);
-  if(!points.length) return;
+  const c = canvas.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0); c.clearRect(0,0,w,h);
+  if(!points || !points.length) return;
+  const PL=44, PB=26, PT=10, PR=10;
   const maxX = Math.max(1, ...points.map(p=>Math.abs(p.mae_r)));
   const maxY = Math.max(1, ...points.map(p=>p.mfe_r));
-  c.strokeStyle = '#21262d'; c.lineWidth = 1;
-  c.beginPath(); c.moveTo(34,h-18); c.lineTo(w-6,h-18); c.moveTo(34,6); c.lineTo(34,h-18); c.stroke();
-  c.fillStyle = '#8b949e'; c.font = '10px ui-monospace,monospace';
-  c.fillText('MAE (R)', w-58, h-5); c.save(); c.translate(10,40); c.rotate(-Math.PI/2); c.fillText('MFE (R)',0,0); c.restore();
+  c.font='10px ui-monospace,monospace';
+  for(let i=0;i<=4;i++){
+    const gy = PT + (h-PT-PB)*i/4, gx = PL + (w-PL-PR)*i/4;
+    c.strokeStyle='#ffffff08';
+    c.beginPath(); c.moveTo(PL,gy); c.lineTo(w-PR,gy); c.stroke();
+    c.beginPath(); c.moveTo(gx,PT); c.lineTo(gx,h-PB); c.stroke();
+    c.fillStyle='#6e7681'; c.textAlign='right'; c.textBaseline='middle';
+    c.fillText((maxY*(1-i/4)).toFixed(1), PL-6, gy);
+    c.textAlign='center'; c.textBaseline='top';
+    c.fillText((maxX*i/4).toFixed(1), gx, h-PB+6);
+  }
+  c.strokeStyle='#30363d';
+  c.beginPath(); c.moveTo(PL,h-PB); c.lineTo(w-PR,h-PB); c.moveTo(PL,PT); c.lineTo(PL,h-PB); c.stroke();
+  c.fillStyle='#8b949e'; c.textAlign='right'; c.textBaseline='alphabetic';
+  c.fillText('MAE (R)', w-PR, h-4);
+  c.save(); c.translate(11,PT+34); c.rotate(-Math.PI/2); c.textAlign='left'; c.fillText('MFE (R)',0,0); c.restore();
   points.forEach(p=>{
-    const x = 34 + Math.abs(p.mae_r)/maxX*(w-44);
-    const y = (h-18) - Math.max(0,p.mfe_r)/maxY*(h-26);
-    c.beginPath(); c.arc(x,y,3,0,7);
+    const x = PL + Math.abs(p.mae_r)/maxX*(w-PL-PR);
+    const y = (h-PB) - Math.max(0,p.mfe_r)/maxY*(h-PT-PB);
+    c.beginPath(); c.arc(x,y,3.5,0,7);
     c.fillStyle = p.r_multiple>0 ? '#3fb95099' : '#f8514999'; c.fill();
+    c.strokeStyle = p.r_multiple>0 ? '#3fb950' : '#f85149'; c.lineWidth=1; c.stroke();
   });
 }
 
+/* ---- alerts ------------------------------------------------------------
+   Everything here is already in state.json and none of it was on the page:
+   a degraded engine, a stuck heartbeat and a stale feed all looked like a
+   healthy panel.                                                           */
+function alerts(s){
+  const out = [];
+  const age = nz(s.updated_ts) ? (Date.now()-s.updated_ts)/1000 : null;
+  if(s.status && s.status!=='running')
+    out.push(['bad','engine ' + s.status, s.degraded_reason || 'the engine is not processing bars']);
+  else if(nz(age) && age>180)
+    out.push(['bad','heartbeat stale', `state.json last written ${ago(s.updated_ts)} — the engine beats every 60s, so it may be stuck`]);
+  if(s.degraded_reason && s.status==='running')
+    out.push(['warn','degraded', s.degraded_reason + ' — risk is reduced, not stopped']);
+  if(s.last_error)
+    out.push(['warn','last error', `${s.last_error} (${ago(s.last_error_ts)})`]);
+  if(s.feed && s.feed.stale)
+    out.push(['warn','feed stale','between-bar checks are paused; the engine falls back to bar-close and the venue stop is untouched']);
+  const sl = s.slippage||{};
+  if(sl.worse_than_assumed)
+    out.push(['warn','slippage worse than assumed',
+      `median ${fmt(sl.median_bps,1)}bps · p90 ${fmt(sl.p90_bps,1)}bps vs assumed ${fmt(sl.assumed_bps,1)}bps over ${sl.samples} fills`]);
+  $('alerts').innerHTML = out.map(([k,t,d])=>
+    `<div class="alert ${k}"><b>${esc(t)}</b><span>${esc(d)}</span></div>`).join('');
+}
+
+/* ---- controls ---------------------------------------------------------- */
+const tok = $('token');
+try{ tok.value = localStorage.getItem('tbot_token')||''; }catch{}
+tok.onchange = () => { try{ localStorage.setItem('tbot_token', tok.value); }catch{} };
+
+async function control(action, btn){
+  if(!tok.value){ tok.focus(); return; }
+  // flatten sells every open position at market. One click should not be able
+  // to do that, so it costs a typed word.
+  if(action==='flatten' && prompt('This closes every open position at market.\nType "flatten" to confirm:') !== 'flatten') return;
+  btn.disabled = true;
+  try{
+    const r = await fetch(`/api/control/${action}?token=${encodeURIComponent(tok.value)}`, {method:'POST'});
+    btn.textContent = r.ok ? action+' queued' : (r.status===403 ? 'bad token' : 'failed');
+  }catch{ btn.textContent = 'failed'; }
+  setTimeout(()=>{ btn.textContent = action; btn.disabled = false; }, 2500);
+  refresh();
+}
+for(const a of ['pause','resume','flatten']) $(a).onclick = e => control(a, e.currentTarget);
+
+/* ---- refresh ----------------------------------------------------------- */
+let UNSCORED = new Set(['regime_veto','already_in_position','max_positions','stale_data','llm_event_veto','correlation_full']);
+get('/api/meta').then(m => { if(m && m.unscored_reasons) UNSCORED = new Set(m.unscored_reasons); });
+
+let lastEq = null, lastEx = null, lastBase = null;
+
 async function refresh(){
-  const s = await get('/api/state') || {status:'not_started'};
+  // One round trip for all of it — sequential awaits made the page update in
+  // visible stages, with the tables lagging the header by a second.
+  const [s0, scan0, reasons, trades, eq, ex] = await Promise.all([
+    get('/api/state'), get('/api/scan'), get('/api/no-trade-reasons'),
+    get('/api/trades?limit=25'), get('/api/equity?limit=1500'), get('/api/excursion'),
+  ]);
+  const s = s0 || {status:'not_started'};
+
   $('status').textContent = s.status || '—';
   $('status').className = 'pill ' + (s.status||'');
   $('mode').textContent = `${s.mode||'—'} · ${s.venue||'—'}`;
-  $('uptime').textContent = s.uptime_human ? `up ${s.uptime_human}` : '';
-  $('updated').textContent = s.updated_iso ? `bar ${s.last_bar_iso||'—'}` : '';
+  $('uptime').textContent = s.uptime_human ? `up ${s.uptime_human} · ${s.bars_processed||0} bars` : '';
+  $('bar').textContent = s.last_bar_iso ? `bar ${s.last_bar_iso}` : '';
 
   // The between-bar feed is an improvement, never a dependency: when it is
   // stale the bot falls back to bar-close behaviour and the venue stop is
   // untouched. Say which of the two is happening rather than implying trouble.
-  const f = s.feed || {};
-  const fp = $('feed');
+  const f = s.feed||{}, fp = $('feed');
   if(!Object.keys(f).length){ fp.textContent=''; fp.className='pill'; }
-  else if(f.stale){ fp.textContent='feed stale — bar-close only'; fp.className='pill degraded'; }
-  else { fp.textContent=`feed ${f.symbols||0} sym · ${fmt(f.age_seconds,1)}s`; fp.className='pill running'; }
+  else if(f.stale){ fp.textContent='feed stale — bar-close only'; fp.className='pill warn'; }
+  else { fp.textContent=`feed ${f.symbols||0} sym · ${fmt(f.age_seconds,1)}s`; fp.className='pill ok'; }
+
+  // The heartbeat is the dead-man switch (60s). Showing when it last beat is
+  // the difference between "waiting for the next bar" and "hung an hour ago".
+  const age = nz(s.updated_ts) ? (Date.now()-s.updated_ts)/1000 : null;
+  const bp = $('beat');
+  bp.textContent = nz(age) ? 'beat ' + ago(s.updated_ts) : '';
+  bp.className = 'pill ' + (!nz(age) ? '' : age>180 ? 'bad' : age>120 ? 'warn' : 'ok');
+
+  alerts(s);
 
   // Measured against where this run actually started, not a hardcoded figure.
   // This read 100 for a long time, which showed a 1014 USDT account as +914%.
-  const base = s.starting_equity || 0;
-  const ret = base ? (s.equity/base - 1) : 0;
+  const base = s.starting_equity||0;
+  const ret = base ? (s.equity/base-1) : null;
+  const delta = base ? s.equity-base : null;
+  const pos = s.open_positions||[];
+  const sl = s.slippage||{};
   $('kpis').innerHTML = [
-    ['Equity', fmt(s.equity), cls(base ? s.equity-base : 0)],
-    ['Return', pct(ret), cls(ret)],
-    ['Drawdown', pct(s.drawdown), s.drawdown>0.1?'warn':''],
-    ['Risk mult', fmt(s.risk_multiplier)+'×', s.risk_multiplier<1?'warn':''],
-    ['Threshold', fmt(s.threshold,0), ''],
-    ['Positions', (s.open_positions||[]).length, ''],
-    ['Leverage', fmt(s.leverage_allowed,1)+'×', ''],
-    ['Restarts', s.restarts||0, (s.restarts||0)>5?'warn':''],
-  ].map(([l,v,k])=>`<div class="kpi"><div class="label">${l}</div><div class="value ${k}">${v}</div></div>`).join('');
+    ['Equity',    fmt(s.equity),                 cls(delta), base?`start ${fmt(base)}`:''],
+    ['Return',    pct(ret),                      cls(ret),   nz(delta)?`${sign(delta)} USDT`:''],
+    ['Drawdown',  pct(s.drawdown),               s.drawdown>0.1?'warn':'', `peak ${fmt(s.peak_equity)}`],
+    ['Cash',      fmt(s.cash),                   '',         base?`${pct(s.cash/s.equity)} of equity`:''],
+    ['Risk mult', fmt(s.risk_multiplier)+'×',    s.risk_multiplier<1?'warn':'pos', s.risk_multiplier<1?'reduced':'full size'],
+    ['Threshold', fmt(s.threshold,0),            '',         'conviction to enter'],
+    ['Positions', pos.length,                    pos.length?'':'dim', `${s.universe_size||0} symbols scanned`],
+    ['Leverage',  fmt(s.leverage_allowed,1)+'×', '',         s.leverage_allowed>1?'gate passed':'spot only'],
+    ['Slippage',  sl.samples?fmt(sl.median_bps,1)+'bps':'—', sl.worse_than_assumed?'warn':'', sl.samples?`${sl.samples} fills · assumed ${fmt(sl.assumed_bps,0)}`:'no fills yet'],
+    ['Restarts',  s.restarts||0,                 (s.restarts||0)>5?'warn':'', 'this install'],
+  ].map(([l,v,k,sub])=>`<div class="kpi"><div class="label">${l}</div>
+      <div class="value ${k}">${v}</div><div class="sub">${esc(sub||'')}</div></div>`).join('');
+
+  // Price comes from the holdings read, so open R is the venue's number rather
+  // than the last bar close — the same figure the stop will be judged against.
+  const price = {};
+  (s.balances||[]).forEach(b=>{ if(nz(b.price)) price[b.coin] = b.price; });
+
+  table($('positions'),
+    [{t:'symbol'},{t:'setup'},{t:'entry',num:1},{t:'price',num:1},{t:'stop',num:1},
+     {t:'R now',num:1},{t:'MFE R',num:1},{t:'MAE R',num:1},{t:'to stop',num:1},
+     {t:'bars',num:1},{t:'conviction',num:1},{t:'',cl:'fill'}],
+    pos, p=>{
+      const px = price[(p.symbol||'').split('/')[0]];
+      const risk = Math.abs(p.entry - p.stop) || null;
+      const dir = p.side==='sell' ? -1 : 1;
+      const r = nz(px) && risk ? dir*(px-p.entry)/risk : null;
+      const toStop = nz(px) && px ? dir*(px-p.stop)/px : null;
+      return `<tr><td class="sym">${esc(p.symbol)}</td><td class="dim">${esc(p.setup)}</td>
+        <td class="num">${fmt(p.entry,4)}</td>
+        <td class="num">${nz(px)?fmt(px,4):'—'}</td>
+        <td class="num warn">${fmt(p.stop,4)}</td>
+        <td class="num ${cls(r)}">${sign(r)}</td>
+        <td class="num pos">${fmt(p.mfe_r)}</td>
+        <td class="num neg">${fmt(p.mae_r)}</td>
+        <td class="num dim">${pct(toStop)}</td>
+        <td class="num dim">${p.bars_held}</td>
+        <td class="num">${fmt(p.conviction,0)}</td><td class="fill"></td></tr>`;
+    });
 
   // Three columns, not one. Showing only "free" would report a position that
   // is correctly protected — its stop reserves the base asset — as no position.
-  table($('balances'), ['coin','free','locked','total','price','value'], s.balances, b=>{
-    const locked = b.used > 0;
-    return `<tr><td><b>${b.coin}</b></td>
-      <td>${fmt(b.free, 6)}</td>
-      <td class="${locked?'warn':'dim'}">${fmt(b.used, 6)}</td>
-      <td>${fmt(b.total, 6)}</td>
-      <td class="dim">${b.price==null?'—':fmt(b.price, 6)}</td>
-      <td>${b.value==null?'—':fmt(b.value, 2)}</td></tr>`;
-  });
+  table($('balances'),
+    [{t:'coin'},{t:'free',num:1},{t:'locked',num:1},{t:'total',num:1},{t:'price',num:1},{t:'value',num:1},{t:'',cl:'fill'}],
+    s.balances, b=>`<tr><td class="sym">${esc(b.coin)}</td>
+      <td class="num">${fmt(b.free,6)}</td>
+      <td class="num ${b.used>0?'warn':'faint'}">${fmt(b.used,6)}</td>
+      <td class="num">${fmt(b.total,6)}</td>
+      <td class="num faint">${fmt(b.price,6)}</td>
+      <td class="num">${fmt(b.value,2)}</td><td class="fill"></td></tr>`);
 
-  table($('positions'), ['symbol','setup','entry','stop','bars','MFE R','MAE R','conviction'],
-    s.open_positions, p=>`<tr><td>${p.symbol}</td><td class="dim">${p.setup}</td>
-    <td>${fmt(p.entry,4)}</td><td>${fmt(p.stop,4)}</td><td>${p.bars_held}</td>
-    <td class="pos">${fmt(p.mfe_r)}</td><td class="neg">${fmt(p.mae_r)}</td>
-    <td>${fmt(p.conviction,0)}</td></tr>`);
+  const scan = scan0 || (s.scan_top||[]).map(r=>({...r,no_trade_reason:r.reason}));
+  $('scanmeta').textContent = scan && scan.length
+    ? `${scan.length} symbols · ${scan.filter(r=>!UNSCORED.has(r.no_trade_reason)).length} scored`
+    : 'every symbol, every bar';
+  table($('scan'),
+    [{t:'symbol'},{t:'regime'},{t:'score',num:1},{t:'threshold',num:1},{t:'',w:'110px'},{t:'status',cl:'fill'}],
+    scan, r=>{
+      // A vetoed symbol was never scored (invariant 10) — "0.0" would claim a
+      // measurement the engine never made.
+      const unscored = UNSCORED.has(r.no_trade_reason);
+      const thr = r.threshold||1, score = r.score;
+      const ok = !unscored && score>=thr;
+      const w = unscored ? 0 : Math.min(100, Math.max(2, score/thr*100));
+      return `<tr class="${unscored?'muted':''}"><td class="sym">${esc(r.symbol)}</td>
+        <td class="dim">${esc(r.regime)}</td>
+        <td class="num ${unscored?'faint':ok?'pos':''}">${unscored?'—':fmt(score,1)}</td>
+        <td class="num faint">${fmt(thr,0)}</td>
+        <td><div class="bar ${unscored?'none':''}">${unscored?'':`<i class="${ok?'ok':''}" style="width:${w}%"></i>`}</div></td>
+        <td class="fill ${unscored?'faint':'dim'}">${esc(r.no_trade_reason||'eligible')}</td></tr>`;
+    });
 
-  const scan = await get('/api/scan') || (s.scan_top||[]).map(r=>({...r,no_trade_reason:r.reason}));
-  table($('scan'), ['symbol','regime','score','threshold','','status'], scan, r=>{
-    const score = r.score||0, thr = r.threshold||1;
-    const w = Math.min(100, score/thr*100);
-    const ok = score >= thr;
-    return `<tr><td>${r.symbol}</td><td class="dim">${r.regime}</td>
-      <td class="${ok?'pos':''}">${fmt(score,1)}</td><td class="dim">${fmt(thr,0)}</td>
-      <td style="width:90px"><div class="bar"><i class="${ok?'ok':''}" style="width:${w}%"></i></div></td>
-      <td class="dim">${r.no_trade_reason||'eligible'}</td></tr>`;
-  });
+  const total = (reasons||[]).reduce((a,r)=>a+r.n,0) || 1;
+  table($('reasons'), [{t:'reason',cl:'fill'},{t:'count',num:1},{t:'',w:'80px'}], reasons,
+    r=>`<tr><td>${esc(r.reason||'eligible')}</td><td class="num">${r.n}</td>
+      <td><div class="bar"><i style="width:${r.n/total*100}%"></i></div></td></tr>`);
 
-  const reasons = await get('/api/no-trade-reasons');
-  table($('reasons'), ['reason','count'], reasons,
-    r=>`<tr><td>${r.reason||'eligible'}</td><td>${r.n}</td></tr>`);
+  table($('trades'),
+    [{t:'closed'},{t:'symbol'},{t:'R',num:1},{t:'bars',num:1},{t:'exit',cl:'fill'}], trades,
+    t=>`<tr><td class="faint">${stamp(t.exit_ts)}</td><td class="sym">${esc(t.symbol)}</td>
+      <td class="num ${cls(t.r_multiple)}">${sign(t.r_multiple)}</td>
+      <td class="num dim">${t.bars_held}</td><td class="dim fill">${esc(t.exit_reason)}</td></tr>`);
 
-  const trades = await get('/api/trades?limit=25');
-  table($('trades'), ['closed','symbol','R','bars','exit'], trades,
-    t=>`<tr><td class="dim">${time(t.exit_ts)}</td><td>${t.symbol}</td>
-    <td class="${cls(t.r_multiple)}">${fmt(t.r_multiple)}</td>
-    <td>${t.bars_held}</td><td class="dim">${t.exit_reason}</td></tr>`);
-
-  const eq = await get('/api/equity?limit=1500');
-  if(eq) line($('equity'), eq.map(p=>p.equity), '#58a6ff');
-
-  const ex = await get('/api/excursion');
-  if(ex) scatter($('excursion'), ex);
+  lastEq = eq; lastBase = base; lastEx = ex;
+  if(eq && eq.length){
+    $('eqrange').textContent = `${eq.length} bars · ${stamp(eq[0].ts)} → ${stamp(eq[eq.length-1].ts)}`;
+  }
+  equityChart($('equity'), eq, base);
+  // An empty 260px canvas is worse than no panel: it reads as a chart that
+  // failed to draw. Say what it is waiting for instead.
+  const exCard = $('excursion-card');
+  if(ex && ex.length){
+    exCard.querySelector('.chartbox').hidden = false;
+    exCard.querySelector('.note').hidden = false;
+    scatter($('excursion'), ex);
+    let hint = exCard.querySelector('.empty'); if(hint) hint.remove();
+  }else{
+    exCard.querySelector('.chartbox').hidden = true;
+    exCard.querySelector('.note').hidden = true;
+    if(!exCard.querySelector('.empty'))
+      exCard.insertAdjacentHTML('beforeend',
+        '<div class="empty">no closed trades yet — this fills in once the first position exits</div>');
+  }
 }
 
+// Redraw on resize, do not refetch. The old handler called refresh() on every
+// resize event, so dragging a window fired a burst of requests per second.
+let rt;
+addEventListener('resize', ()=>{
+  clearTimeout(rt);
+  rt = setTimeout(()=>{ equityChart($('equity'), lastEq, lastBase); if(lastEx&&lastEx.length) scatter($('excursion'), lastEx); }, 120);
+});
+bindTip($('equity'), $('eqtip'), 2);
+
 refresh(); setInterval(refresh, 10000);
-window.addEventListener('resize', refresh);
 </script>
 </body>
 </html>

@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tbot.core.config import load_config
+from tbot.strategy.conviction import UNSCORED_REASONS
 from tbot.web import app as web_app
 
 
@@ -55,6 +56,22 @@ def test_reads_stay_correct_when_the_handle_is_shared(client):
     assert c.get("/api/equity").json() == []
     assert c.get("/api/no-trade-reasons").json() == []
     assert c.get("/api/conviction/BTC%2FUSDT").status_code == 404
+
+
+def test_the_panel_is_told_which_reasons_mean_no_score_was_taken(client):
+    """The panel must not draw a vetoed symbol as a score of zero.
+
+    A symbol blocked before scoring has no opinion attached to it (invariant
+    10); rendering "0.0" claims a measurement the engine never made, and puts
+    it in the same column as a symbol that really was scored and fell short.
+    The panel reads the engine's own set rather than restating it in JavaScript,
+    where it would drift the first time a reason is added.
+    """
+    c, _ = client
+    served = c.get("/api/meta").json()["unscored_reasons"]
+    assert set(served) == {str(r) for r in UNSCORED_REASONS}
+    assert "regime_veto" in served
+    assert "below_threshold" not in served, "below_threshold is a real score, not a veto"
 
 
 def test_a_serialised_sqlite_build_is_required_to_share_the_handle(tmp_path, monkeypatch):

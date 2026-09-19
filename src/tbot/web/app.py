@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from tbot.core.config import Config, load_config, load_secrets
 from tbot.core.db import Database
+from tbot.strategy.conviction import UNSCORED_REASONS
 
 STATIC = Path(__file__).parent / "static"
 
@@ -97,6 +98,17 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/api/trades")
     def trades(limit: int = Query(200, le=5000)) -> JSONResponse:
         return JSONResponse(db().recent_trades(limit))
+
+    @app.get("/api/meta")
+    def meta() -> JSONResponse:
+        """Constants the panel must agree with the engine about.
+
+        The panel has to tell "blocked before scoring" apart from "scored and
+        came up short" — a vetoed symbol has no opinion, not a score of zero
+        (invariant 10). Serving the engine's own set beats restating it in
+        JavaScript, where it would drift the first time a reason is added.
+        """
+        return JSONResponse({"unscored_reasons": sorted(str(r) for r in UNSCORED_REASONS)})
 
     @app.get("/api/scan")
     def scan() -> JSONResponse:
