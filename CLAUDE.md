@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 389 test
+.venv/bin/python -m pytest -q             # 398 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -126,6 +126,15 @@ testi oku — hepsinin kendini koruyan bir testi var.
     portföy yanlış, equity yanlış, slot boşa kilitli, ve sonraki barda olmayan
     pozisyon için ikinci satış. İki okuma şart — tek okuma kanıt değil.
     → `_detect_venue_exits`
+50. **Bilinmeyen config anahtarı hatadır, varsayılana dönüş değil.** Her bölüm
+    `extra="forbid"`. İki kez ölü ayar üretti (`max_spread_bps`,
+    `vol_lookback_bars`): dosyada duruyor, hiçbir kod okumuyor, ve okunuyormuş
+    gibi görünüyor. → `StrictModel`
+51. **Kuyruğu kesen her şey pahalıdır.** Kârın tamamı MFE 3R+ gören ~%20'lik
+    işlemden geliyor (21 işlem +460, diğer 82 işlem −385). Erken çıkan her
+    mekanizma — conviction çöküşü, kısmi kâr alma — vasatlarda kurtardığından
+    fazlasını kuyrukta veriyor. İkisi de ölçüldü, ikisi de kapalı.
+
 48. **Engellenmiş skor ile düşük skor aynı şey değildir.** `_blocking_reason`
     skorlamadan önce kısa devre yapar, `total=0.0` hesaplanmadığı içindir —
     "fikrim yok" (değişmez 10). Ama `below_threshold` skorlamadan *sonra*
@@ -233,6 +242,8 @@ kurulduğunun kanıtı.
 
 | 47 | **#40'ın ilk tamiri no-op'tu ve etkisi yanlış atfedildi.** `conviction_now` bağlandı ama sonuç değişmedi — bot durdurulup sabit arşivle ölçülünce açık/kapalı **birebir aynı**. Sebep: tamirin içine koyduğum koruma, `no_trade_reason is not None` olan her skoru "fikrim yok" sayıyordu. Ama `below_threshold` engelleme değil, **gerçek bir skor** — ve çöken bir tez tanımı gereği eşiğin altındadır. Ölçüldü: 391 bar çöküş eşiğinin altında skorlandı, 391'i de atıldı | yüksek | `UNSCORED_REASONS`: yalnız *skorlanmadan* kısa devre yapan sebepler "fikrim yok" sayılır |
 | 48 | **Çalışır hale gelince conviction-çöküş çıkışı sonucu KÖTÜLEŞTİRDİ.** 24 çıkış üretti: PF 1.23 → 1.12, expectancy +0.179 → +0.100R, getiri +%5.75 → +%2.32, yakalama %8.7 → %5.6. Hâlâ çalışan kazananları kesiyor | — | `collapse_threshold: 0.0` (kapalı). Mekanizma doğru ve test edildi; **seviye onaylanmadı** |
+| 50 | **`risk.vol_lookback_bars` config'te duruyordu ve hiçbir kod okumuyordu** — motor iki yerde, backtest iki yerde 30'u sabit yazmıştı. `universe.max_spread_bps`'den sonra ikinci ölü ayar. Pydantic bilinmeyen anahtarı sessizce yutuyor, yani modelin hiç büyümediği alan ile büyüdüğü alan aynı görünüyor | orta | alan modele eklendi (240), ve her config bölümü artık `extra="forbid"` — yazım hatası açılışta patlıyor. 30 saatlik pencere yıllık vol tahmini için çok kısa: evren genelinde p90/p10 4.0x (240'ta 3.2x), ölçek bar başına medyan %0.87 zıplıyor (240'ta %0.09) |
+| 51 | **Kısmi kâr alma sezgiyi doğrulamadı.** 0.00R biten işlem 31→3 oldu ama PF 1.19→1.12, getiri +%6.04→+%2.60. Sebep: +1R'de yarısını satmak, sonradan 3R+'ye koşan pozisyonu da yarıya indiriyor. Vasatlarda $80 kurtarıp iyilerde $108 veriyor | — | mekanizma kuruldu ve test edildi, `scale_out_at_r: 0.0`. Düşüşü %15.8→%12.8 indiriyor, yani risk/getiri takası — "daha iyi" değil |
 | 49 | **PF 1.20→1.41 ve PBO 1.00→0.33 iyileşmesi #40'a atfedilmişti. Yanlış atıf.** İki koşu arasında arşiv büyümüştü (bkz. #45) ve tamirin kendisi no-op'tu. Sayılar doğru — bugünkü sabit ölçüm de PBO 0.33 / 6'da 5 veriyor — ama **sebep A1 değildi** | orta | atıf CLAUDE.md ve `hypotheses.md`'de düzeltildi; A/B'ler artık bot **durdurularak** ve `--to` ile yapılıyor |
 
 Denetim #47 ve #49 birlikte bir ders: **kendi tamirimin ölçümüne en az başkasınınki
@@ -453,8 +464,8 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 11** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 11` geçirin — DSR her denemeyi fiyatlıyor.
+**Kümülatif deneme: 15** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 15` geçirin — DSR her denemeyi fiyatlıyor.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir

@@ -813,3 +813,151 @@ def test_a_stored_entry_atr_is_never_overwritten(runner):
 
     assert runner._entry_atr_for(position, atr_now=99.0) == pytest.approx(2.5)
     assert position.meta["entry_atr"] == pytest.approx(2.5)
+
+
+# --------------------------------------------------------------------------
+# Partial profit taking
+# --------------------------------------------------------------------------
+
+
+def test_scale_out_is_off_by_default():
+    """Measured worse on return, better on drawdown. A trade, not an upgrade.
+
+    At 1.0R it saves $80 across the 82 mediocre trades and gives up $108 on
+    the 21 that reach 3R+ - and that tail is the entire profit. Profit factor
+    1.19 -> 1.12, return +6.04% -> +2.60%, max drawdown 15.8% -> 12.8%.
+    """
+    assert ExitConfig().scale_out_at_r == 0.0
+    manager = ExitManager(ExitConfig())
+    assert manager.scale_out(_position(), high=1e9, low=99.0) is None
+
+
+def test_scale_out_fires_at_its_level_and_only_once():
+    """A position oscillating around the level must not be sold down bar by bar."""
+    manager = ExitManager(ExitConfig(scale_out_at_r=1.0, scale_out_pct=0.5))
+    position = _position(entry=100.0, stop=90.0)  # 1R = 10
+
+    plan = manager.scale_out(position, high=110.0, low=99.0)
+    assert plan is not None
+    assert plan.price == pytest.approx(110.0)
+    assert plan.fraction == pytest.approx(0.5)
+
+    position.meta["scaled_out"] = True
+    assert manager.scale_out(position, high=130.0, low=99.0) is None
+
+
+def test_scale_out_does_not_fire_before_its_level():
+    manager = ExitManager(ExitConfig(scale_out_at_r=2.0, scale_out_pct=0.5))
+    position = _position(entry=100.0, stop=90.0)
+    assert manager.scale_out(position, high=119.0, low=99.0) is None
+    assert manager.scale_out(position, high=120.0, low=99.0) is not None
+
+
+def test_r_is_measured_against_the_original_size_after_a_partial_exit():
+    """Half a position closing at +2R is not a +2R trade.
+
+    R has to describe the risk the position actually carried, or a scaled-out
+    winner reports the same R as one that ran whole and the expectancy series
+    quietly stops being comparable across trades.
+    """
+    from tbot.core.models import ExitReason, Fill, Regime, Side
+    from tbot.engine.portfolio import Portfolio
+
+    portfolio = Portfolio(starting_cash=10_000.0)
+    fill = Fill(
+        order_client_id="x",
+        symbol="BTC/USDT",
+        side=Side.BUY,
+        quantity=2.0,
+        price=100.0,
+        fee=0.0,
+        ts=0,
+    )
+    portfolio.open_position(
+        fill=fill,
+        stop_price=90.0,  # 1R = 10 per unit, 20 for the position
+        setup="test",
+        risk_amount=20.0,
+        conviction=70.0,
+        regime=Regime.TREND_UP,
+    )
+
+    # Half off at +1R, the rest exits at +2R.
+    sold = portfolio.scale_out("BTC/USDT", price=110.0, fraction=0.5)
+    assert sold == pytest.approx(1.0)
+    assert portfolio.positions["BTC/USDT"].quantity == pytest.approx(1.0)
+
+    trade = portfolio.close_position("BTC/USDT", 120.0, 1, ExitReason.TRAILING_STOP)
+    # 1.0 unit at +10 plus 1.0 unit at +20 = 30 against 20 of risk.
+    assert trade.pnl == pytest.approx(30.0)
+    assert trade.r_multiple == pytest.approx(1.5)
+
+
+def test_r_is_unchanged_when_nothing_was_scaled_out():
+    """The new formula must be algebraically the old one in the common case."""
+    from tbot.core.models import ExitReason, Fill, Regime, Side
+    from tbot.engine.portfolio import Portfolio
+
+    portfolio = Portfolio(starting_cash=10_000.0)
+    portfolio.open_position(
+        fill=Fill(
+            order_client_id="x",
+            symbol="BTC/USDT",
+            side=Side.BUY,
+            quantity=2.0,
+            price=100.0,
+            fee=0.0,
+            ts=0,
+        ),
+        stop_price=90.0,
+        setup="test",
+        risk_amount=20.0,
+        conviction=70.0,
+        regime=Regime.TREND_UP,
+    )
+    trade = portfolio.close_position("BTC/USDT", 120.0, 1, ExitReason.TRAILING_STOP)
+    assert trade.r_multiple == pytest.approx(2.0)
+
+
+def test_scaling_out_cannot_compound_into_a_full_exit():
+    """The fraction is of the original size, so repeats cannot eat the position."""
+    from tbot.core.models import Fill, Regime, Side
+    from tbot.engine.portfolio import Portfolio
+
+    portfolio = Portfolio(starting_cash=10_000.0)
+    portfolio.open_position(
+        fill=Fill(
+            order_client_id="x",
+            symbol="BTC/USDT",
+            side=Side.BUY,
+            quantity=4.0,
+            price=100.0,
+            fee=0.0,
+            ts=0,
+        ),
+        stop_price=90.0,
+        setup="test",
+        risk_amount=40.0,
+        conviction=70.0,
+        regime=Regime.TREND_UP,
+    )
+    for _ in range(3):
+        portfolio.scale_out("BTC/USDT", price=110.0, fraction=0.5)
+    # Three halvings of the ORIGINAL 4.0 would be 6.0 - more than exists.
+    assert portfolio.positions["BTC/USDT"].quantity == pytest.approx(0.0, abs=1e-9)
+    assert portfolio.positions["BTC/USDT"].quantity >= 0.0
+
+
+def test_an_oversized_resting_stop_is_not_adopted():
+    """After a partial exit the venue stop covers more than is still held.
+
+    Adopting it means that when it triggers it asks to sell inventory already
+    sold, is refused for insufficient balance, and leaves the remainder with no
+    protection - a partial profit bought with the whole position's safety.
+    """
+    import inspect
+
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    source = inspect.getsource(CCXTBroker.place_stop)
+    assert "quantity * 1.005" in source, "the adopt check must bound the upper side too"

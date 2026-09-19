@@ -21,11 +21,48 @@ bir sonrakinin barını yükseltiyor.
 | 8 | Volatilite ölçekleyici çalışıyor | varsayım | **red — mekanizma hiç çalışmamış.** Hedef %35 (hisse portföyü değeri), evren medyanı %79. Ölçekleyici sürekli tabanda, her pozisyon niyetlenenin %44'ü. Düzeltildi (0.80) | 0 (tamir, deneme değil) |
 
 | 9 | Conviction-çöküş çıkışı canlıda ve backtest'te **hiç tetiklenmiyordu** (`conviction_now=None` sabit) | mimari denetim | **doğrulandı; ilk tamir NO-OP çıktı, ikinci tamir çalıştı, sonuç REDDEDİLDİ** — aşağıya bakın | 1 |
-| 11 | Conviction-çöküş çıkışı (eşik 32) sonucu iyileştirir | belgelenen 4. katman | **test edildi, REDDEDİLDİ** — PF 1.23→1.12, expectancy +0.179→+0.100R, yakalama %8.7→%5.6. Kapatıldı (`collapse_threshold: 0.0`) | (yukarıdaki 1'e dahil) |
+| 11 | Conviction-çöküş çıkışı (eşik 32) sonucu iyileştirir | belgelenen 4. katman | **test edildi, REDDEDİLDİ** — PF 1.23→1.12, expectancy +0.179→+0.100R, yakalama %8.7→%5.6. Kapatıldı (`collapse_threshold: 0.0`) | (9'daki 1'e dahil) |
 
 | 10 | Kırılım seviyesine önceden kurulu emir bırakmak, bar kapanışını beklemekten iyidir | bar-arası körlük | **test edildi, REDDEDİLDİ** — sonuç iyi göründü ama 5 işlemden geliyor, 2'si %92'sini taşıyor. Mekanizma kuruldu, varsayılan **kapalı** | 1 |
 
-**Kümülatif deneme: 11.** Bir sonraki CPCV koşusunda `--trials 11` geçirin.
+| 12 | Kısmi kâr alma (+1R/+1.5R/+2R'de %50 sat) sonucu iyileştirir | MFE/yakalama ölçümü | **test edildi, REDDEDİLDİ** — üç seviyede de PF ve getiri düştü. Düşüşü azaltıyor (%15.8→%12.8) ama getiriyi de azaltıyor | 3 |
+| 13 | `risk_per_trade` 0.75%→1.2% (operatör pozisyon boyutu istedi) | tercih | **uygulandı** — maks düşüş %11.9→%15.8. Sharpe ~ölçek-bağımsız olduğu için DSR'a etkisi küçük | 1 |
+
+**Kümülatif deneme: 15.** Bir sonraki CPCV koşusunda `--trials 15` geçirin.
+
+## 12. deneme: kısmi kâr alma — neden reddedildi
+
+Hedeflediği sorun gerçekti ve **onu çözdü**: tam 0.00R'de biten işlem 31'den
+3'e düştü (1.0R seviyesinde). Ama toplam sonuç kötüleşti.
+
+| | kapalı | 1.0R | 1.5R | 2.0R |
+|---|---|---|---|---|
+| profit factor | **1.19** | 1.12 | 1.07 | 1.04 |
+| expectancy | **+0.195R** | +0.099R | +0.109R | +0.078R |
+| getiri | **+%6.04** | +%2.60 | +%1.15 | −%0.23 |
+| Sharpe | **0.23** | 0.15 | 0.09 | 0.03 |
+| maks düşüş | %15.8 | **%12.8** | %12.8 | %13.8 |
+| 0.00R biten | 31 | **3** | 11 | 22 |
+
+Sebep tek bir tabloda görünüyor (1.0R seviyesi):
+
+| | işlem | toplam pnl (kapalı) | toplam pnl (1.0R) | fark |
+|---|---|---|---|---|
+| MFE 3R+ görenler | 21 | **+460.58** | +352.07 | **−108.51** |
+| diğerleri | 82 | −385.47 | −305.80 | +79.67 |
+| **net** | 103 | **+75.11** | +46.27 | −28.84 |
+
+**Vasat işlemlerde $80 kurtarıyor, iyi işlemlerde $108 veriyor.** Çünkü +1R'de
+yarısını satmak, sonradan 3R+'ye koşacak pozisyonu da yarıya indiriyor — ve o
+21 işlem kârın tamamını taşıyor.
+
+Bu, conviction-çöküş çıkışıyla aynı ders: **kuyruğu kesen her şey pahalı.**
+Sezgi ("kârı geri verme") makul, veri aksini söylüyor.
+
+**Karar: mekanizma kuruldu, test edildi, varsayılan kapalı.** Ama bu bir
+risk/getiri takası — düşüşü %15.8'den %12.8'e indiriyor. Daha düz bir eğri
+karşılığında getiri vermeye razı olan biri için savunulabilir; "daha iyi" değil,
+**farklı**.
 
 ## 10. deneme: kurulu kırılım girişi — neden reddedildi
 

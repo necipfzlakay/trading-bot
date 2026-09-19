@@ -382,6 +382,32 @@ class ExitConfig(StrictModel):
     # works while the bot is running. That asymmetry is deliberate: a missed
     # target costs opportunity, a missing stop costs capital.
     target_atr_mult: float = Field(default=0.0, ge=0, le=20)
+    # Partial profit taking. At ``scale_out_at_r`` multiples of risk, sell
+    # ``scale_out_pct`` of the ORIGINAL quantity and let the rest run.
+    #
+    # This is the measured gap, not a preference. Of 114 backtest trades, 33
+    # (29%) ended at exactly 0.00R via the trailing stop after averaging +1.78R
+    # of favourable excursion; the 1-2R bucket realised -0.01R on average and
+    # the 2-3R bucket +0.00R. Everything the strategy earns comes from the 24
+    # trades that reach 3R+, and nothing at all is taken from the rest.
+    #
+    # MEASURED, and the intuition is wrong. Scaling out does close the gap it
+    # was aimed at - trades ending at exactly 0.00R drop from 31 to 3 at 1.0R -
+    # but it does not leave the tail alone, because selling half at +1R halves
+    # the position that later runs to 3R+, and that tail is the entire profit:
+    #
+    #     off:    21 tail trades +460.58, other 82 -385.47, net  +75.11
+    #     1.0R:   21 tail trades +352.07, other 82 -305.80, net  +46.27
+    #
+    # It saves $80 on the mediocre trades and gives up $108 on the good ones.
+    # Profit factor 1.19 -> 1.12, return +6.04% -> +2.60%. Max drawdown does
+    # improve, 15.8% -> 12.8%.
+    #
+    # So this is a risk/return trade, not an improvement: less drawdown, less
+    # money. Zero disables it, and it ships disabled because the operator has
+    # not asked to trade return for smoothness.
+    scale_out_at_r: float = Field(default=0.0, ge=0, le=20)
+    scale_out_pct: float = Field(default=0.5, gt=0, lt=1.0)
 
 
 class EntryConfig(StrictModel):

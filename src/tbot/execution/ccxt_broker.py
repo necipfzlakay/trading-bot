@@ -440,7 +440,15 @@ class CCXTBroker(Broker):
                 resting_trigger = float(order.get("triggerPrice") or 0.0)
             except (TypeError, ValueError):
                 continue
-            covers = resting_qty >= quantity * 0.995
+            # Bounded on BOTH sides. Only the lower bound existed, so any
+            # oversized stop was adopted as good enough — and after a partial
+            # exit the resting stop covers more than is still held. It would
+            # then trigger, try to sell inventory that is no longer there, be
+            # refused for insufficient balance, and leave the remainder with no
+            # protection at all. The upper bound is what forces a replace.
+            # The 0.5% of slack below absorbs the base-asset fee that makes a
+            # placed stop very slightly smaller than the position it covers.
+            covers = quantity * 0.995 <= resting_qty <= quantity * 1.005
             same_level = resting_trigger > 0 and abs(resting_trigger - stop_price) / stop_price < 1e-3
             if order_id and covers and same_level:
                 log.info("protective_stop_adopted", symbol=symbol, order_id=order_id)

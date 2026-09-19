@@ -892,7 +892,13 @@ class Runner:
 
             if decision.should_exit:
                 self._close(symbol, decision.exit_price or close, bar_ts, decision.reason)
-            elif decision.new_stop is not None:
+                continue
+
+            # Only reached when no exit fired, so the stop has already had its
+            # say on this bar (invariant D40).
+            self._maybe_scale_out(position, high, low, bar_ts)
+
+            if decision.new_stop is not None:
                 position.current_stop = decision.new_stop
                 self.db.upsert_position(position)
                 self._sync_protective_stop(position)
@@ -937,6 +943,9 @@ class Runner:
 
             decision = self.exits.evaluate_intrabar(position, quote.high, quote.low)
             if not decision.should_exit:
+                # The stop did not fire, so a scale-out level reached since the
+                # last close can be acted on now rather than at the next one.
+                self._maybe_scale_out(position, quote.high, quote.low, forming_bar)
                 continue
 
             log.info(
@@ -1071,6 +1080,115 @@ class Runner:
         )
         if self.notifier and self.config.telegram.notify_fills:
             self.notifier.notify_exit(trade)
+
+    def _maybe_scale_out(self, position, high: float, low: float, bar_ts: int) -> None:
+        """Take part of a position off at its level, and re-protect the rest.
+
+        Three things have to happen together or the position ends up worse off
+        than before:
+
+        1. sell the slice at the venue,
+        2. reduce the tracked quantity by what actually filled,
+        3. **resize the protective stop.**
+
+        Step 3 is not housekeeping. The resting stop still covers the original
+        size, so when it triggers it asks to sell inventory that has already
+        been sold, is refused for insufficient balance, and leaves the
+        remainder unprotected — a partial profit bought with the whole
+        position's safety. ``place_stop`` now refuses to adopt an oversized
+        stop, so re-placing here genuinely replaces it.
+
+        Order matters too: sell first, then re-place. Cancelling the stop
+        before the sale would open a gap with no protection at all, which is
+        the lesson from audit #27.
+        """
+        plan = self.exits.scale_out(position, high, low)
+        if plan is None:
+            return
+
+        original = float(position.meta.get("original_quantity", position.quantity))
+        wanted = min(original * plan.fraction, position.quantity)
+        if wanted <= 0:
+            return
+
+        spec = self.broker.market_spec(position.symbol)
+        remainder = position.quantity - wanted
+        if wanted < spec.min_amount or (remainder > 0 and remainder < spec.min_amount):
+            # Either slice would be unsellable. Taking a partial profit that
+            # strands an unsellable remnant is worse than not taking it.
+            log.info(
+                "scale_out_skipped",
+                symbol=position.symbol,
+                wanted=wanted,
+                remainder=remainder,
+                min_amount=spec.min_amount,
+                reason="one of the two pieces would be below the venue minimum",
+            )
+            position.meta["scaled_out"] = True  # do not retry every bar
+            self.db.upsert_position(position)
+            return
+
+        order = self.broker.build_order(
+            strategy=position.setup,
+            symbol=position.symbol,
+            bar_ts=bar_ts,
+            action="scaleout",
+            side=Side.SELL,
+            quantity=wanted,
+            order_type=OrderType.MARKET,
+            reduce_only=True,
+        )
+
+        if isinstance(self.broker, PaperBroker):
+            fill = self.broker.force_fill_at(order, plan.price, bar_ts)
+        else:
+            submitted = self.watchdog.call("submit_scale_out", lambda: self.broker.submit(order))
+            if submitted is None or submitted.status.value in ("rejected", "expired"):
+                log.warning(
+                    "scale_out_rejected",
+                    symbol=position.symbol,
+                    reason=getattr(submitted, "reject_reason", "no response"),
+                )
+                return
+            filled = submitted.filled_quantity or wanted
+            fill = Fill(
+                order_client_id=submitted.client_id,
+                symbol=position.symbol,
+                side=Side.SELL,
+                quantity=filled,
+                price=submitted.average_price or plan.price,
+                fee=submitted.fee_paid,
+                ts=bar_ts,
+            )
+            self.db.upsert_order(submitted)
+
+        self.db.record_fill(fill)
+        sold = self.portfolio.scale_out(
+            position.symbol, fill.price, fill.quantity / max(original, 1e-12), fill.fee
+        )
+        if not sold:
+            return
+        self.db.upsert_position(position)
+
+        # Re-protect what is left, at the same level, at the new size.
+        if isinstance(self.broker, CCXTBroker):
+            position.meta.pop("stop_order_id", None)
+            self._place_protective_stop(position, bar_ts)
+
+        log.info(
+            "scaled_out",
+            symbol=position.symbol,
+            sold=sold,
+            price=fill.price,
+            remaining=position.quantity,
+            detail=plan.detail,
+        )
+        if self.notifier and self.config.telegram.notify_fills:
+            self.notifier.send(
+                f"💰 <b>PARTIAL {position.symbol}</b>\n"
+                f"{sold:.6f} @ {fill.price:.6f} ({plan.detail})\n"
+                f"kalan {position.quantity:.6f}, stop {position.current_stop:.6f}"
+            )
 
     def _entry_atr_for(self, position, atr_now: float) -> float:
         """The ATR this position was opened against, backfilled if it is missing.

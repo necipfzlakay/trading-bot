@@ -786,8 +786,35 @@ class Backtester:
                 self.risk.record_trade(trade)
             return
 
+        # Mirrors Runner._maybe_scale_out, and for the same reason: if one side
+        # takes partial profits and the other does not, every measured number
+        # stops describing the thing that is running.
+        self._scale_out(portfolio, d, position, high, low)
+
         if decision.new_stop is not None:
             position.current_stop = decision.new_stop
+
+    def _scale_out(self, portfolio: Portfolio, d: SymbolData, position, high, low) -> None:
+        """Take the same slice off at the same level the live engine would.
+
+        Reached only after the stop has been checked, so a bar that touched
+        both the stop and the scale-out level is a loss (invariant D40).
+        """
+        plan = self.exits.scale_out(position, high, low)
+        if plan is None:
+            return
+
+        original = float(position.meta.get("original_quantity", position.quantity))
+        wanted = min(original * plan.fraction, position.quantity)
+        remainder = position.quantity - wanted
+        if wanted < d.spec.min_amount or (remainder > 0 and remainder < d.spec.min_amount):
+            position.meta["scaled_out"] = True  # unsellable either way; do not retry
+            return
+
+        fee = plan.price * wanted * d.spec.taker_fee
+        sold = portfolio.scale_out(d.symbol, plan.price, plan.fraction, fee)
+        if sold:
+            self._funnel["scaled_out"] += 1
 
     def _conviction_for_open(
         self, d: SymbolData, idx: int, bar_ts: int, side: Side, regime: Regime

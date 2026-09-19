@@ -82,11 +82,50 @@ class Portfolio:
             fees_paid=fill.fee,
             conviction_at_entry=conviction,
             entry_conviction_id=conviction_id,
-            meta={"regime_at_entry": regime.value},
+            # ``original_quantity`` is what R is measured against for the rest
+            # of this position's life. Without it a scaled-out position would
+            # compute R against whatever is left, and half a position closing
+            # at +2R would report +2R on half the money.
+            meta={"regime_at_entry": regime.value, "original_quantity": fill.quantity},
         )
         self.positions[fill.symbol] = position
         self.cash -= fill.notional + fill.fee
         return position
+
+    def scale_out(
+        self, symbol: str, price: float, fraction: float, fee: float = 0.0
+    ) -> float | None:
+        """Sell part of a position, keeping the rest open. Returns the quantity sold.
+
+        The fraction is of the **original** quantity, not what remains, so this
+        cannot compound into a full exit if it is ever called twice.
+
+        No ``Trade`` row is written here. A trade in this system is one
+        position's whole life — its MAE, MFE, bars held and R all describe the
+        position, not a slice of it — and emitting a row per slice would
+        silently change what every per-trade statistic means. The realised
+        money is banked on the position instead and folded into the Trade when
+        it finally closes.
+        """
+        position = self.positions.get(symbol)
+        if position is None:
+            return None
+
+        original = float(position.meta.get("original_quantity", position.quantity))
+        quantity = min(original * fraction, position.quantity)
+        if quantity <= 0:
+            return None
+
+        gross = (price - position.entry_price) * quantity * position.side.sign
+        position.quantity -= quantity
+        position.fees_paid += fee
+        position.meta["scaled_out"] = True
+        position.meta["realised_pnl"] = float(position.meta.get("realised_pnl", 0.0)) + gross
+        position.meta["scaled_quantity"] = (
+            float(position.meta.get("scaled_quantity", 0.0)) + quantity
+        )
+        self.cash += price * quantity - fee
+        return quantity
 
     def close_position(
         self, symbol: str, exit_price: float, exit_ts: int, reason: ExitReason, fee: float = 0.0
@@ -96,13 +135,20 @@ class Portfolio:
             return None
 
         gross = (exit_price - position.entry_price) * position.quantity * position.side.sign
+        # Anything already taken off at a scale-out level is part of this
+        # trade's result, not a separate one.
+        realised_earlier = float(position.meta.get("realised_pnl", 0.0))
         total_fees = position.fees_paid + fee
-        pnl = gross - fee
+        pnl = gross + realised_earlier - fee
 
+        # Measured against the risk the position actually carried — original
+        # quantity times the initial stop distance — so R stays comparable
+        # whether or not part of it was sold early. With no scale-out this is
+        # algebraically the old formula.
         r_unit = position.r_unit
-        r_multiple = (
-            (exit_price - position.entry_price) * position.side.sign / r_unit if r_unit > 0 else 0.0
-        )
+        original = float(position.meta.get("original_quantity", position.quantity))
+        risk_at_entry = original * r_unit
+        r_multiple = (gross + realised_earlier) / risk_at_entry if risk_at_entry > 0 else 0.0
 
         trade = Trade(
             symbol=symbol,

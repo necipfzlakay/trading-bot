@@ -50,6 +50,15 @@ class ExitDecision:
 
 
 @dataclass(slots=True)
+class ScaleOut:
+    """Take part of the position off at a level, and leave the rest running."""
+
+    fraction: float  # of the ORIGINAL quantity, so repeated calls cannot compound
+    price: float
+    detail: str = ""
+
+
+@dataclass(slots=True)
 class ExitManager:
     """Evaluates the exit layers for one position."""
 
@@ -121,6 +130,45 @@ class ExitManager:
             )
 
         return ExitDecision(False, new_stop=self.update_stop(position, close, atr))
+
+    def scale_out(self, position: Position, high: float, low: float) -> ScaleOut | None:
+        """Whether part of this position should be taken off now.
+
+        A resting instruction like the stop: the level is known at the last
+        close, and reaching it is the whole trigger. So it works identically
+        between bars and at a bar close, and the backtest reads it off the
+        bar's high exactly as the live path reads it off the running high.
+
+        **Fires once.** The level is recorded in ``meta`` when it is taken, so
+        a position that oscillates around it cannot be sold down repeatedly —
+        which would turn one decision into a slow full exit.
+
+        **Never checked before the stop.** Both callers run ``_stop_breach``
+        first, so a bar that touched both is a loss, not a partial win
+        (invariant D40).
+        """
+        level_r = self.config.scale_out_at_r
+        if level_r <= 0 or position.meta.get("scaled_out"):
+            return None
+
+        unit = position.r_unit
+        if unit <= 0:
+            return None
+
+        target = (
+            position.entry_price + level_r * unit
+            if position.side is Side.BUY
+            else position.entry_price - level_r * unit
+        )
+        reached = high >= target if position.side is Side.BUY else low <= target
+        if not reached:
+            return None
+
+        return ScaleOut(
+            fraction=self.config.scale_out_pct,
+            price=target,
+            detail=f"{self.config.scale_out_pct:.0%} off at {level_r:.2f}R ({target:.6f})",
+        )
 
     def evaluate_intrabar(self, position: Position, high: float, low: float) -> ExitDecision:
         """The price-level layers only, for use between bar closes.
