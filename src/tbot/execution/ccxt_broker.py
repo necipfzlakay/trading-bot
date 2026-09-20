@@ -384,7 +384,31 @@ class CCXTBroker(Broker):
             # stop, by hand, or by a reset — and adopting one of those invents a
             # position that does not exist, with negative cash to match.
             executed = float(historic.get("cumExecQty") or 0.0)
-            held = self._balances("total").get(order.symbol.split("/")[0], 0.0)
+            totals = self._balances("total")
+            if totals is None:
+                # ``_balances`` returns None when the venue could not be read,
+                # and this call used to assume a dict — a plain AttributeError
+                # on the exact path a network hiccup leads to, since a hiccup
+                # is what produces the duplicate id in the first place.
+                #
+                # The inventory check is the whole safeguard here, and a venue
+                # that cannot be read can neither confirm nor deny it. Reading
+                # the failure as "holds nothing" would discard a real position;
+                # as "holds it" would invent one. Skip the bar, same as below.
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = (
+                    "client id already used by a filled order, and the balance "
+                    "read failed — cannot tell whether that fill is still held"
+                )
+                log.warning(
+                    "duplicate_order_unverifiable",
+                    symbol=order.symbol,
+                    client_id=order.client_id,
+                    status=status,
+                    action="entry skipped; the next bar gets a fresh client id",
+                )
+                return order
+            held = totals.get(order.symbol.split("/")[0], 0.0)
             if held >= executed * 0.95:
                 log.info("duplicate_order_adopted", client_id=order.client_id, status=status)
                 return self._merge(order, self._from_raw_v5(historic))
@@ -1282,6 +1306,24 @@ class PerpBroker(CCXTBroker):
             return False
         log.info("take_profit_set", symbol=symbol, target=round(target_price, 8))
         return True
+
+    def amend_stop(self, symbol: str, order_id: str, stop_price: float) -> bool:
+        """Move the position's stop. Overwrite, not edit.
+
+        The base implementation calls ``edit_order`` against a real order id.
+        There is no such id here: ``place_stop`` returns ``position:<symbol>``
+        because the venue tracks a perpetual's stop as a property of the
+        position. Inherited, that call raised on every trail, got caught, and
+        returned ``False`` — so the venue kept the *first* stop for the life of
+        the position while the local book showed the trailed one. The gap only
+        appears when the engine is down, which is the one case a venue-side
+        stop exists for (invariant 12).
+
+        ``order_id`` is accepted for interface parity and deliberately unused:
+        the position identifies itself.
+        """
+        del order_id
+        return self.place_stop(symbol, 0.0, stop_price, "") is not None
 
     def cancel_stop(self, symbol: str, order_id: str) -> bool:
         """Clear the position's stop by setting it to zero."""

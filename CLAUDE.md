@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 440 test
+.venv/bin/python -m pytest -q             # 449 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -201,6 +201,20 @@ testi oku — hepsinin kendini koruyan bir testi var.
     başlayan motoru bulur; durmuş motorun sağlık kontrolü çalışan motorun pid'ini
     kanıt sayıyordu. İki motoru ayırt edemeyen anahtar, anahtar değildir.
     → `healthcheck.check_process(config_path)`
+64. **Kaydın yönü emrin yönüdür, literal değil.** `Fill.side` `open_position`
+    üzerinden doğrudan `position.side` oluyor: yanlış yön, ters PnL işareti ve
+    girişin yanlış tarafında duran bir stop demek. Aynı şekilde giriş/çıkış
+    ayracı da yön değil, emrin üstündeki **plan**. Spot-yalnız dünyada `Side.BUY`
+    literali tek olasılığı yazdığı için ikisi de doğru görünüyordu.
+    → `Runner._enter`, `_apply_paper_fill`, `_maybe_scale_out`
+65. **Perp'te stop düzenlenmez, üzerine yazılır.** Stop pozisyonun bir özelliği,
+    ayrı bir emir değil — gerçek bir emir id'si yok. Spot'un `edit_order` yolunu
+    miras almak her trailing güncellemesini sessizce no-op yapar ve borsa
+    pozisyonun ömrü boyunca ilk stop'u tutar. → `PerpBroker.amend_stop`
+66. **Borsanın kaldıracı kazanılmış kaldıraçtır.** `risk.max_leverage` ileriye
+    dönük bir yetkilendirme; borsaya kurulan sayı `LeverageGate`'in izin
+    verdiğidir. Aksi halde motor 1x boyutlandırırken hesap 3x'te durur —
+    teminat %100 değil %33 (değişmez 57). → `build_broker`
 
 51. **Kuyruğu kesen her şey pahalıdır.** Kârın tamamı MFE 3R+ gören ~%20'lik
     işlemden geliyor (21 işlem +460, diğer 82 işlem −385). Erken çıkan her
@@ -365,6 +379,32 @@ Dördü de motor çalışırken, borsaya sorarak bulundu. Hiçbiri teste takılm
 Emir kabulü bir makbuz değil; makbuzu ayrıca istemek gerekiyor. Bu üçü birlikte,
 repodaki "ölçüm aracının kendisi ölçülmemiş" serisinin (#24, #40, #52) dördüncü
 üyesi — ve bu kez aracı bozan şey, aracı besleyen verinin hiç var olmamasıydı.
+
+### Sekizinci tur (2026-09-20, `feat/capital-recycling` kod incelemesinde)
+
+Yedisi de kod okunarak bulundu. Hiçbiri teste takılmamıştı, ve hiçbiri bugüne
+kadar ısırmamıştı: **short tarafını açan diff'in kendisi onları erişilebilir
+yaptı.** `fast` motoru başlatılmadığı için hepsi hâlâ ölü daldaydı.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 65 | **Canlı short girişi long olarak kaydediliyordu.** `Fill(side=Side.BUY)` literal; diff emri gerçek `side` ile kuruyor ama kaydı kurmuyor. `open_position` `position.side`'ı fill'den okuyor → PnL işareti ters, stop girişin yanlış tarafında, çıkış koşulu hiç sağlanamaz. Emir doğru gidiyor, **yalnız kaydı yanlış** — mutabakatın karşılaştıracağı iki taraf da bu kayda bakıyor | kritik | `side=side`; kayma da `side.sign` ile ölçülüyor |
+| 66 | **Paper modda her short sessizce düşüyordu.** `_apply_paper_fill` `fill.side is not Side.BUY` ile dönüyordu — bu bir giriş/çıkış ayracıydı ve yalnız her giriş alışken doğruydu. Simülatör dolduruyor ve bakiyeyi oynatıyor, motor hiçbir şey kaydetmiyor: stop yok, çıkış yok, sembol bir sonraki barda yine boş, equity koşunun geri kalanında yanlış. H17'nin ileri testi paper'da başlarsa ölçtüğü şey strateji olmazdı | yüksek | ayraç emrin üstündeki **plan** (`"stop" in meta`); çıkışlar zaten `force_fill_at` ile doluyor, bu yola hiç uğramıyor |
+| 67 | **Perp'te trailing stop borsaya hiç ulaşmıyordu.** `PerpBroker` `place_stop`/`cancel_stop` override ediyor, `amend_stop` etmiyor. `place_stop` gerçek id değil `position:<sembol>` dönüyor; miras alınan `amend_stop` bunu `edit_order`'a veriyor, borsa reddediyor, exception yakalanıyor, `False`. Yerel defter ilerletilmiş stop'u gösterirken borsa pozisyonun ömrü boyunca **ilkini** tutuyordu. Açılan fark tam da sürecin kapalı olduğu anda anlam kazanıyor — borsa tarafı stop'un var olma sebebi (değişmez 12) | yüksek | `amend_stop` override: perp'te stop pozisyonun özelliği, düzenlenmez, **üzerine yazılır** |
+| 68 | **Borsa kaldıracı kazanılmamış tavana kuruluyordu.** `build_broker` `PerpBroker(leverage=config.risk.max_leverage)`; boyutlandırmanın her çağrı yeri ise `gate.allowed_leverage(...)`. `max_leverage: 3.0` ileriye dönük bir yetkilendirme — kapı geçilene dek motor 1x boyutlandırırken hesap 3x'te duruyordu, yani pozisyon %100 değil ~%33 teminatlı. Değişmez 57'nin açık tutmak için var olduğu likidasyon mesafesi | yüksek | borsa ve boyutlandırıcı **aynı sayıyı** okuyor |
+| 69 | **`_resolve_duplicate` okunamayan bakiyede çöküyordu.** Denetim #54 `_balances`'ı `None` dönecek şekilde değiştirdi, iki çağrı yeri güncellendi, bu kaldı: `self._balances("total").get(...)` → `AttributeError`. Yol egzotik değil — yinelenen id'yi üreten şey zaten ağ hıçkırığı, yani burada başarısız olması en muhtemel okuma tam da buna bağlı olan | orta | bar atlanıyor: "hiç tutmuyor" gerçek pozisyonu atar, "tutuyor" olmayanı icat eder |
+| 70 | `RiskConfig.vol_lookback_bars` **iki kez** tanımlıydı (`ge=5`, sonra `ge=10, le=2000`). Sınıf gövdesinde sonraki kazanıyor; ilki ölü koddu — ona yapılan bir düzenleme çalışan motorda hiçbir şeyi değiştirmezdi. Değişmez 50'nin kapattığı "okunuyormuş gibi duran ayar" sınıfı, başka bir kapıdan | düşük | ölü tanım kaldırıldı; sınır testle sabitlendi (yalnız ölü tanım 5'i kabul ediyordu) |
+| 71 | `LeverageGate.evaluate` `min(user_ceiling, 2.0)` ile kısıyordu. Bu literal config sınırının bayat bir kopyasıydı; sınır 3.0'a taşınınca 3x'i açıkça yetkilendirmiş **ve kazanmış** operatör sessizce 2x'te tutulacaktı. `allowed_leverage`'da aynı literal temizlenmiş, kardeşi unutulmuştu — üstelik sayıyı **kalıcılaştıran** çağrı yeri bu, yani kısıtlama onu üreten koşudan sonra da yaşıyordu | düşük | `granted = user_ceiling`; değişmez 8 etkilenmiyor, tavan hâlâ operatörün |
+
+#65–#67 tek kök ve repoda yeni bir sınıf: **ölü dal, canlanana kadar doğru
+görünür.** Üçü de spot-yalnız dünyada bit-bit doğruydu — `Side.BUY` literali
+tek olasılığı yazıyordu, `fill.side` gerçekten giriş/çıkış ayracıydı, `amend_stop`
+gerçek bir id alıyordu. Short'u mümkün kılan diff hiçbirine dokunmadı ve hepsini
+yanlış yaptı. Test paketi 440'ta yeşildi çünkü testler de aynı dünyadan geliyordu.
+
+Bu yüzden yedisinin de artık kendini koruyan bir testi var (448), ve her biri
+fix'i geri alarak **doğrulandı** — denetim #47'nin dersi: tamirin işe yaradığını
+göstermeyen bir test, tamirin kendisi kadar değersiz.
 
 ### Ölçülmüş borsa gerçekleri — linear perpetual (2026-09-20, demo'da emirle)
 

@@ -246,7 +246,6 @@ class RiskConfig(StrictModel):
     # intended size, which then fell below the exchange minimum. The mechanism
     # was not conservative — it was inoperative.
     vol_target_annual: float = Field(default=0.80, gt=0, le=3.0)
-    vol_lookback_bars: int = Field(default=30, ge=5)
     vol_scale_min: float = Field(default=0.4, gt=0, le=1.0)
     vol_scale_max: float = Field(default=2.0, ge=1.0, le=5.0)
     # How many trigger bars the realised-volatility estimate looks back over.

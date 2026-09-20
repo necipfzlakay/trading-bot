@@ -105,6 +105,23 @@ def test_leverage_defaults_to_one_even_though_the_ceiling_is_higher():
     assert RiskConfig().max_leverage == 1.0
 
 
+def test_the_volatility_window_has_exactly_one_definition():
+    """``vol_lookback_bars`` was declared twice in ``RiskConfig``.
+
+    The later declaration wins in a Python class body, so the first one — sat
+    among its neighbours with a ``ge=5`` bound and a stale default — was dead:
+    an edit to it changed nothing in the running engine. That is the same
+    "setting that looks read and is not" class the surrounding ``extra=forbid``
+    work exists to end, arriving through a different door. The bound is what
+    pins it, because only the dead declaration accepted 5.
+    """
+    assert RiskConfig().vol_lookback_bars == 240
+    with pytest.raises(ValidationError):
+        RiskConfig(vol_lookback_bars=5)
+    with pytest.raises(ValidationError):
+        RiskConfig(vol_lookback_bars=5000)
+
+
 def test_zero_slippage_backtest_is_rejected():
     with pytest.raises(ValidationError, match="fiction"):
         Config(mode=Mode.BACKTEST, execution={"slippage_bps": 0.0})

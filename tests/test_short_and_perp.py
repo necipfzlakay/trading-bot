@@ -513,3 +513,360 @@ def test_the_live_scan_carries_allow_short_into_the_scoring_context():
     assert rows[0].regime is Regime.TREND_DOWN
     assert rows[0].best_side is Side.SELL
     assert rows[0].no_trade_reason is not NoTradeReason.REGIME_VETO
+
+
+# --------------------------------------------------------------------------
+# The fill is the record. Its side is not decoration.
+# --------------------------------------------------------------------------
+
+
+def _spec(symbol: str = "SOL/USDT:USDT"):
+    from tbot.core.models import MarketSpec
+
+    return MarketSpec(
+        symbol=symbol,
+        base=symbol.split("/")[0],
+        quote="USDT",
+        min_notional=5.0,
+        min_amount=0.001,
+        amount_step=0.001,
+        price_step=0.01,
+        maker_fee=0.0001,
+        taker_fee=0.0006,
+    )
+
+
+class _Venue:
+    """A live venue that is neither the simulator nor a CCXT broker.
+
+    Enough to take ``_enter`` down its live branch without reaching the
+    exchange-side stop, which ``_place_protective_stop`` skips for anything
+    that is not a :class:`CCXTBroker`.
+    """
+
+    def __init__(self, fill_price: float):
+        self.fill_price = fill_price
+        self.submitted: list = []
+
+    def market_spec(self, symbol: str):
+        return _spec(symbol)
+
+    def build_order(self, **kwargs):
+        from tbot.execution.broker import Broker
+
+        return Broker.build_order(self, **kwargs)
+
+    def submit(self, order):
+        from tbot.core.models import OrderStatus
+
+        order.status = OrderStatus.FILLED
+        order.filled_quantity = order.quantity
+        order.average_price = self.fill_price
+        order.fee_paid = self.fill_price * order.quantity * 0.0006
+        self.submitted.append(order)
+        return order
+
+
+def _live_runner(config, cash: float = 5_000.0):
+    from tbot.engine.runner import Runner
+    from tbot.execution.safety import SlippageTracker
+    from tbot.risk.budget import RiskBudget
+
+    runner = Runner.__new__(Runner)
+    runner.config = config
+    runner.portfolio = Portfolio(starting_cash=cash)
+    runner.risk = RiskBudget(config.risk)
+    runner.risk.state.equity = cash
+    runner.slippage = SlippageTracker(assumed_bps=config.execution.slippage_bps)
+    runner.notifier = None
+    runner._rejections = {}
+    runner.db = type(
+        "D",
+        (),
+        {
+            "order_exists": lambda self, _cid: False,
+            "upsert_order": lambda self, _o: None,
+            "record_fill": lambda self, _f: None,
+            "upsert_position": lambda self, _p: None,
+        },
+    )()
+    runner.watchdog = type("W", (), {"call": lambda self, _n, fn: fn()})()
+    return runner
+
+
+def test_a_live_short_entry_is_recorded_as_a_short():
+    """The ``Fill`` carried ``side=Side.BUY`` as a literal.
+
+    ``Portfolio.open_position`` reads ``position.side`` straight off the fill,
+    so a short opened at the venue became a long in every downstream reading:
+    unrealised PnL with its sign inverted, a stop sitting above an entry the
+    engine believed was a buy, and an exit condition that could never be met.
+    The order itself went out correctly — only the record of it was wrong,
+    which is the kind of divergence nothing reconciles.
+    """
+    from tbot.core.config import Config
+    from tbot.core.models import ScanRow
+
+    config = Config()
+    config.entries.allow_short = True
+    config.entries.require_setup = False
+
+    runner = _live_runner(config)
+    runner.broker = _Venue(fill_price=160.0)
+
+    frames = _downtrend_frames()
+    data = frames["SOL/USDT:USDT"]
+    row = ScanRow(
+        symbol="SOL/USDT:USDT",
+        bar_ts=1_758_300_000_000,
+        regime=Regime.TREND_DOWN,
+        best_side=Side.SELL,
+        score=80.0,
+        threshold=60.0,
+        no_trade_reason=None,
+    )
+
+    assert runner._enter(data, row, bar_ts=1_758_300_000_000) is True
+
+    position = runner.portfolio.positions["SOL/USDT:USDT"]
+    assert position.side is Side.SELL
+    # A short's stop sits above the entry. If the side were wrong this would
+    # still hold numerically while meaning the opposite.
+    assert position.initial_stop > position.entry_price
+
+
+def test_a_paper_short_entry_becomes_a_position():
+    """``_apply_paper_fill`` gated on ``fill.side is not Side.BUY``.
+
+    That was an entry/exit discriminator only for as long as every entry was a
+    buy. Once the scoring could choose SELL, the simulated venue filled the
+    short and moved its balances while the engine recorded nothing: no stop, no
+    exit, the symbol free to re-enter next bar, and equity wrong for the rest
+    of the run. Exits never reach this path — they fill through
+    ``force_fill_at``, which removes the order from ``pending`` — so the plan on
+    the order, not the side, is what marks an entry.
+    """
+    from tbot.core.config import Config
+    from tbot.core.models import Order, OrderType
+
+    config = Config()
+    config.entries.allow_short = True
+
+    runner = _live_runner(config)
+    data = _downtrend_frames()["SOL/USDT:USDT"]
+
+    order = Order(
+        client_id="x",
+        symbol="SOL/USDT:USDT",
+        side=Side.SELL,
+        type=OrderType.MARKET,
+        quantity=2.0,
+        price=None,
+        created_ts=0,
+        updated_ts=0,
+    )
+    order.meta = {
+        "stop": 168.0,
+        "setup": "momentum_decline",
+        "conviction": 80.0,
+        "regime": Regime.TREND_DOWN.value,
+        "risk_amount": 25.0,
+        "planned_entry": 160.0,
+    }
+    fill = Fill(
+        order_client_id="x",
+        symbol="SOL/USDT:USDT",
+        side=Side.SELL,
+        quantity=2.0,
+        price=160.0,
+        fee=0.19,
+        ts=1_758_300_000_000,
+    )
+
+    runner._apply_paper_fill(fill, order, data, bar_ts=1_758_300_000_000)
+
+    position = runner.portfolio.positions["SOL/USDT:USDT"]
+    assert position.side is Side.SELL
+    assert position.initial_stop > position.entry_price
+
+
+def test_scaling_out_of_a_short_is_recorded_as_a_buy_to_cover():
+    """The order was built with ``position.side.opposite`` and the ``Fill``
+    with a literal ``Side.SELL``. Reducing a short is a buy, so the fills table
+    gained a sale that never happened in that direction — and the fills table
+    is what every audit of a disputed trade is reconstructed from.
+    """
+    from tbot.core.config import Config
+    from tbot.core.models import OrderStatus
+
+    config = Config()
+    config.exits.scale_out_at_r = 1.0
+
+    runner = _live_runner(config)
+    runner.broker = _Venue(fill_price=140.0)
+    runner.exits = ExitManager(config=config.exits)
+    recorded: list[Fill] = []
+    runner.db = type(
+        "D",
+        (),
+        {
+            "upsert_order": lambda self, _o: None,
+            "record_fill": lambda self, f: recorded.append(f),
+            "upsert_position": lambda self, _p: None,
+        },
+    )()
+
+    position = Position(
+        symbol="SOL/USDT:USDT",
+        side=Side.SELL,
+        quantity=2.0,
+        entry_price=160.0,
+        entry_ts=0,
+        initial_stop=168.0,
+        current_stop=168.0,
+        setup="momentum_decline",
+        risk_amount=16.0,
+        meta={"original_quantity": 2.0},
+    )
+    runner.portfolio.positions[position.symbol] = position
+
+    # Price has run 1R in the short's favour, which is what arms the scale-out.
+    runner._maybe_scale_out(position, high=152.0, low=151.0, bar_ts=1)
+
+    assert recorded, "the scale-out did not execute"
+    assert recorded[-1].side is Side.BUY
+    assert runner.broker.submitted[-1].side is Side.BUY
+    assert runner.broker.submitted[-1].status is OrderStatus.FILLED
+
+
+# --------------------------------------------------------------------------
+# A stop the venue holds is only worth the level it currently holds
+# --------------------------------------------------------------------------
+
+
+def test_the_perp_trailing_stop_actually_reaches_the_venue():
+    """``PerpBroker`` overrode ``place_stop`` but not ``amend_stop``.
+
+    Its ``place_stop`` returns ``position:<symbol>`` rather than an order id,
+    because the venue tracks a perpetual's stop as a property of the position.
+    The inherited ``amend_stop`` called ``edit_order`` against that string, the
+    venue refused, the exception was caught and ``False`` returned — so the
+    local book showed a trailed stop while the venue kept the original one for
+    the life of the position. The gap opens exactly when this process is down,
+    which is the only reason a venue-side stop exists (invariant 12).
+    """
+    from tbot.core.models import Venue
+    from tbot.execution.ccxt_broker import PerpBroker
+
+    sent: list[dict] = []
+
+    class Exchange:
+        def price_to_precision(self, _symbol, price):
+            return str(price)
+
+        def privatePostV5PositionTradingStop(self, params):
+            sent.append(params)
+            return {"retCode": 0}
+
+    broker = PerpBroker.__new__(PerpBroker)
+    broker.exchange = Exchange()
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {}
+
+    order_id = broker.place_stop("SOL/USDT:USDT", 2.0, 150.0, "cid")
+    assert order_id == "position:SOLUSDT"
+
+    # The trail ratchets the stop up. This is the call that used to be a no-op.
+    assert broker.amend_stop("SOL/USDT:USDT", order_id, 155.0) is True
+    assert sent[-1]["stopLoss"] == "155.0"
+    assert sent[-1]["symbol"] == "SOLUSDT"
+
+
+def test_the_venue_is_set_to_the_earned_leverage_not_the_operator_ceiling():
+    """``risk.max_leverage`` is a forward authorisation, not a permission.
+
+    Every sizing call site asks ``LeverageGate.allowed_leverage``, which stays
+    at 1.0 until 90 days, 100 trades, PF >= 1.3 and drawdown < 15% are on
+    record. ``build_broker`` handed the venue the raw ceiling instead, so an
+    operator who had written ``max_leverage: 3.0`` in advance ran an account
+    set to 3x while the engine sized as if at 1x — a position roughly 33%
+    collateralised where the risk model assumes 100%, which is the liquidation
+    distance invariant 57 exists to hold open.
+    """
+    from tbot.core.config import Config, Mode
+    from tbot.engine import runner as runner_module
+
+    config = Config()
+    config.mode = Mode.LIVE
+    config.execution.market_type = "linear"
+    config.risk.max_leverage = 3.0
+
+    seen: dict = {}
+
+    class FakePerp:
+        def __init__(self, *_args, **kwargs):
+            seen.update(kwargs)
+
+        def load_markets(self):
+            return None
+
+        def refresh_fees(self, _symbols):
+            return None
+
+        def assert_venue_ready(self, _symbols):
+            return None
+
+    original = runner_module.PerpBroker
+    runner_module.PerpBroker = FakePerp
+    try:
+        secrets = type("S", (), {"credentials_for": lambda self, _v: ("k", "s")})()
+        runner_module.build_broker(config, secrets, ["SOL/USDT:USDT"])
+    finally:
+        runner_module.PerpBroker = original
+
+    # No promotion record exists, so nothing has been earned.
+    assert seen["leverage"] == 1.0
+
+
+def test_a_duplicate_id_is_not_resolved_against_a_venue_that_cannot_be_read():
+    """``_balances`` returns ``None`` on a failed read, and this call site
+    assumed a dict.
+
+    The path is not exotic: a network hiccup is what makes the venue keep an
+    order the engine did not record, which is what produces the duplicate id in
+    the first place — so the read most likely to fail here is the one this
+    depends on. It raised ``AttributeError`` out of ``submit``. Reading the
+    failure as "holds nothing" would discard a real position and reading it as
+    "holds it" would invent one, so the bar is skipped instead: the next one
+    carries a different ``bar_ts`` and a fresh id.
+    """
+    from tbot.core.models import Order, OrderStatus, OrderType, Venue
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {}
+    broker._find_in_history = lambda _s, _c: {
+        "orderStatus": "Filled",
+        "cumExecQty": "1.31",
+    }
+    broker._balances = lambda _kind: None
+
+    order = Order(
+        client_id="cid",
+        symbol="VVV/USDT",
+        side=Side.BUY,
+        type=OrderType.MARKET,
+        quantity=1.31,
+        price=None,
+        created_ts=0,
+        updated_ts=0,
+    )
+    resolved = broker._resolve_duplicate(order, 1.31, None, {})
+
+    assert resolved.status is OrderStatus.REJECTED
+    assert "balance read failed" in resolved.reject_reason

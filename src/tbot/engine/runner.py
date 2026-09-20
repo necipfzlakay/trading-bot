@@ -674,7 +674,16 @@ class Runner:
         Entry plans travel on the order's ``meta`` rather than being recomputed,
         so the position that opens is the one that was scored and sized.
         """
-        if order is None or fill.side is not Side.BUY or not order.meta:
+        # What makes this an *entry* is the plan on the order, not its side.
+        # The guard used to read ``fill.side is not Side.BUY``, which was an
+        # entry/exit discriminator only while every entry was a buy. Once the
+        # scoring could choose SELL, every paper short was dropped here: the
+        # simulated venue filled it and moved its balances, but no position was
+        # ever recorded, so nothing stopped it, nothing exited it, the symbol
+        # looked free to re-enter, and equity was wrong for the rest of the run.
+        # Exits never reach this path anyway — they fill through
+        # ``force_fill_at``, which takes the order out of ``pending``.
+        if order is None or not order.meta or "stop" not in order.meta:
             return
         if self.portfolio.has_position(fill.symbol):
             return
@@ -711,7 +720,7 @@ class Runner:
         if self.notifier and self.config.telegram.notify_fills:
             self.notifier.notify_entry(
                 fill.symbol,
-                "buy",
+                "buy" if fill.side is Side.BUY else "sell",
                 fill.price,
                 fill.quantity,
                 stop,
@@ -1195,10 +1204,13 @@ class Runner:
             fill_price, filled = self._fill_terms(
                 submitted, plan.price, wanted, "scale_out"
             )
+            # Same side the order was built with. Scaling out of a short is a
+            # buy-to-cover; writing SELL here would put a trade in the fills
+            # table that never happened in that direction.
             fill = Fill(
                 order_client_id=submitted.client_id,
                 symbol=position.symbol,
-                side=Side.SELL,
+                side=position.side.opposite,
                 quantity=filled,
                 price=fill_price,
                 fee=submitted.fee_paid,
@@ -1666,10 +1678,16 @@ class Runner:
                 row.no_trade_reason = NoTradeReason.MIN_NOTIONAL
                 return False
 
+        # The order's own side, never a literal. ``Portfolio.open_position``
+        # takes ``position.side`` straight off this fill, so a short recorded
+        # as a buy is a short the rest of the engine treats as a long: PnL sign
+        # inverted, stop on the wrong side of the entry, exits that can never
+        # trigger. The literal was harmless only while spot made BUY the sole
+        # possibility.
         fill = Fill(
             order_client_id=submitted.client_id,
             symbol=row.symbol,
-            side=Side.BUY,
+            side=side,
             quantity=filled,
             price=fill_price,
             fee=submitted.fee_paid,
@@ -1677,7 +1695,9 @@ class Runner:
         )
         self.db.record_fill(fill)
 
-        drift = self.slippage.record(price, fill_price, side_sign=1)
+        # Slippage is "worse than expected", and worse means the opposite
+        # direction for a seller.
+        drift = self.slippage.record(price, fill_price, side_sign=side.sign)
         if self.slippage.exceeds_assumption():
             log.warning(
                 "slippage_worse_than_assumed",
@@ -1718,7 +1738,7 @@ class Runner:
         if self.notifier and self.config.telegram.notify_fills:
             self.notifier.notify_entry(
                 row.symbol,
-                "buy",
+                "buy" if side is Side.BUY else "sell",
                 fill_price,
                 fill.quantity,
                 actual_stop,
@@ -2701,13 +2721,23 @@ def build_broker(config: Config, secrets: Secrets, symbols: list[str]) -> Broker
 
     key, secret = secrets.credentials_for(config.venue)
     if config.execution.market_type == "linear":
+        # The *earned* leverage, not the operator's ceiling. ``max_leverage`` is
+        # a forward authorisation — config alone can raise it, and every sizing
+        # call site asks the gate what is actually allowed, which is 1.0 until
+        # 90 days, 100 trades, PF >= 1.3 and drawdown < 15% are on record.
+        # Handing the raw ceiling to the venue set the account to 3x while the
+        # engine sized as if at 1x, leaving the position ~33% collateralised
+        # instead of 100% — the exact liquidation distance invariant 57 exists
+        # to hold open. The venue and the sizer must read the same number.
         perp = PerpBroker(
             key,
             secret,
             config.venue,
             config.quote_currency,
             margin_mode=config.execution.margin_mode,
-            leverage=config.risk.max_leverage,
+            leverage=LeverageGate(config.promotion_path).allowed_leverage(
+                config.risk.max_leverage
+            ),
         )
         perp.load_markets()
         perp.refresh_fees(symbols)

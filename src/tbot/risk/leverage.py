@@ -100,9 +100,15 @@ class LeverageGate:
             failures.append("no out-of-sample validation on record")
 
         eligible = not failures
-        # Even a clean sheet cannot exceed the operator's ceiling. This min() is
-        # the line that keeps the decision theirs.
-        granted = min(user_ceiling, 2.0) if eligible else 1.0
+        # Even a clean sheet cannot exceed the operator's ceiling, and it is the
+        # only bound that belongs here. The literal 2.0 that used to sit beside
+        # it was a stale copy of the config bound; once that bound moved to 3.0
+        # an operator who had explicitly authorised 3x would have been capped at
+        # 2x with nothing saying so — and this is the call site that *persists*
+        # the number, so the silent cap outlived the run that made it.
+        # Invariant 8 is untouched: the ceiling is still theirs, and still a
+        # ceiling.
+        granted = user_ceiling if eligible else 1.0
 
         status = PromotionStatus(
             eligible=eligible,

@@ -297,6 +297,31 @@ def test_leverage_gate_grants_only_up_to_the_operator_ceiling(tmp_path):
     assert gate.allowed_leverage(1.5) == 1.5
 
 
+def test_the_gate_grants_the_whole_ceiling_the_operator_authorised(tmp_path):
+    """``evaluate`` clamped the grant with a hardcoded 2.0.
+
+    That literal was a stale copy of the config bound. When the bound moved to
+    3.0, an operator who had explicitly authorised 3x — and then earned it —
+    was silently held at 2x, with nothing in the record saying why. This is the
+    call site that *persists* the number, so the cap outlived the run that made
+    it. ``allowed_leverage`` had the same literal removed; this is its sibling.
+    """
+    gate = LeverageGate(tmp_path / "promotion.json")
+    status = gate.evaluate(
+        first_trade_ts=0,
+        trades=150,
+        profit_factor=1.6,
+        expectancy_r=0.25,
+        max_drawdown=0.09,
+        oos_validated=True,
+        user_ceiling=3.0,
+        now=200 * 86_400_000,
+    )
+    assert status.eligible
+    assert status.granted_leverage == 3.0
+    assert gate.allowed_leverage(3.0) == 3.0
+
+
 def test_passing_the_gate_cannot_raise_leverage_above_a_one_x_ceiling(tmp_path):
     gate = LeverageGate(tmp_path / "promotion.json")
     gate.evaluate(
