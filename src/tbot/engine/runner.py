@@ -50,6 +50,7 @@ from tbot.core.models import (
     Fill,
     Mode,
     NoTradeReason,
+    Order,
     OrderStatus,
     OrderType,
     Regime,
@@ -1191,13 +1192,15 @@ class Runner:
                     reason=getattr(submitted, "reject_reason", "no response"),
                 )
                 return
-            filled = submitted.filled_quantity or wanted
+            fill_price, filled = self._fill_terms(
+                submitted, plan.price, wanted, "scale_out"
+            )
             fill = Fill(
                 order_client_id=submitted.client_id,
                 symbol=position.symbol,
                 side=Side.SELL,
                 quantity=filled,
-                price=submitted.average_price or plan.price,
+                price=fill_price,
                 fee=submitted.fee_paid,
                 ts=bar_ts,
             )
@@ -1635,8 +1638,7 @@ class Runner:
             )
             return True
 
-        fill_price = submitted.average_price or price
-        filled = submitted.filled_quantity or sizing.quantity
+        fill_price, filled = self._fill_terms(submitted, price, sizing.quantity, "entry")
 
         # A market order on a thin book can come back partially filled. Record
         # what actually filled, not what was asked for — carrying the requested
@@ -1957,6 +1959,36 @@ class Runner:
                 str(armed["setup"]),
             )
 
+    def _fill_terms(
+        self, submitted: Order, planned_price: float, planned_quantity: float, stage: str
+    ) -> tuple[float, float]:
+        """What the order actually transacted at, or the plan and a warning.
+
+        The venue is the only authority on the price paid and the size filled.
+        These used to fall back to the request silently (``average_price or
+        price``), which is not a conservative default but a wrong one: it wrote
+        the price the engine *intended* to pay into the column that every R,
+        MAE and MFE is measured from, and it fed the slippage monitor a drift of
+        exactly zero, so the monitor could never fire. ``CCXTBroker._settle``
+        now fills these in from the venue; the fallback stays for the case where
+        that lookup itself failed, and says so when it is used.
+        """
+        price = submitted.average_price
+        quantity = submitted.filled_quantity
+        if price > 0.0 and quantity > 0.0:
+            return price, quantity
+        log.warning(
+            "fill_terms_unknown",
+            symbol=submitted.symbol,
+            stage=stage,
+            status=submitted.status.value,
+            consequence=(
+                "recorded at the requested price and size; slippage and fees "
+                "are unmeasured for this order"
+            ),
+        )
+        return (price or planned_price), (quantity or planned_quantity)
+
     def _record_rejection(self, symbol: str, order) -> None:
         """Count venue refusals and stop retrying a symbol that always fails."""
         count = self._rejections.get(symbol, 0) + 1
@@ -2134,6 +2166,9 @@ class Runner:
             order_type=OrderType.MARKET,
             reduce_only=True,
         )
+        # Zero means "the venue never told us", not "it was free" — the
+        # assumed rate below stands in only for that case.
+        charged = 0.0
         if isinstance(self.broker, PaperBroker):
             # A stop is a resting instruction: it executes where it triggers.
             # Deferring it to the next open understates losses on exactly the
@@ -2142,15 +2177,30 @@ class Runner:
             self.db.record_fill(fill)
             self.db.upsert_order(order)
             price = fill.price
+            charged = fill.fee
         else:
             self._cancel_protective_stop(symbol)
             submitted = self.watchdog.call("submit_exit", lambda: self.broker.submit(order))
             if submitted is not None:
                 self.db.upsert_order(submitted)
-                price = submitted.average_price or price
+                price, quantity = self._fill_terms(
+                    submitted, price, position.quantity, "exit"
+                )
+                charged = submitted.fee_paid
+                self.db.record_fill(
+                    Fill(
+                        order_client_id=submitted.client_id,
+                        symbol=symbol,
+                        side=position.side.opposite,
+                        quantity=quantity,
+                        price=price,
+                        fee=charged,
+                        ts=bar_ts,
+                    )
+                )
 
         spec = self.broker.market_spec(symbol)
-        fee = price * position.quantity * spec.taker_fee
+        fee = charged if charged > 0.0 else price * position.quantity * spec.taker_fee
         closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
         trade = self.portfolio.close_position(
             symbol, price, bar_ts, reason or ExitReason.TRAILING_STOP, fee

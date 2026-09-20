@@ -46,18 +46,32 @@ _STATUS_MAP = {
 }
 
 
-def _order_state(raw: dict) -> dict[str, float | str]:
-    """One v5 order reduced to the three things a caller ever acts on."""
-    filled = float(raw.get("cumExecQty") or 0.0)
+def _number(raw: dict, key: str) -> float:
     try:
-        average = float(raw.get("avgPrice") or 0.0)
+        return float(raw.get(key) or 0.0)
     except (TypeError, ValueError):
-        average = 0.0
+        return 0.0
+
+
+def _order_state(raw: dict) -> dict[str, float | str]:
+    """One v5 order reduced to the things a caller ever acts on."""
+    filled = _number(raw, "cumExecQty")
+    value = _number(raw, "cumExecValue")
+    average = _number(raw, "avgPrice")
+    # ``avgPrice`` comes back empty on some terminal orders while the executed
+    # value is always present. Deriving it keeps a settled order from reporting
+    # a price of zero, which downstream reads as "no fill".
+    if average <= 0.0 and filled > 0.0:
+        average = value / filled
     status = str(raw.get("orderStatus") or "")
     return {
         "status": status,
         "filled": filled,
         "average_price": average,
+        "value": value,
+        # Raw, in whatever currency the venue charged it — see ``_fee_in_quote``.
+        "fee": _number(raw, "cumExecFee"),
+        "side": str(raw.get("side") or ""),
         # Bybit spells a cancelled conditional order "Deactivated"; treating
         # that as a fill would invent an exit that never happened.
         "terminal": status
@@ -231,7 +245,115 @@ class CCXTBroker(Broker):
             log.error("order_rejected", symbol=order.symbol, error=str(exc)[:200])
             return order
 
-        return self._merge(order, response)
+        return self._settle(self._merge(order, response))
+
+    # A market order fills at once, but the reply that acknowledges it does not
+    # say so. These bound how long the truth is worth waiting for.
+    _SETTLE_ATTEMPTS = 5
+    _SETTLE_PAUSE_S = 0.25
+
+    def _settle(self, order: Order) -> Order:
+        """Replace an accepted market order's blanks with what the venue did.
+
+        Bybit's create-order reply carries an id and a status and nothing else:
+        no executed quantity, no average price, no fee. ``_merge`` therefore
+        leaves ``filled_quantity``, ``average_price`` and ``fee_paid`` at zero,
+        and every caller that reads them falls through to what it *asked* for.
+        That is how the engine came to record the planned entry as the price
+        paid, leave filled entries sitting at ``open`` forever, and hand the
+        slippage monitor a drift of exactly zero on every trade — the monitor
+        could not have fired whatever the venue charged.
+
+        Only market orders are settled. A limit or stop-entry order is supposed
+        to rest unfilled, and polling one would just burn requests.
+        """
+        if order.type is not OrderType.MARKET:
+            return order
+        if order.status in (OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.CANCELED):
+            return order
+        if not order.exchange_id:
+            return order
+        if order.filled_quantity > 0.0 and order.average_price > 0.0:
+            return order  # the reply was complete for once; nothing to ask
+
+        state: dict[str, float | str] | None = None
+        for attempt in range(self._SETTLE_ATTEMPTS):
+            state = self.order_state(order.symbol, order.exchange_id)
+            if state and float(state.get("filled") or 0.0) > 0.0:
+                break
+            if state and state.get("terminal"):
+                break
+            if attempt + 1 < self._SETTLE_ATTEMPTS:
+                time.sleep(self._SETTLE_PAUSE_S)
+
+        if state is None:
+            # Unknown is not zero. Leaving the order as the venue accepted it
+            # keeps the caller's own fallback in play; claiming a zero fill here
+            # would report an order that filled as one that did not.
+            log.warning(
+                "order_settle_failed",
+                symbol=order.symbol,
+                client_id=order.client_id,
+                consequence="fill price falls back to the requested price",
+            )
+            return order
+
+        filled = float(state.get("filled") or 0.0)
+        average = float(state.get("average_price") or 0.0)
+        if filled <= 0.0 or average <= 0.0:
+            log.warning(
+                "order_settle_empty",
+                symbol=order.symbol,
+                client_id=order.client_id,
+                status=state.get("status"),
+                consequence="fill price falls back to the requested price",
+            )
+            return order
+
+        order.filled_quantity = filled
+        order.average_price = average
+        order.fee_paid = self._fee_in_quote(order, state)
+        if state.get("status") == "Filled":
+            order.status = OrderStatus.FILLED
+        elif str(state.get("status") or "") == "PartiallyFilled":
+            order.status = OrderStatus.PARTIALLY_FILLED
+        order.updated_ts = now_ms()
+        return order
+
+    def _fee_in_quote(self, order: Order, state: dict[str, float | str]) -> float:
+        """``cumExecFee`` converted to the quote currency the ledger counts in.
+
+        Bybit charges a spot **buy** in the base asset — the same fact that
+        forces the stop quantity to be clamped (``_sellable``) — and everything
+        else in the quote. Recording the raw number would put 0.00131 VVV in a
+        column that means dollars.
+
+        Measured on demo: a 1.31 VVV buy reports ``cumExecFee`` 0.00131 against
+        ``cumExecValue`` 34.16, i.e. the fee is base-denominated and one tenth
+        of a percent of the quantity.
+        """
+        fee = float(state.get("fee") or 0.0)
+        if fee <= 0.0:
+            return 0.0
+        value = float(state.get("value") or 0.0) or (order.filled_quantity * order.average_price)
+        if self.category == "spot" and order.side is Side.BUY:
+            fee *= order.average_price
+
+        # A fee larger than a hundredth of the notional means the currency was
+        # read wrong, and a wrong fee is worse than a missing one: it lands in
+        # realised PnL where nothing else would ever contradict it.
+        if value > 0.0 and fee > value * 0.01:
+            spec = self.market_spec(order.symbol)
+            log.warning(
+                "fee_currency_implausible",
+                symbol=order.symbol,
+                raw_fee=state.get("fee"),
+                converted=fee,
+                value=value,
+                action="using the assumed taker rate instead",
+            )
+            return value * spec.taker_fee
+        return fee
 
     def _resolve_duplicate(self, order: Order, amount: float, price, params: dict) -> Order:
         """The venue already knows this client id. Find out what became of it.
@@ -315,7 +437,9 @@ class CCXTBroker(Broker):
             return order
 
         order.client_id = retry_id
-        return self._merge(order, response)
+        # Same empty acknowledgement as any other create call, so the same
+        # follow-up question is owed.
+        return self._settle(self._merge(order, response))
 
     def _find_in_history(self, symbol: str, client_id: str) -> dict | None:
         """The order's final state, including terminal ones open-order calls hide."""

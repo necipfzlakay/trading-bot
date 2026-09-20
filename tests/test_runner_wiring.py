@@ -7,6 +7,7 @@ corresponds to something that was silently doing nothing.
 
 import json
 
+import ccxt
 import pytest
 
 from tbot.core.models import (
@@ -1069,6 +1070,185 @@ def test_no_notification_path_is_defined_but_never_called():
         f"advertises and the engine never sends is a promise the operator "
         f"relies on and does not get."
     )
+
+
+# --------------------------------------------------------------------------
+# A market order's terms come from the venue, never from the request
+# --------------------------------------------------------------------------
+
+
+def _settling_exchange(history_row: dict, create_reply: dict | None = None):
+    """A Bybit stand-in whose create reply is as empty as the real one."""
+
+    class Exchange:
+        def __init__(self):
+            self.realtime_calls = []
+
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.5f}"
+
+        def price_to_precision(self, symbol, price):
+            return f"{price:.4f}"
+
+        def fetch_open_orders(self, symbol):
+            return []
+
+        def create_order(self, **kwargs):
+            # This is the whole bug in one line: the venue acknowledges the
+            # order with an id and a status, and says nothing about the fill.
+            return create_reply if create_reply is not None else {"id": "ex-1", "status": "open"}
+
+        def privateGetV5OrderRealtime(self, params):
+            self.realtime_calls.append(params)
+            return {"result": {"list": [history_row]}}
+
+        def privateGetV5OrderHistory(self, params):
+            return {"result": {"list": [history_row]}}
+
+    return Exchange()
+
+
+def _market_order(symbol="VVV/USDT", quantity=1.31):
+    from tbot.core.models import Order, OrderType, Side
+
+    return Order(
+        client_id="tb-vvv-entr-test",
+        symbol=symbol,
+        side=Side.BUY,
+        type=OrderType.MARKET,
+        quantity=quantity,
+        price=None,
+    )
+
+
+def _settling_broker(exchange):
+    """A spot broker whose settle polling does not sleep."""
+    from tbot.core.models import MarketSpec
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = exchange
+    broker.quote = "USDT"
+    broker.load_markets = lambda: None
+    broker._SETTLE_PAUSE_S = 0.0
+    spec = MarketSpec(
+        symbol="VVV/USDT",
+        base="VVV",
+        quote="USDT",
+        min_notional=5.0,
+        min_amount=0.01,
+        amount_step=0.00001,
+        price_step=0.0001,
+        maker_fee=0.0001,
+        taker_fee=0.0006,
+    )
+    broker.market_spec = lambda symbol: spec
+    broker._specs = {"VVV/USDT": spec}
+    return broker
+
+
+def test_market_order_records_the_price_paid_not_the_price_planned():
+    """The create-order reply carries no fill, so the order must be settled.
+
+    Measured on demo: a market buy acknowledged as ``{"id": ..., "status":
+    "open"}`` had in fact filled 1.31 at 26.078 while the engine recorded
+    26.171 — the price it *asked* for. Every R, MAE and MFE is measured from
+    that column, and the slippage monitor was handed a drift of exactly zero
+    on every trade, so it could never have fired.
+    """
+    exchange = _settling_exchange(
+        {
+            "orderId": "ex-1",
+            "orderLinkId": "tb-vvv-entr-test",
+            "orderStatus": "Filled",
+            "cumExecQty": "1.31",
+            "cumExecValue": "34.16218",
+            "cumExecFee": "0.00131",
+            "avgPrice": "26.078",
+            "side": "Buy",
+        }
+    )
+    broker = _settling_broker(exchange)
+
+    submitted = broker.submit(_market_order())
+
+    assert submitted.average_price == pytest.approx(26.078)
+    assert submitted.filled_quantity == pytest.approx(1.31)
+    assert submitted.status.value == "filled"
+
+
+def test_spot_buy_fee_is_converted_out_of_the_base_asset():
+    """Bybit charges a spot buy in the base coin; the ledger counts in quote.
+
+    0.00131 VVV against a 34.16 USDT fill is 0.034 USDT, not 0.00131. Writing
+    the raw number into a dollar column understates the round trip by roughly
+    the whole commission — invariant 23's other half.
+    """
+    exchange = _settling_exchange(
+        {
+            "orderId": "ex-1",
+            "orderLinkId": "tb-vvv-entr-test",
+            "orderStatus": "Filled",
+            "cumExecQty": "1.31",
+            "cumExecValue": "34.16218",
+            "cumExecFee": "0.00131",
+            "avgPrice": "26.078",
+            "side": "Buy",
+        }
+    )
+    submitted = _settling_broker(exchange).submit(_market_order())
+
+    assert submitted.fee_paid == pytest.approx(0.00131 * 26.078)
+
+
+def test_settlement_leaves_the_order_alone_when_the_venue_cannot_be_read():
+    """Unknown is not zero: an unreadable venue must not report a zero fill."""
+    from tbot.core.models import OrderStatus
+
+    class Blind:
+        def amount_to_precision(self, symbol, amount):
+            return f"{amount:.5f}"
+
+        def price_to_precision(self, symbol, price):
+            return f"{price:.4f}"
+
+        def fetch_open_orders(self, symbol):
+            return []
+
+        def create_order(self, **kwargs):
+            return {"id": "ex-1", "status": "open"}
+
+        def privateGetV5OrderRealtime(self, params):
+            raise ccxt.BaseError("network")
+
+        def privateGetV5OrderHistory(self, params):
+            raise ccxt.BaseError("network")
+
+    submitted = _settling_broker(Blind()).submit(_market_order())
+
+    assert submitted.filled_quantity == 0.0
+    assert submitted.average_price == 0.0
+    assert submitted.status is OrderStatus.OPEN
+
+
+def test_limit_orders_are_not_settled():
+    """A resting order is supposed to be unfilled; polling one burns requests."""
+    from tbot.core.models import Order, OrderType, Side
+
+    exchange = _settling_exchange({"orderId": "ex-1", "orderStatus": "New"})
+    broker = _settling_broker(exchange)
+    order = Order(
+        client_id="tb-vvv-limit-test",
+        symbol="VVV/USDT",
+        side=Side.BUY,
+        type=OrderType.LIMIT,
+        quantity=1.31,
+        price=26.0,
+    )
+
+    broker.submit(order)
+
+    assert exchange.realtime_calls == [], "a limit order must not be polled for a fill"
 
 
 def test_perp_order_lookups_use_the_linear_category():
