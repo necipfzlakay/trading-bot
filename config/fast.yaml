@@ -1,0 +1,94 @@
+# Bot #2 — "fast": kısa vadeli, iki yönlü, linear perpetual.
+#
+# Ana motor (config/demo.yaml) hiç değişmeden çalışmaya devam eder. Bu dosya
+# ayrı bir süreç, ayrı bir runtime dizini ve ayrı bir emir isim alanı tanımlar;
+# aynı Bybit demo hesabını paylaşırlar.
+#
+# extends TEK SEVİYE takip edilir (core/config.py:_deep_merge çağrısı parent'ın
+# kendi extends'ini atar), o yüzden mode/venue burada yeniden yazılmak zorunda.
+extends: base.yaml
+
+mode: live
+venue: bybit-demo
+
+# Her şey ayrı: tbot.db, state.json, logs/, reports/, engine.lock, command.json.
+# Tek anahtar hepsini taşır (core/config.py:runtime_dir'den türeyen property'ler).
+runtime_dir: runtime-fast
+
+engine:
+  # İki karakteri her client order id'ye giriyor. Bu olmadan iki motor aynı
+  # sembol ve bar için BİREBİR aynı id üretir ve ikincisi birincinin emrini
+  # kendi emri sanıp benimser — cross_sectional modda her ikisi de
+  # strategy="ranked_entry" ürettiği için çakışma kesin.
+  namespace: fast
+
+web:
+  port: 8788 # ana panel 8787'de
+
+telegram:
+  # Telegram'ın getUpdates offset'i token başına. İki motor aynı token'ı
+  # paylaşırsa komutları birbirinden çalar. İkinci bir bot token'ı açılana
+  # kadar bu motor sessiz.
+  enabled: false
+
+universe:
+  symbols: [] # runtime-fast/universe.json'dan, category=linear ile seçilir
+  # 30 -> 100. Kurulum kapısı adayların %99.1'ini eliyor ve bu sembol başına
+  # bağımsız bir olay, yani daha çok sembol doğrudan daha çok işlem demek —
+  # daha hızlı bar değil (değişmez kural 58: 5m'de gereken isabet %48.9).
+  #
+  # Bedeli ölçüldü: 20M eşiğinde 53 sembol / medyan spread 1.25bps, 5M'de
+  # 114 sembol / 2.38bps. Yani 1.2 baz puan, %70'lik gidiş-dönüş maliyetin
+  # %1.7'si. Kesitsel sıralama da daha seçici oluyor: üst desil 30 sembolde
+  # 3 iken 100'de 10, yani aday havuzu güçleniyor.
+  #
+  # Bot #1'in evreni KASITLI olarak değişmedi: orası backtest'inin ölçtüğü
+  # evren ve ortasında genişletmek hem ileri testi kirletir hem deneme harcar.
+  auto_top_n: 100
+  min_volume_24h_usd: 5000000
+  min_history_days: 540
+
+data:
+  parquet_dir: runtime-fast/data # perp fiyatları spot arşiviyle karışmaz
+
+execution:
+  market_type: linear
+  margin_mode: isolated
+  # Borsadan okundu (research/perp_venue_facts.md): perp taker %0.06,
+  # maker %0.01. Spot'ta ikisi de %0.10 idi. Gerçekçi gidiş-dönüş maker
+  # giriş + taker çıkış = %0.07, çünkü stop tanımı gereği taker.
+  assumed_taker_fee: 0.0006
+  assumed_maker_fee: 0.0001
+
+risk:
+  # SERT sermaye tavanı. Borsadaki bakiye ne derse desin bu motor $300 üstünden
+  # boyutlandırır. UTA cüzdanı paylaşıldığı için (ölçüldü: perp komisyonu spot
+  # motorun boyutlandırdığı USDT'den düşüyor) bu tavan olmadan iki motor da
+  # aynı $1000'i kendi sermayesi sayardı.
+  max_capital: 300.0
+  risk_per_trade: 0.012
+  max_positions: 3
+  # Operatör 3.0'a kadar yetki verdi ve tavan öyle kayıtlı (core/config.py).
+  # Kullanılan değer 1.0: kaldıraç beklentiyi çarpar, işaretini değiştirmez —
+  # ve ölçülen beklenti negatif. 1x'te pozisyon %100 teminatlı, short
+  # likidasyonu %99 uzakta; 3x'te %33'e iner.
+  max_leverage: 1.0
+
+entries:
+  # Kesitsel sıralamanın altını short'la. Bugüne kadar yalnız üst ucu
+  # kullanıldı çünkü spot açığa satamıyor. H17'nin test ettiği tek yeni şey bu.
+  allow_short: true
+
+exits:
+  # Ölçülen 2:1 bariyer şekli (research/short_term_feasibility.md, grid).
+  initial_stop_atr_mult: 1.0
+  target_atr_mult: 2.0
+  # Trail tetik zaman diliminden: ana motor 'permission' kullanıyor çünkü
+  # haftalarca tutuyor. Bu motor saatler-günler tutuyor.
+  trail_timeframe: trigger
+  # Sermaye devri. Ana motorda 0 (değişmez kural 51: kuyruğu kesen her şey
+  # pahalı). Burada kasıtlı olarak açık — hedefe de stop'a da değmemiş bir
+  # pozisyon 48 bar sonra bir slotu hiçbir şeyde haklı çıkmadan tutuyor.
+  time_stop_bars: 48
+  # Kısmi kâr alma kapalı kalıyor: ölçüldü, PF 1.19 -> 1.12 (denetim #51).
+  scale_out_at_r: 0.0

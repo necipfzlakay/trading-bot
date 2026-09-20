@@ -33,6 +33,9 @@ class Portfolio:
     trades: list[Trade] = field(default_factory=list)
     equity_curve: list[EquityPoint] = field(default_factory=list)
     peak_equity: float = 0.0
+    # Scratch for close_position: what the venue hands back, which differs by
+    # side. Declared because the class uses __slots__.
+    _returned: float = 0.0
 
     def __post_init__(self) -> None:
         if self.cash == 0.0:
@@ -124,7 +127,12 @@ class Portfolio:
         position.meta["scaled_quantity"] = (
             float(position.meta.get("scaled_quantity", 0.0)) + quantity
         )
-        self.cash += price * quantity - fee
+        # Same asymmetry as a full close: a long banks the sale, a short
+        # releases the slice of margin it posted plus that slice's result.
+        if position.side is Side.BUY:
+            self.cash += price * quantity - fee
+        else:
+            self.cash += position.entry_price * quantity + gross - fee
         return quantity
 
     def close_position(
@@ -150,6 +158,14 @@ class Portfolio:
         risk_at_entry = original * r_unit
         r_multiple = (gross + realised_earlier) / risk_at_entry if risk_at_entry > 0 else 0.0
 
+        # A long returns the proceeds of the sale. A short returns the margin
+        # it posted and settles the difference — paying out ``exit_price *
+        # quantity`` would hand back money the position never held.
+        if position.side is Side.BUY:
+            self._returned = exit_price * position.quantity - fee
+        else:
+            self._returned = position.entry_price * position.quantity + gross - fee
+
         trade = Trade(
             symbol=symbol,
             side=position.side,
@@ -171,7 +187,7 @@ class Portfolio:
             leverage=position.leverage,
         )
         self.trades.append(trade)
-        self.cash += exit_price * position.quantity - fee
+        self.cash += self._returned
         return trade
 
     def update_bar(self, symbol: str, high: float, low: float) -> None:
@@ -185,11 +201,26 @@ class Portfolio:
     # -- valuation ---------------------------------------------------------
 
     def equity(self, marks: dict[str, float]) -> float:
+        """Cash plus what the open positions are worth.
+
+        The two sides are not symmetric and cannot share a line. A long *spent*
+        its cash and holds an asset, so the asset's market value is the entry.
+        A short posted **margin** — ``entry_price * quantity`` at 1x, which
+        ``open_position`` deducted from cash — and owes a contract. Its
+        contribution is therefore that margin coming back, plus or minus the
+        move.
+
+        Counting only ``unrealized_pnl`` for a short, as this did while nothing
+        could open one, loses the margin entirely: a short opened at 100 on a
+        300 account reported equity 200 before the price had moved at all.
+        """
         total = self.cash
         for symbol, position in self.positions.items():
             price = marks.get(symbol, position.entry_price)
-            total += price * position.quantity if position.side is Side.BUY else 0.0
-            if position.side is Side.SELL:
+            if position.side is Side.BUY:
+                total += price * position.quantity
+            else:
+                total += position.entry_price * position.quantity
                 total += position.unrealized_pnl(price)
         return total
 

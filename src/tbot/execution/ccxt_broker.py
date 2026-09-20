@@ -135,7 +135,20 @@ class CCXTBroker(Broker):
         try:
             fees = self.exchange.fetch_trading_fees()
         except ccxt.BaseError as exc:
-            log.warning("fee_fetch_failed", error=str(exc)[:160])
+            # Bybit answers "Illegal category" for linear on the demo host, and
+            # the account fee-rate endpoint returns 10001 there too, so on this
+            # venue there is simply no account-level tier to read. The market
+            # metadata is the right source in that case and it agrees with what
+            # was measured by placing an order (0.06% taker / 0.01% maker), so
+            # this is a fact about the venue rather than a problem — logged as
+            # such. A warning nothing can clear teaches the channel to be
+            # ignored, which is how a real one gets missed.
+            log.info(
+                "fee_tier_unavailable",
+                market=self.exchange.options.get("defaultType"),
+                using="market metadata",
+                error=str(exc)[:120],
+            )
             return
 
         for symbol in symbols:
@@ -323,18 +336,29 @@ class CCXTBroker(Broker):
             log.warning("cancel_failed", client_id=client_id, error=str(exc)[:160])
             return False
 
-    def _balances(self, kind: str) -> dict[str, float]:
-        """``free`` (spendable), ``used`` (locked in orders) or ``total``."""
+    def _balances(self, kind: str) -> dict[str, float] | None:
+        """``free`` (spendable), ``used`` (locked in orders) or ``total``.
+
+        **None means the read failed.** It used to return an empty dict, which
+        is indistinguishable from "the account holds nothing" — and that is the
+        exact reading that makes an engine conclude its positions have been
+        sold. It nearly happened: during a four-hour network outage the engine
+        logged ``position_inventory_missing`` for a position that was sitting
+        untouched at the venue, and was saved only because the stop lookup
+        failed in the same breath and pushed it down the "report loudly" branch
+        instead of the "close it locally" one. Nothing in the design guaranteed
+        that.
+        """
         try:
             balance = self.exchange.fetch_balance()
         except ccxt.BaseError as exc:
             log.error("balance_fetch_failed", error=str(exc)[:200])
-            return {}
+            return None
         return {k: float(v) for k, v in (balance.get(kind) or {}).items() if v}
 
     def fetch_balance(self) -> dict[str, float]:
         """Spendable balances. Money locked in a resting order cannot be sized against."""
-        return self._balances("free")
+        return self._balances("free") or {}
 
     def fetch_open_orders(self, symbol: str | None = None) -> list[Order]:
         try:
@@ -533,7 +557,7 @@ class CCXTBroker(Broker):
             log.warning("stop_cancel_failed", symbol=symbol, error=str(exc)[:160])
             return False
 
-    def fetch_positions(self) -> dict[str, float]:
+    def fetch_positions(self) -> dict[str, float] | None:
         """Non-quote balances — on spot this is what "a position" means.
 
         Deliberately ``total`` and not ``free``: a protective stop **locks** the
@@ -541,9 +565,16 @@ class CCXTBroker(Broker):
         ``free ≈ 0``. Reading free here made the engine conclude its own stop
         had closed the position, drop it from the portfolio, and stop managing
         a holding it still owned.
+
+        Returns **None when the venue could not be read**, which callers must
+        treat as "no information" rather than "no positions". An empty dict
+        still means the account genuinely holds nothing.
         """
+        totals = self._balances("total")
+        if totals is None:
+            return None
         positions = {}
-        for coin, amount in self._balances("total").items():
+        for coin, amount in totals.items():
             if coin == self.quote or amount <= 0:
                 continue
             symbol = f"{coin}/{self.quote}"
@@ -823,4 +854,294 @@ class CCXTBroker(Broker):
             return True
         except ccxt.BaseError as exc:
             log.error("demo_topup_failed", error=str(exc)[:200])
+            return False
+
+
+class PerpBroker(CCXTBroker):
+    """USDT-margined linear perpetuals.
+
+    A separate class rather than a flag because the differences are not
+    cosmetic. On spot a position *is* a balance; here it is a contract the
+    venue tracks for you, reported by its own endpoint, and it can be negative.
+    Three spot-specific workarounds also stop applying:
+
+    * ``_sellable`` exists because Bybit spot charges the buy fee **in the base
+      asset**, leaving slightly less than the order quantity (invariant 23).
+      Perpetual fees come out of the margin balance, so the clamp is not just
+      unnecessary, it would read a base balance that does not exist and clamp
+      every stop to zero.
+    * A resting spot stop **locks** the base asset, which is why a second
+      reduce-only order beside it is refused and the take-profit had to live in
+      the engine (invariant 39). Perpetuals attach both to the position, and
+      the venue accepted both in the same call when measured — so here the
+      target can be a venue order, and survives the process being down.
+    * ``fetch_positions`` on spot reads ``total`` balances. Here it reads the
+      position list, so an unmanaged coin balance can never be mistaken for a
+      contract.
+
+    What replaces isolated margin as the safety mechanism is leverage. Measured
+    on the demo account: the account-level ``ISOLATED_MARGIN`` flag is accepted
+    and the position still reports ``tradeMode=0`` (cross) on a Unified
+    account, so asserting the flag would refuse to start on a correctly
+    configured account. At 1x the position is 100% collateralised and a short
+    liquidates 99% away from entry; at 3x that becomes roughly 33%, which a
+    weekend gap can reach. So leverage is what is verified, and cross margin is
+    only tolerated while leverage is 1.0.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        venue: Venue,
+        quote: str = "USDT",
+        margin_mode: str = "isolated",
+        leverage: float = 1.0,
+    ):
+        super().__init__(api_key, api_secret, venue, quote, default_type="linear")
+        self.margin_mode = margin_mode
+        self.leverage = leverage
+
+    # -- venue naming ------------------------------------------------------
+
+    def _bare(self, symbol: str) -> str:
+        """``SOL/USDT:USDT`` -> ``SOLUSDT``, the form the v5 endpoints want."""
+        return symbol.split(":")[0].replace("/", "")
+
+    def _symbol_from_id(self, venue_id: str) -> str | None:
+        """``SOLUSDT`` -> ``SOL/USDT:USDT``, via ccxt's own market table.
+
+        Reconstructed from the loaded markets rather than by string surgery:
+        the same id exists on spot, and picking the wrong one would hand the
+        engine a symbol whose market has different precision and a different
+        minimum.
+        """
+        self.load_markets()
+        for market in self.exchange.markets_by_id.get(venue_id) or []:
+            if market.get("linear") and market.get("settle") == self.quote:
+                return str(market["symbol"])
+        return None
+
+    # -- safety ------------------------------------------------------------
+
+    def assert_venue_ready(self, symbols: list[str]) -> None:
+        """Refuse to trade until the venue agrees about leverage.
+
+        Raises rather than warning. An engine that starts with the venue set to
+        10x because a previous session left it there would size every position
+        correctly and carry ten times the liquidation risk it believes it has,
+        and nothing downstream would notice: the sizing maths never reads the
+        venue's leverage.
+
+        There is no acknowledgement flag, for the same reason
+        ``assert_key_is_safe`` has none.
+        """
+        self.load_markets()
+        problems: list[str] = []
+
+        for symbol in symbols:
+            try:
+                self.exchange.set_leverage(self.leverage, symbol)
+            except ccxt.BaseError as exc:
+                # 110043 is "leverage not modified" — it is already at this
+                # value, which is the state we wanted, not a failure.
+                if "110043" not in str(exc) and "not modified" not in str(exc).lower():
+                    problems.append(f"{symbol}: cannot set leverage ({str(exc)[:100]})")
+                    continue
+
+            if self.margin_mode == "isolated":
+                try:
+                    self.exchange.set_margin_mode(
+                        "isolated", symbol, {"leverage": self.leverage}
+                    )
+                except ccxt.BaseError as exc:
+                    # Accepted-but-ineffective is the norm on a Unified account,
+                    # so this is recorded and not fatal. Leverage is the control
+                    # that actually binds; see the class docstring.
+                    log.info(
+                        "margin_mode_not_set_per_symbol",
+                        symbol=symbol,
+                        detail=str(exc)[:120],
+                    )
+
+        effective = self._venue_leverage(symbols)
+        for symbol, value in effective.items():
+            if value > self.leverage + 1e-9:
+                problems.append(
+                    f"{symbol}: venue leverage is {value:g}x, configured ceiling is "
+                    f"{self.leverage:g}x"
+                )
+
+        if self.leverage > 1.0 and not self._isolated_account():
+            problems.append(
+                f"leverage {self.leverage:g}x requires isolated margin; the account "
+                "reports cross, where a liquidation can reach balances this engine "
+                "does not own"
+            )
+
+        if problems:
+            raise RuntimeError(
+                "perpetual venue is not in a safe state:\n  - " + "\n  - ".join(problems)
+            )
+
+        log.info(
+            "perp_venue_ready",
+            leverage=self.leverage,
+            margin_mode=self.margin_mode,
+            isolated_account=self._isolated_account(),
+            symbols=len(symbols),
+        )
+
+    def _venue_leverage(self, symbols: list[str]) -> dict[str, float]:
+        """Leverage the venue reports per symbol, as it will actually apply it."""
+        found: dict[str, float] = {}
+        try:
+            response = self.exchange.privateGetV5PositionList(
+                {"category": "linear", "settleCoin": self.quote}
+            )
+        except ccxt.BaseError as exc:
+            log.warning("position_leverage_unreadable", error=str(exc)[:160])
+            return found
+
+        wanted = {self._bare(s) for s in symbols}
+        for row in (response.get("result") or {}).get("list") or []:
+            venue_id = str(row.get("symbol") or "")
+            if venue_id not in wanted:
+                continue
+            try:
+                found[venue_id] = float(row.get("leverage") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return found
+
+    def _isolated_account(self) -> bool:
+        try:
+            info = self.exchange.privateGetV5AccountInfo({}).get("result") or {}
+        except ccxt.BaseError as exc:
+            log.warning("account_info_unreadable", error=str(exc)[:160])
+            return False
+        return str(info.get("marginMode", "")) == "ISOLATED_MARGIN"
+
+    # -- positions ---------------------------------------------------------
+
+    def fetch_positions(self) -> dict[str, float] | None:
+        """Open contracts, keyed by symbol, as **absolute** size.
+
+        Absolute rather than signed so it answers the same question the spot
+        implementation answers — "how much of this do we still hold" — which is
+        what both callers compare against ``Position.quantity``. The direction
+        is the engine's own record; a venue that disagreed about *direction*
+        would be a different failure, and one a size comparison cannot express
+        anyway.
+
+        None means the venue could not be read (see ``CCXTBroker._balances``).
+        """
+        try:
+            response = self.exchange.privateGetV5PositionList(
+                {"category": "linear", "settleCoin": self.quote}
+            )
+        except ccxt.BaseError as exc:
+            log.error("position_fetch_failed", error=str(exc)[:200])
+            return None
+
+        positions: dict[str, float] = {}
+        for row in (response.get("result") or {}).get("list") or []:
+            try:
+                size = abs(float(row.get("size") or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if size <= 0:
+                continue
+            symbol = self._symbol_from_id(str(row.get("symbol") or ""))
+            if symbol:
+                positions[symbol] = size
+        return positions
+
+    def _sellable(self, symbol: str, wanted: float) -> float:
+        """No clamp. The spot fee-in-base-asset problem does not exist here.
+
+        Inheriting the spot version would be actively harmful: it reads the
+        *base coin balance*, which for a perpetual is zero, and would clamp
+        every protective stop to nothing.
+        """
+        return wanted
+
+    # -- protective orders -------------------------------------------------
+
+    def place_stop(
+        self, symbol: str, quantity: float, stop_price: float, client_id: str
+    ) -> str | None:
+        """Attach a stop-loss to the position itself.
+
+        Not a resting reduce-only order: on perpetuals the venue tracks the
+        stop as a property of the position, which means it cannot drift out of
+        step with the position's size the way a separate order can. Setting it
+        again simply overwrites, so this is idempotent without the adopt or
+        replace dance the spot path needs.
+        """
+        self.load_markets()
+        try:
+            self.exchange.privatePostV5PositionTradingStop(
+                {
+                    "category": "linear",
+                    "symbol": self._bare(symbol),
+                    "stopLoss": self.exchange.price_to_precision(symbol, stop_price),
+                    "positionIdx": 0,
+                }
+            )
+        except ccxt.BaseError as exc:
+            log.error(
+                "protective_stop_rejected",
+                symbol=symbol,
+                stop=stop_price,
+                error=str(exc)[:200],
+                consequence="position is unprotected between bars until this succeeds",
+            )
+            return None
+
+        log.info("protective_stop_set", symbol=symbol, stop=round(stop_price, 8))
+        # The venue identifies it by the position, not by an order id. Returning
+        # the symbol keeps ``meta["stop_order_id"]`` meaningful for the engine's
+        # own bookkeeping without inventing an id the venue would not recognise.
+        return f"position:{self._bare(symbol)}"
+
+    def place_take_profit(self, symbol: str, target_price: float) -> bool:
+        """Attach a take-profit alongside the stop.
+
+        Impossible on spot — a resting stop locks the base asset and the second
+        reduce-only order is refused ``170131``, which is why invariant 39 puts
+        the target in the engine. Measured on perpetuals: both legs are accepted
+        in the same call. That matters beyond tidiness, because a target held at
+        the venue still works while this process is down.
+        """
+        self.load_markets()
+        try:
+            self.exchange.privatePostV5PositionTradingStop(
+                {
+                    "category": "linear",
+                    "symbol": self._bare(symbol),
+                    "takeProfit": self.exchange.price_to_precision(symbol, target_price),
+                    "positionIdx": 0,
+                }
+            )
+        except ccxt.BaseError as exc:
+            log.warning("take_profit_rejected", symbol=symbol, error=str(exc)[:160])
+            return False
+        log.info("take_profit_set", symbol=symbol, target=round(target_price, 8))
+        return True
+
+    def cancel_stop(self, symbol: str, order_id: str) -> bool:
+        """Clear the position's stop by setting it to zero."""
+        try:
+            self.exchange.privatePostV5PositionTradingStop(
+                {
+                    "category": "linear",
+                    "symbol": self._bare(symbol),
+                    "stopLoss": "0",
+                    "positionIdx": 0,
+                }
+            )
+            return True
+        except ccxt.BaseError as exc:
+            log.warning("stop_cancel_failed", symbol=symbol, error=str(exc)[:160])
             return False

@@ -172,7 +172,19 @@ class RiskConfig(StrictModel):
 
     # User-owned hard cap. The promotion gate may never exceed it, and code may
     # never raise it on its own.
-    max_leverage: float = Field(default=1.0, ge=1.0, le=2.0)
+    #
+    # The 3.0 ceiling is the operator's explicit authorisation, recorded here so
+    # it exists rather than because it is used. Raising it changes nothing on
+    # its own: LeverageGate still requires 90 days, 100 trades, PF >= 1.3 and a
+    # drawdown under 15% before granting anything above 1.0.
+    #
+    # And the default stays 1.0 on measurement, not caution. Leverage multiplies
+    # expectancy without changing its sign, and the measured expectancy for the
+    # short-horizon hypothesis is about -0.05% per trade. It also moves the one
+    # number that bounds the damage: at 1x a position is 100% collateralised and
+    # a short liquidates 99% away; at 3x that becomes roughly 33%, which a
+    # crypto weekend gap can reach. Measured, see research/perp_venue_facts.md.
+    max_leverage: float = Field(default=1.0, ge=1.0, le=3.0)
 
     # Continuous exposure ladder — no binary lockouts anywhere.
     drawdown_tiers: list[DrawdownTier] = Field(
@@ -206,6 +218,17 @@ class RiskConfig(StrictModel):
     # Measured for this universe at 0.75% risk and a 5 USDT venue minimum:
     # 183 covers 95% of setups, 306 covers 99%. Re-measure after changing
     # risk_per_trade, the universe, or the stop multiple.
+    # Hard ceiling on the capital this engine may size against, regardless of
+    # what the venue balance says. **Zero means no cap** — size against the
+    # real balance, which is right when one engine owns the account.
+    #
+    # It exists because two engines on one Unified account both read the same
+    # free USDT and each adopt it as their own starting equity (measured: a
+    # perp fill moves the very balance the spot engine sizes against). Without
+    # a cap they would collectively risk twice what either believes it is
+    # risking, and every percentage on each panel would be measured against a
+    # number the other engine moves.
+    max_capital: float = Field(default=0.0, ge=0)
     min_equity: float = Field(default=183.0, ge=0.0)
 
     # Consecutive losses raise the conviction bar; they never ban trading.
@@ -352,6 +375,18 @@ class ExecutionConfig(StrictModel):
     # while it is waiting between bars. Without this the engine learns its own
     # stop fired only at the next close — up to an hour on an hourly bar.
     venue_poll_seconds: int = Field(default=60, ge=10, le=900)
+    # Which market this engine trades. ``spot`` buys the asset; ``linear``
+    # trades USDT-margined perpetuals, which is the only way to take the short
+    # side and cuts the round-trip fee from 0.20% to 0.07% (measured:
+    # research/perp_venue_facts.md).
+    market_type: Literal["spot", "linear"] = "spot"
+    # Perpetuals only. Verified against the venue at startup rather than
+    # trusted: ``set_margin_mode`` returns success on a Unified account and
+    # leaves the position reporting cross, which is the ``fetchTradingFees``
+    # failure all over again. What actually bounds the damage is leverage —
+    # at 1.0 a position is 100% collateralised and a short liquidates 99% away
+    # (measured) — so this is recorded and checked, not relied upon alone.
+    margin_mode: Literal["isolated", "cross"] = "isolated"
 
 
 class ExitConfig(StrictModel):
@@ -382,6 +417,17 @@ class ExitConfig(StrictModel):
     # works while the bot is running. That asymmetry is deliberate: a missed
     # target costs opportunity, a missing stop costs capital.
     target_atr_mult: float = Field(default=0.0, ge=0, le=20)
+    # Close the position outright after this many trigger bars. **Zero
+    # disables it**, which is right for the main engine: invariant 51 measured
+    # that every mechanism cutting the tail costs more than it saves, and all
+    # the profit comes from the ~20% of trades that run past 3R.
+    #
+    # The fast engine sets it anyway, deliberately. Its whole purpose is to
+    # recycle capital, and a position that has neither hit its target nor its
+    # stop after N bars is holding a slot without having been right about
+    # anything. That is a different trade-off, not a better one, and it is
+    # pre-registered as part of H17.
+    time_stop_bars: int = Field(default=0, ge=0, le=2000)
     # Partial profit taking. At ``scale_out_at_r`` multiples of risk, sell
     # ``scale_out_pct`` of the ORIGINAL quantity and let the rest run.
     #
@@ -412,6 +458,14 @@ class ExitConfig(StrictModel):
 
 class EntryConfig(StrictModel):
     """How an entry reaches the venue once conviction has chosen the symbol."""
+
+    # Take the bottom of the cross-section short as well as the top long.
+    # Requires ``execution.market_type: linear`` — spot cannot sell what it
+    # does not hold, which is why the short side has never been measured here.
+    #
+    # Off by default. It doubles the trade population, so it is a trial rather
+    # than a repair, and it is pre-registered as H17.
+    allow_short: bool = False
 
     # Place the entry as a resting trigger order at the breakout level instead
     # of buying at the close. This is the only way to act between bar closes
@@ -524,6 +578,12 @@ class SecurityConfig(StrictModel):
 
 
 class EngineConfig(StrictModel):
+    # Identifies this engine to the venue when more than one shares an account.
+    # Empty reproduces the pre-namespace client order ids exactly, so the
+    # original engine needs no migration; anything else must be short, because
+    # two characters of it ride in every client order id under a 36-character
+    # ceiling.
+    namespace: str = Field(default="", max_length=8, pattern=r"^[a-z0-9]*$")
     loop_interval_seconds: float = Field(default=5.0, gt=0, le=300)
     # Restart storm detection: beyond this, drop to safe mode instead of thrashing.
     max_restarts_per_hour: int = Field(default=10, ge=1)
@@ -538,7 +598,15 @@ class EngineConfig(StrictModel):
 
 
 class Config(BaseModel):
-    """Root configuration, assembled from YAML and validated as a whole."""
+    """Root configuration, assembled from YAML and validated as a whole.
+
+    ``extra="forbid"`` here closes the last gap in invariant 50. Every section
+    already rejected unknown keys, but the root did not: a top-level typo landed
+    in a model that silently ignored it, which looks exactly like a setting that
+    is being read. Two dead settings reached production that way.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     mode: Mode = Mode.PAPER
     venue: Venue = Venue.BYBIT_DEMO

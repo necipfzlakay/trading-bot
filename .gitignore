@@ -5,6 +5,10 @@ __pycache__/
 .env.*
 !.env.example
 runtime/
+# Every engine's runtime directory, not just the first one's. A second engine
+# means a second directory of database, logs, state and parquet archive, and
+# they are no more committable than the original.
+runtime-*/
 *.db
 *.db-wal
 *.db-shm

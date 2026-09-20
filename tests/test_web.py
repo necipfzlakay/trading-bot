@@ -85,3 +85,74 @@ def test_a_serialised_sqlite_build_is_required_to_share_the_handle(tmp_path, mon
     monkeypatch.setattr(sqlite3, "threadsafety", 1)
     with pytest.raises(RuntimeError, match="threadsafety"):
         web_app.create_app(cfg)
+
+
+# --------------------------------------------------------------------------
+# Two engines, one panel
+# --------------------------------------------------------------------------
+
+
+def test_the_panel_serves_every_engine_not_only_its_own(tmp_path):
+    """The page draws one tab per engine, so the list has to come from the
+    server. A tab bar hardcoded in JavaScript would be wrong the first time
+    someone added a config.
+    """
+    from tbot.core.config import load_config
+
+    main = load_config("config/demo.yaml")
+    main.runtime_dir = tmp_path / "main"
+    fast = load_config("config/fast.yaml")
+    fast.runtime_dir = tmp_path / "fast"
+
+    with TestClient(web_app.create_app(main, engines={"main": main, "fast": fast})) as client:
+        rows = client.get("/api/engines").json()
+        by_name = {r["name"]: r for r in rows}
+        assert set(by_name) == {"main", "fast"}
+        assert by_name["main"]["primary"] is True
+        assert by_name["fast"]["market"] == "linear"
+        assert by_name["fast"]["port"] != by_name["main"]["port"]
+
+
+def test_each_engine_reads_its_own_state_file(tmp_path):
+    """One engine's positions shown under the other's equity would be worse
+    than no panel at all."""
+    import json
+
+    from tbot.core.config import load_config
+
+    main = load_config("config/demo.yaml")
+    main.runtime_dir = tmp_path / "main"
+    main.runtime_dir.mkdir(parents=True)
+    (main.runtime_dir / "state.json").write_text(json.dumps({"status": "running", "equity": 1000.0}))
+
+    fast = load_config("config/fast.yaml")
+    fast.runtime_dir = tmp_path / "fast"
+    fast.runtime_dir.mkdir(parents=True)
+    (fast.runtime_dir / "state.json").write_text(json.dumps({"status": "paused", "equity": 300.0}))
+
+    with TestClient(web_app.create_app(main, engines={"main": main, "fast": fast})) as client:
+        assert client.get("/api/state").json()["equity"] == 1000.0
+        assert client.get("/api/state?engine=fast").json()["equity"] == 300.0
+        assert client.get("/api/state?engine=nope").status_code == 404
+
+
+def test_a_control_command_reaches_only_the_engine_it_names(tmp_path):
+    """pause aimed at the fast engine must not stop the one holding positions."""
+    import json
+
+    from tbot.core.config import load_config, load_secrets
+
+    main = load_config("config/demo.yaml")
+    main.runtime_dir = tmp_path / "main"
+    main.runtime_dir.mkdir(parents=True)
+    fast = load_config("config/fast.yaml")
+    fast.runtime_dir = tmp_path / "fast"
+    fast.runtime_dir.mkdir(parents=True)
+
+    token = load_secrets().web_token
+    with TestClient(web_app.create_app(main, engines={"main": main, "fast": fast})) as client:
+        assert client.post(f"/api/control/pause?token={token}&engine=fast").status_code == 200
+
+    assert (fast.runtime_dir / "command.json").exists()
+    assert not (main.runtime_dir / "command.json").exists()
+    assert json.loads((fast.runtime_dir / "command.json").read_text())["action"] == "pause"

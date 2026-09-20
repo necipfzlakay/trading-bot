@@ -92,6 +92,28 @@ class ExitManager:
         if hit is not None:
             return hit
 
+        # A hard limit on how long a position may hold a slot without having
+        # been right about anything. Deliberately **off** for the main engine:
+        # invariant 51 measured that every mechanism cutting the tail costs
+        # more than it saves, because all the profit comes from the ~20% of
+        # trades that run past 3R.
+        #
+        # The short-horizon engine sets it anyway, and that is a different
+        # trade-off rather than a better one: recycling capital is the whole
+        # point there, so a position that has reached neither its target nor
+        # its stop after N bars is capital doing nothing. Pre-registered as
+        # part of H17, not slipped in as a default.
+        #
+        # Checked after the stop and the target so a bar that reached either
+        # is reported as that, not as a timeout.
+        if self.config.time_stop_bars > 0 and position.bars_held >= self.config.time_stop_bars:
+            return ExitDecision(
+                True,
+                ExitReason.TIME_STOP,
+                close,
+                f"held {position.bars_held} bars, limit {self.config.time_stop_bars}",
+            )
+
         # A volatility shock reprices risk faster than a trailing stop can
         # follow. Waiting for the stop here means taking the gap.
         if entry_atr > 0 and atr / entry_atr >= self.config.vol_shock_atr_ratio:

@@ -32,6 +32,20 @@ def safe_symbol(symbol: str) -> str:
     return symbol.replace("/", "_").replace(":", "_")
 
 
+def unsafe_symbol(name: str) -> str:
+    """Inverse of :func:`safe_symbol`, for reading the archive back.
+
+    A settled perpetual carries its quote twice — ``BTC/USDT:USDT`` — so the
+    three-part directory name is unambiguous. Restoring only the first
+    separator would hand back ``BTC/USDT_USDT``, a symbol no exchange has
+    heard of, and the failure surfaces far from here as an empty universe.
+    """
+    parts = name.split("_")
+    if len(parts) == 3:
+        return f"{parts[0]}/{parts[1]}:{parts[2]}"
+    return name.replace("_", "/", 1)
+
+
 class ParquetStore:
     """File-backed store for OHLCV and derivative series."""
 
@@ -241,7 +255,7 @@ class ParquetStore:
 
     def symbols(self) -> list[str]:
         return sorted(
-            p.name.replace("_", "/", 1) for p in (self.root / "ohlcv").iterdir() if p.is_dir()
+            unsafe_symbol(p.name) for p in (self.root / "ohlcv").iterdir() if p.is_dir()
         )
 
 

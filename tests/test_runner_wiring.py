@@ -867,7 +867,7 @@ def test_every_candidate_ends_the_bar_with_a_reason():
     opened, and the dashboard showed it as eligible with nothing explaining the
     gap. The scans table exists so that question is answered by query.
     """
-    from tbot.core.config import RiskConfig
+    from tbot.core.config import ConvictionConfig, RiskConfig
     from tbot.core.models import NoTradeReason
     from tbot.engine.runner import Runner
 
@@ -884,7 +884,15 @@ def test_every_candidate_ends_the_bar_with_a_reason():
 
     runner = OneEntry.__new__(OneEntry)
     runner.portfolio = Portfolio()
-    runner.config = type("C", (), {"risk": RiskConfig(max_positions=3)})()
+    # "absolute" keeps this test about reason-assignment. Ranking has its own.
+    runner.config = type(
+        "C",
+        (),
+        {
+            "risk": RiskConfig(max_positions=3),
+            "conviction": ConvictionConfig(selection="absolute"),
+        },
+    )()
 
     runner._maybe_enter({r.symbol: {} for r in rows}, rows, 0)
 
@@ -894,7 +902,7 @@ def test_every_candidate_ends_the_bar_with_a_reason():
 
 
 def test_candidates_past_the_position_limit_say_so():
-    from tbot.core.config import RiskConfig
+    from tbot.core.config import ConvictionConfig, RiskConfig
     from tbot.core.models import NoTradeReason
     from tbot.engine.runner import Runner
 
@@ -909,7 +917,14 @@ def test_candidates_past_the_position_limit_say_so():
 
     runner = NeverEnters.__new__(NeverEnters)
     runner.portfolio = Portfolio()
-    runner.config = type("C", (), {"risk": RiskConfig(max_positions=2)})()
+    runner.config = type(
+        "C",
+        (),
+        {
+            "risk": RiskConfig(max_positions=2),
+            "conviction": ConvictionConfig(selection="absolute"),
+        },
+    )()
 
     runner._maybe_enter({r.symbol: {} for r in rows}, rows, 0)
     assert all(r.no_trade_reason is NoTradeReason.MAX_POSITIONS for r in rows)

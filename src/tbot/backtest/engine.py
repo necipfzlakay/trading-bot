@@ -51,7 +51,12 @@ from tbot.strategy.conviction import UNSCORED_REASONS, ConvictionEngine, Scoring
 from tbot.strategy.exits import ExitManager
 from tbot.strategy.ranking import CrossSectionalRanker
 from tbot.strategy.regime import classify_series
-from tbot.strategy.setups import DEFAULT_SETUPS, detect_all, fallback_candidate
+from tbot.strategy.setups import (
+    DEFAULT_SETUPS,
+    detect_all,
+    fallback_candidate,
+    setups_for,
+)
 
 log = get_logger("backtest.engine")
 
@@ -325,10 +330,12 @@ class Backtester:
 
             # -- the highest-scoring candidate wins; others wait for next bar
             candidates.sort(key=lambda c: -c[0])
+            sides = {row.symbol: row.best_side for row, _, _ in bar_rows}
             for score, _symbol, d, idx in candidates:
                 if len(portfolio.positions) >= self.config.risk.max_positions:
                     break
-                if self._try_enter(portfolio, broker, d, idx, bar_ts, score):
+                side = sides.get(d.symbol, Side.BUY)
+                if self._try_enter(portfolio, broker, d, idx, bar_ts, score, side):
                     entries_this_bar += 1
                     break
 
@@ -469,20 +476,40 @@ class Backtester:
             already_open=portfolio.has_position(d.symbol),
             portfolio_full=len(portfolio.positions) >= self.config.risk.max_positions,
             correlation_conflict=conflict,
+            allow_short=self.config.entries.allow_short,
         )
 
-        conviction = self.conviction.score(
-            ctx,
-            Side.BUY,
-            self.risk.state.threshold_bump,
-            self.risk.threshold_bump() - self.risk.state.threshold_bump,
-        )
+        # Mirrors the live engine exactly. Scoring one side here and both there
+        # is the class of difference that makes a backtest describe a strategy
+        # nobody is running.
+        allow_short = self.config.entries.allow_short
+        bump = self.risk.state.threshold_bump
+        streak = self.risk.threshold_bump() - bump
+        conviction = None
+        for side in (Side.BUY, Side.SELL) if allow_short else (Side.BUY,):
+            scored = self.conviction.score(ctx, side, bump, streak)
+            if conviction is None:
+                conviction = scored
+                continue
+            blocked_now = scored.no_trade_reason is not None
+            blocked_best = conviction.no_trade_reason is not None
+            if (blocked_best and not blocked_now) or (
+                blocked_best == blocked_now and scored.total > conviction.total
+            ):
+                conviction = scored
 
         reason = conviction.no_trade_reason
         if reason is None and self.config.entries.require_setup and len(history) >= 220:
-            candidates = detect_all(
-                history, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
-            )
+            candidates = [
+                c
+                for c in detect_all(
+                    history,
+                    regime,
+                    self.config.exits.initial_stop_atr_mult,
+                    setups_for(allow_short),
+                )
+                if c.side is conviction.side
+            ]
             if not candidates:
                 reason = NoTradeReason.NO_SETUP
 
@@ -490,7 +517,7 @@ class Backtester:
             symbol=d.symbol,
             bar_ts=bar_ts,
             regime=regime,
-            best_side=Side.BUY,
+            best_side=conviction.side,
             score=conviction.total,
             threshold=conviction.threshold,
             no_trade_reason=reason,
@@ -504,15 +531,23 @@ class Backtester:
         idx: int,
         bar_ts: int,
         score: float,
+        side: Side = Side.BUY,
     ) -> bool:
         regime = Regime(d.regime[idx]) if d.regime[idx] else Regime.UNKNOWN
         history = d.setup_frame.iloc[: max(0, d.setup_map[idx] + 1)]
         if len(history) < 220:
             return False
 
-        candidates = detect_all(
-            history, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
-        )
+        candidates = [
+            c
+            for c in detect_all(
+                history,
+                regime,
+                self.config.exits.initial_stop_atr_mult,
+                setups_for(self.config.entries.allow_short),
+            )
+            if c.side is side
+        ]
         if candidates:
             candidate = candidates[0]
         elif self.config.entries.require_setup:
@@ -520,7 +555,7 @@ class Backtester:
             return False
         else:
             candidate = fallback_candidate(
-                history, regime, self.config.exits.initial_stop_atr_mult
+                history, regime, self.config.exits.initial_stop_atr_mult, side
             )
             if candidate is None:
                 self._funnel["no_setup_at_entry"] += 1
@@ -529,8 +564,9 @@ class Backtester:
         price = float(d.frame["close"].iloc[idx])
         # The setup was detected on the slower chart; the stop must be expressed
         # relative to the price we will actually pay.
-        stop = price - (candidate.entry_price - candidate.stop_price)
-        if stop >= price:
+        distance = abs(candidate.entry_price - candidate.stop_price)
+        stop = price - distance if side is Side.BUY else price + distance
+        if (side is Side.BUY and stop >= price) or (side is Side.SELL and stop <= price):
             self._funnel["stop_above_price"] += 1
             return False
 
@@ -557,11 +593,12 @@ class Backtester:
             return False
 
         order = broker.build_order(
+            namespace=self.config.engine.namespace,
             strategy=candidate.name,
             symbol=d.symbol,
             bar_ts=bar_ts,
             action="entry",
-            side=Side.BUY,
+            side=side,
             quantity=sizing.quantity,
             order_type=OrderType.MARKET,
         )
@@ -703,6 +740,7 @@ class Backtester:
             return
 
         order = broker.build_order(
+            namespace=self.config.engine.namespace,
             strategy=str(armed["setup"]),
             symbol=armed["symbol"],
             bar_ts=bar_ts,

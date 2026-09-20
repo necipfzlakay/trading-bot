@@ -99,6 +99,10 @@ class ScoringContext:
     stale: bool = False
     llm_veto: bool = False
     setup: str = "unknown"
+    # Whether the permission layer may consider the short side. Set by the
+    # engine from ``entries.allow_short``, which in turn requires a market that
+    # can actually sell — spot cannot.
+    allow_short: bool = False
 
 
 @dataclass(slots=True)
@@ -212,7 +216,7 @@ class ConvictionEngine:
             return NoTradeReason.MAX_POSITIONS
         if ctx.llm_veto:
             return NoTradeReason.LLM_EVENT_VETO
-        if not regime_allows(ctx.regime, side.value):
+        if not regime_allows(ctx.regime, side.value, ctx.allow_short):
             return NoTradeReason.REGIME_VETO
         if ctx.correlation_conflict:
             return NoTradeReason.CORRELATION_FULL
@@ -237,9 +241,13 @@ class ConvictionEngine:
     ) -> ConvictionComponent:
         """How well the current regime supports this direction."""
         fit = {
+            # Mirrored rather than long-only: a downtrend supports a short
+            # exactly as an uptrend supports a long. RANGE supports both at the
+            # same reduced weight, because a range is a weaker reason for
+            # either direction than a trend is for its own.
             Regime.TREND_UP: 1.0 if side is Side.BUY else 0.0,
-            Regime.RANGE: 0.55 if side is Side.BUY else 0.0,
-            Regime.TREND_DOWN: 0.0,
+            Regime.TREND_DOWN: 1.0 if side is Side.SELL else 0.0,
+            Regime.RANGE: 0.55,
             Regime.HIGH_VOL: 0.0,
             Regime.UNKNOWN: 0.0,
         }[ctx.regime]

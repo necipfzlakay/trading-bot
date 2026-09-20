@@ -143,11 +143,16 @@ class LeverageGate:
         status = self.load()
         if status is None or not status.eligible:
             return 1.0
-        return min(user_ceiling, status.granted_leverage, 2.0)
+        # The operator's ceiling is the ceiling. The literal 2.0 that used to
+        # sit here was a second copy of the config bound, and when the config
+        # bound moved to 3.0 it would have silently capped an authorisation the
+        # operator had given — a setting that looks applied and is not.
+        # Invariant 8 is unaffected: min() can only ever lower.
+        return min(user_ceiling, status.granted_leverage)
 
     def explain(self, user_ceiling: float) -> str:
         if user_ceiling <= 1.0:
-            return "leverage ceiling is 1.0x (spot only) — set risk.max_leverage to raise it"
+            return "leverage ceiling is 1.0x — set risk.max_leverage to raise it"
         status = self.load()
         if status is None:
             return "no promotion record yet — leverage stays at 1.0x"

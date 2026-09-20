@@ -65,6 +65,10 @@ def main() -> int:
             min_volume_24h=cfg.universe.min_volume_24h_usd,
             exclude=cfg.universe.exclude,
             min_history_days=cfg.universe.min_history_days,
+            # A perpetual engine must be handed perpetual symbols. Backfilling
+            # the spot pair and trading the contract would mean every indicator
+            # was computed on a different instrument's prices.
+            category=cfg.execution.market_type,
         )
         universe_path.parent.mkdir(parents=True, exist_ok=True)
         universe_path.write_text(

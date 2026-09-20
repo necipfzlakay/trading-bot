@@ -259,8 +259,147 @@ class RangeDipBuy(Setup):
         )
 
 
+class DonchianBreakdown(Setup):
+    """Price closes below the prior N-bar low. The mirror of the breakout.
+
+    Written rather than achieved by deleting the setup gate. Removing the gate
+    was measured and rejected — trades went 103 to 367 but Gate 1 fell from 5/6
+    to 2/6 and PBO from 0.33 to 0.67 (invariant 52). A short engine with no
+    short setups would have had to run ungated, which is the configuration that
+    already failed; mirroring the setups keeps the filter that earned its place.
+    """
+
+    name = "donchian_breakdown"
+    allowed_regimes = (Regime.TREND_DOWN,)
+
+    def __init__(self, period: int = 20):
+        self.period = period
+
+    def detect(self, df: pd.DataFrame, regime: Regime, atr_mult: float) -> SetupCandidate | None:
+        if not self._allowed(regime) or len(df) < self.period + 20:
+            return None
+
+        upper, _, lower = ta.donchian(df["high"], df["low"], self.period)
+        atr_series = ta.atr(df["high"], df["low"], df["close"], 14)
+
+        close = float(df["close"].iloc[-1])
+        band = lower.iloc[-1]
+        atr_value = atr_series.iloc[-1]
+        if np.isnan(band) or np.isnan(atr_value) or atr_value <= 0:
+            return None
+
+        prev_close = float(df["close"].iloc[-2])
+        # Same prior-bar condition as the breakout: without it the setup
+        # re-triggers on every bar price stays extended.
+        if not (close < band and prev_close >= lower.iloc[-2]):
+            return None
+
+        stop = close + atr_mult * float(atr_value)
+        # The channel ceiling is often nearer than the ATR stop; take whichever
+        # risks less, exactly as the long side takes the channel floor.
+        channel_stop = float(upper.iloc[-1])
+        stop = min(stop, channel_stop) if channel_stop > close else stop
+
+        return SetupCandidate(
+            name=self.name,
+            side=Side.SELL,
+            entry_price=close,
+            stop_price=stop,
+            trigger_detail=f"close {close:.4f} < {self.period}-bar low {float(band):.4f}",
+            atr=float(atr_value),
+        )
+
+
+class MomentumDecline(Setup):
+    """Sustained weakness while the downtrend is intact."""
+
+    name = "momentum_decline"
+    allowed_regimes = (Regime.TREND_DOWN,)
+
+    def __init__(self, adx_min: float = 25.0, rsi_max: float = 42.0):
+        self.adx_min = adx_min
+        self.rsi_max = rsi_max
+
+    def detect(self, df: pd.DataFrame, regime: Regime, atr_mult: float) -> SetupCandidate | None:
+        if not self._allowed(regime) or len(df) < self.min_bars:
+            return None
+
+        adx_value, plus_di, minus_di = ta.adx(df["high"], df["low"], df["close"], 14)
+        rsi_value = ta.rsi(df["close"], 14)
+        ema50 = ta.ema(df["close"], 50)
+        atr_series = ta.atr(df["high"], df["low"], df["close"], 14)
+
+        close = float(df["close"].iloc[-1])
+        checks = {
+            "adx": adx_value.iloc[-1] >= self.adx_min,
+            "di": minus_di.iloc[-1] > plus_di.iloc[-1],
+            "rsi": rsi_value.iloc[-1] <= self.rsi_max,
+            "below_ema50": close < ema50.iloc[-1],
+        }
+        if not all(bool(v) for v in checks.values()):
+            return None
+
+        atr_value = float(atr_series.iloc[-1])
+        if np.isnan(atr_value) or atr_value <= 0:
+            return None
+
+        return SetupCandidate(
+            name=self.name,
+            side=Side.SELL,
+            entry_price=close,
+            stop_price=close + atr_mult * atr_value,
+            trigger_detail=(
+                f"ADX {float(adx_value.iloc[-1]):.0f} RSI {float(rsi_value.iloc[-1]):.0f} "
+                f"below EMA50"
+            ),
+            atr=atr_value,
+        )
+
+
+class RangeRallyFade(Setup):
+    """Deep short-term overbought inside a range, sold at the upper band."""
+
+    name = "range_rally"
+    allowed_regimes = (Regime.RANGE,)
+
+    def __init__(self, rsi_period: int = 2, rsi_min: float = 92.0):
+        self.rsi_period = rsi_period
+        self.rsi_min = rsi_min
+
+    def detect(self, df: pd.DataFrame, regime: Regime, atr_mult: float) -> SetupCandidate | None:
+        if not self._allowed(regime) or len(df) < self.min_bars:
+            return None
+
+        fast_rsi = ta.rsi(df["close"], self.rsi_period)
+        upper, _, _, _ = ta.bollinger(df["close"], 20, 2.0)
+        ema200 = ta.ema(df["close"], 200)
+        atr_series = ta.atr(df["high"], df["low"], df["close"], 14)
+
+        close = float(df["close"].iloc[-1])
+        # Never fade rallies above the 200 EMA, for the reason the long side
+        # never buys dips below it: in a structural uptrend every rally looks
+        # like this one and the range assumption has already failed.
+        if close > ema200.iloc[-1]:
+            return None
+        if not (fast_rsi.iloc[-1] >= self.rsi_min and close >= upper.iloc[-1] * 0.99):
+            return None
+
+        atr_value = float(atr_series.iloc[-1])
+        if np.isnan(atr_value) or atr_value <= 0:
+            return None
+
+        return SetupCandidate(
+            name=self.name,
+            side=Side.SELL,
+            entry_price=close,
+            stop_price=close + atr_mult * 0.75 * atr_value,  # tighter: lower conviction
+            trigger_detail=f"RSI({self.rsi_period}) {float(fast_rsi.iloc[-1]):.1f} at upper band",
+            atr=atr_value,
+        )
+
+
 def fallback_candidate(
-    df: pd.DataFrame, regime: Regime, atr_mult: float
+    df: pd.DataFrame, regime: Regime, atr_mult: float, side: Side = Side.BUY
 ) -> SetupCandidate | None:
     """Entry at the close with a volatility stop, when no setup fired.
 
@@ -277,8 +416,18 @@ def fallback_candidate(
     make results worse and the question is settled.
 
     Requires the regime to permit the side, exactly as a real setup does.
+
+    ``side`` mirrors the whole construction for a short: the stop goes above
+    the close instead of below, and the caller is responsible for having asked
+    the permission layer first. The cross-sectional ranker already produces a
+    full ordering; only its top has ever been used, because spot cannot sell
+    what it does not hold.
     """
-    if regime not in (Regime.TREND_UP, Regime.RANGE) or len(df) < 220:
+    allowed = {
+        Side.BUY: (Regime.TREND_UP, Regime.RANGE),
+        Side.SELL: (Regime.TREND_DOWN, Regime.RANGE),
+    }[side]
+    if regime not in allowed or len(df) < 220:
         return None
 
     atr_series = ta.atr(df["high"], df["low"], df["close"], 14)
@@ -287,13 +436,16 @@ def fallback_candidate(
     if np.isnan(atr_value) or atr_value <= 0:
         return None
 
-    stop = close - atr_mult * atr_value
-    if stop >= close:
+    distance = atr_mult * atr_value
+    stop = close - distance if side is Side.BUY else close + distance
+    # A stop on the wrong side of the entry is not a stop; it is an instruction
+    # to close immediately at a loss.
+    if (side is Side.BUY and stop >= close) or (side is Side.SELL and stop <= close):
         return None
 
     return SetupCandidate(
         name="ranked_entry",
-        side=Side.BUY,
+        side=side,
         entry_price=close,
         stop_price=stop,
         trigger_detail=f"cross-sectional rank, no setup trigger (ATR {atr_value:.6f})",
@@ -306,6 +458,22 @@ DEFAULT_SETUPS: tuple[Setup, ...] = (
     DonchianBreakout(),
     RangeDipBuy(),
 )
+
+# Deliberately not folded into DEFAULT_SETUPS. A spot engine reaching these
+# would produce a short candidate it cannot execute — there is nothing to sell
+# — and the failure would surface as a rejected order rather than as a config
+# mistake. The engine adds them only when ``entries.allow_short`` is set, which
+# in turn requires a market that can actually take the other side.
+SHORT_SETUPS: tuple[Setup, ...] = (
+    MomentumDecline(),
+    DonchianBreakdown(),
+    RangeRallyFade(),
+)
+
+
+def setups_for(allow_short: bool) -> tuple[Setup, ...]:
+    """The setup registry an engine should scan with."""
+    return DEFAULT_SETUPS + SHORT_SETUPS if allow_short else DEFAULT_SETUPS
 
 
 def detect_all(

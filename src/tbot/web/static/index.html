@@ -108,11 +108,38 @@ canvas{width:100%;display:block}
   font:11px var(--mono);background:#000000d9;border:1px solid var(--border-2);
   border-radius:6px;padding:5px 8px;white-space:pre;transform:translate(-50%,-115%);z-index:5}
 
+/* ---- hints and glossary ----------------------------------------------
+   A column called "MFE R" is exact and unreadable at the same time. The header
+   keeps the term (so a screenshot still matches a grep of the logs), the
+   tooltip says what it means, and the glossary under the table says it again
+   for anyone who never thinks to hover. */
+th[title],[data-tip]{cursor:help;text-decoration:underline dotted #6e768188;
+  text-underline-offset:3px;text-decoration-thickness:1px}
+.kpi .label[title]{cursor:help;text-decoration:underline dotted #6e768166;
+  text-underline-offset:2px}
+.gloss{font-size:11px;line-height:1.65;color:var(--faint);margin-top:10px;
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:1px 22px}
+.gloss b{color:var(--dim);font-weight:600;font-family:var(--mono)}
+
 /* ---- misc ------------------------------------------------------------ */
 .note{font-size:11px;line-height:1.55;color:var(--faint);margin-top:8px}
 .note b{color:var(--dim);font-weight:600}
 .empty{color:var(--faint);font-style:italic;font:12px var(--mono);padding:2px 0}
 footer{color:var(--faint);font-size:11px;padding:14px 0 24px}
+.tabs{display:flex;gap:2px;margin:0 0 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tabs button{background:none;border:none;border-bottom:2px solid transparent;color:var(--faint);
+  font:12px var(--mono);padding:7px 13px;cursor:pointer;margin-bottom:-1px}
+.tabs button:hover{color:var(--dim)}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--accent)}
+.tabs button .dot{display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--faint);margin-right:6px;vertical-align:middle}
+.tabs button .dot.running{background:var(--ok)}
+.tabs button .dot.stopped{background:var(--bad)}
+table.sum{width:100%;border-collapse:collapse;font:12px var(--mono)}
+table.sum th{text-align:left;color:var(--faint);font-weight:500;padding:5px 10px 5px 0;
+  border-bottom:1px solid var(--line)}
+table.sum td{padding:6px 10px 6px 0;border-bottom:1px solid var(--line)}
+table.sum tr.total td{border-bottom:none;border-top:1px solid var(--line);color:var(--fg);font-weight:600}
 code{font:11px var(--mono);color:var(--dim)}
 </style>
 </head>
@@ -121,12 +148,12 @@ code{font:11px var(--mono);color:var(--dim)}
 
 <header>
   <h1>tbot</h1>
-  <span class="pill" id="status">…</span>
-  <span class="pill" id="mode"></span>
-  <span class="pill" id="uptime"></span>
-  <span class="pill" id="feed"></span>
-  <span class="pill" id="bar"></span>
-  <span class="pill" id="beat"></span>
+  <span class="pill" id="status" title="Motorun durumu: running = bar işliyor, degraded = çalışıyor ama riski kısılmış, stopped = durmuş">…</span>
+  <span class="pill" id="mode" title="Çalışma modu ve borsa. paper = sahte para, demo = Bybit demo hesabı, live = gerçek para"></span>
+  <span class="pill" id="uptime" title="Motor ne zamandır ayakta ve bu koşuda kaç bar işledi"></span>
+  <span class="pill" id="feed" title="Bar-arası WebSocket fiyat akışı. Bayatsa motor bar kapanışına düşer — borsadaki stop yerinde durmaya devam eder"></span>
+  <span class="pill" id="bar" title="İşlenen son kapanmış barın zamanı (UTC)"></span>
+  <span class="pill" id="beat" title="Ölü-adam nabzı: motor state.json'ı 60 saniyede bir tazeler. 3 dakikayı geçerse takılmış demektir"></span>
   <span class="spacer"></span>
   <div class="ctl">
     <input type="password" id="token" placeholder="token" autocomplete="off" spellcheck="false">
@@ -136,75 +163,107 @@ code{font:11px var(--mono);color:var(--dim)}
   </div>
 </header>
 
+<nav class="tabs" id="tabs"></nav>
+
 <div id="alerts"></div>
 
-<div class="grid">
+<div class="grid" id="grid">
   <div class="card wide">
-    <h2>Account</h2>
+    <h2>Hesap <small>anlık durum</small></h2>
     <div class="kpis" id="kpis"></div>
   </div>
 
   <div class="card wide">
-    <h2>Equity <small id="eqrange"></small></h2>
+    <h2>Equity eğrisi <small id="eqrange"></small></h2>
     <div class="chartbox">
       <canvas id="equity"></canvas>
       <div class="tip" id="eqtip"></div>
     </div>
     <div class="note">
-      The dashed line is where this run started. The axis is labelled because the
-      shape of a line says nothing without one — a 0.4% day and a 40% day draw
-      the same picture.
+      Kesikli çizgi bu koşunun <b>başlangıç equity</b>'si. Üstü yeşil = kârda,
+      altı kırmızı = zararda. Eksen etiketli, çünkü etiketsiz bir çizginin şekli
+      hiçbir şey söylemez — %0.4'lük bir gün ile %40'lık bir gün aynı resmi çizer.
     </div>
   </div>
 
   <div class="card wide">
-    <h2>Open positions</h2>
+    <h2>Açık pozisyonlar <small>şu anda elde tutulanlar</small></h2>
     <div class="scroll"><table id="positions"></table></div>
+    <div class="gloss">
+      <div><b>R</b> — risk birimi. 1R = giriş fiyatı ile ilk stop arasındaki mesafe.
+        Her pozisyon tam 1R risk eder, o yüzden kâr/zarar dolarla değil R ile ölçülür.</div>
+      <div><b>R şimdi</b> — şu anki kâr/zarar, R cinsinden. <span class="pos">+1.05</span>
+        = risk ettiğinin 1.05 katı kârda.</div>
+      <div><b>en iyi (MFE)</b> — pozisyon açıkken görülen <i>en iyi</i> nokta.
+        Masada ne kadar kâr durmuştu.</div>
+      <div><b>en kötü (MAE)</b> — görülen <i>en kötü</i> nokta. −1.00'a yaklaşması
+        stop'a yaklaştığı anlamına gelir.</div>
+      <div><b>stop payı</b> — şu anki fiyattan stop'a yüzde kaç kaldı.</div>
+      <div><b>puan</b> — girişteki conviction skoru (0-100). Motor bu sayı eşiği
+        geçtiği için girmişti.</div>
+    </div>
   </div>
 
   <div class="card wide">
-    <h2>Holdings <small>what the account actually contains</small></h2>
+    <h2>Varlıklar <small>hesapta gerçekten ne var</small></h2>
     <div class="scroll"><table id="balances"></table></div>
     <div class="note">
-      <b>free</b> can be spent or sold right now · <b>locked</b> is reserved by a resting order —
-      a protective stop reserves the whole holding, so a properly protected position shows
-      zero free · <b>total</b> is what is owned. Read live from the venue.
+      <b>serbest</b> şu anda harcanabilir ya da satılabilir · <b>kilitli</b> bekleyen bir
+      emir tarafından rezerve edilmiş — koruyucu stop varlığın tamamını kilitler, yani
+      <i>doğru korunan</i> bir pozisyonun serbesti sıfırdır · <b>toplam</b> sahip olunan.
+      Borsadan canlı okunur, yerel kayıttan değil.
     </div>
   </div>
 
   <div class="card wide">
-    <h2>Scan <small id="scanmeta">every symbol, every bar</small></h2>
+    <h2>Tarama <small id="scanmeta">her sembol, her bar</small></h2>
     <div class="scroll"><table id="scan"></table></div>
     <div class="note">
-      A symbol vetoed before scoring shows <b>—</b>, not a zero: the engine formed
-      no opinion about it. Only a number in the score column was actually measured.
+      Puanlanmadan elenen sembol <b>—</b> gösterir, sıfır değil: motor o sembol
+      hakkında <i>fikir oluşturmadı</i>. Puan sütununda sayı varsa gerçekten ölçülmüştür.
+      Satırın sonundaki durum, o barda neden işleme girmediğini söyler.
     </div>
   </div>
 
   <div class="card">
-    <h2>Why no trade <small>24h</small></h2>
+    <h2>Neden işlem yok <small>son 24 saat</small></h2>
     <div class="scroll"><table id="reasons"></table></div>
   </div>
 
   <div class="card">
-    <h2>Recent trades</h2>
+    <h2>Son işlemler <small>kapanmış pozisyonlar</small></h2>
     <div class="scroll"><table id="trades"></table></div>
   </div>
 
   <div class="card wide" id="excursion-card">
-    <h2>MAE / MFE <small>exit calibration</small></h2>
+    <h2>En kötü / en iyi nokta <small>MAE / MFE — çıkış kalibrasyonu</small></h2>
     <div class="chartbox"><canvas id="excursion"></canvas></div>
     <div class="note">
-      Each dot is a closed trade: x = worst point reached (MAE), y = best point
-      reached (MFE), both in R. Winners clustered at low MAE mean the stop is
-      wider than it needs to be.
+      Her nokta kapanmış bir işlem: yatay eksen görülen <b>en kötü</b> nokta (MAE),
+      dikey eksen görülen <b>en iyi</b> nokta (MFE), ikisi de R cinsinden. Yeşil = kârla
+      kapandı. Kazananlar sol tarafta (düşük MAE) toplanıyorsa stop gereğinden geniştir —
+      daha dar bir stop aynı işlemleri yakalar, daha az risk eder.
+    </div>
+  </div>
+</div>
+
+<div class="grid" id="combined" style="display:none">
+  <div class="card wide">
+    <h2>Hesabın tamamı <small>iki motor, tek Bybit hesabı</small></h2>
+    <div id="sumtable"></div>
+    <div class="note">
+      Motorlar aynı Unified hesabı paylaşıyor: bir perp işleminin komisyonu spot
+      motorun boyutlandırdığı USDT'den düşüyor (ölçüldü). Bu yüzden her motorun
+      kendi <b>max_capital</b> tavanı var — panelde gördüğün yüzdeler o tavana
+      göre değil, motorun kendi başlangıç equity'sine göre ölçülüyor.
     </div>
   </div>
 </div>
 
 <footer>
-  Reads <code>runtime/state.json</code> and <code>runtime/tbot.db</code> directly —
-  same source as the engine. Auto-refresh 10s.
+  <code>runtime/state.json</code> ve <code>runtime/tbot.db</code> doğrudan okunur —
+  motorun yazdığı kaynağın aynısı. 10 saniyede bir tazelenir.
+  Üstü noktalı çizili her başlığın üzerine gelince ne olduğunu anlatır.
 </footer>
 
 </div>
@@ -214,7 +273,9 @@ const nz = v => v!=null && !isNaN(v);
 const fmt = (v,d=2) => nz(v) ? Number(v).toFixed(d) : '—';
 const sign = (v,d=2) => nz(v) ? (v>0?'+':'') + Number(v).toFixed(d) : '—';
 const cls = v => !nz(v) ? '' : v>0 ? 'pos' : v<0 ? 'neg' : 'dim';
-const esc = s => String(s??'').replace(/[<>&]/g, c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+// Also escapes quotes: this now feeds title="" attributes, not just text.
+const esc = s => String(s??'').replace(/[<>&"']/g,
+  c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
 
 // A return of -0.036% rendered as "-0.0%" and coloured red is noise pretending
 // to be a signal. Widen the precision until the number says something.
@@ -227,21 +288,100 @@ function pct(v, min=1){
 function ago(ms){
   if(!nz(ms)) return '—';
   const s = Math.max(0,(Date.now()-ms)/1000);
-  if(s<60) return Math.round(s)+'s ago';
-  if(s<3600) return Math.round(s/60)+'m ago';
-  return (s/3600).toFixed(1)+'h ago';
+  if(s<60) return Math.round(s)+' sn önce';
+  if(s<3600) return Math.round(s/60)+' dk önce';
+  return (s/3600).toFixed(1)+' sa önce';
 }
 const stamp = ts => ts ? new Date(ts).toISOString().slice(5,16).replace('T',' ') : '—';
 
-async function get(url){ try{ const r = await fetch(url); return r.ok ? await r.json() : null; }catch{ return null; } }
+/* Which engine the page is looking at. Two engines share this account, so
+   every request has to say which one it means — a panel that silently showed
+   one engine's positions under the other's equity would be worse than no
+   panel. `combined` is a view, not an engine: it asks each in turn. */
+let ENGINE = 'main';
+let ENGINES = [];
+
+function withEngine(url){
+  if(!url.startsWith('/api/') || url.startsWith('/api/engines') || url.startsWith('/api/meta')) return url;
+  const name = ENGINE === 'combined' ? (ENGINES[0]?.name || 'main') : ENGINE;
+  return url + (url.includes('?') ? '&' : '?') + 'engine=' + encodeURIComponent(name);
+}
+
+async function get(url){ try{ const r = await fetch(withEngine(url)); return r.ok ? await r.json() : null; }catch{ return null; } }
 
 function table(el, cols, rows, render){
   if(!rows || !rows.length){
-    el.innerHTML = `<tr><td class="empty">no data yet</td></tr>`; return;
+    el.innerHTML = `<tr><td class="empty">henüz veri yok</td></tr>`; return;
   }
+  // `h` is the column's explanation. A header that needs a footnote and does
+  // not carry one is a header nobody can read.
   el.innerHTML = `<thead><tr>${cols.map(c=>
-      `<th class="${c.num?'num':''} ${c.cl||''}" ${c.w?`style="width:${c.w}"`:''}>${esc(c.t??c)}</th>`).join('')}</tr></thead>`
+      `<th class="${c.num?'num':''} ${c.cl||''}" ${c.w?`style="width:${c.w}"`:''}`
+      + `${c.h?` title="${esc(c.h)}"`:''}>${esc(c.t??c)}</th>`).join('')}</tr></thead>`
     + `<tbody>${rows.map(render).join('')}</tbody>`;
+}
+
+/* ---- vocabulary --------------------------------------------------------
+   The engine writes enum codes: exact, greppable, and meaningless to read.
+   The panel shows the plain words and keeps the code in the tooltip, so a
+   screenshot still matches a grep of runtime/logs/*.jsonl.                */
+const REASON = {
+  below_threshold:      ['eşik altı',          'Puanlandı ama giriş eşiğini geçemedi — gerçek bir ölçüm, sadece yeterince yüksek değil'],
+  no_setup:             ['kurulum yok',        'Puan yeterliydi ama hiçbir giriş tetikleyicisi oluşmadı'],
+  regime_veto:          ['rejim kapalı',       'Günlük rejim bu yönde işleme izin vermiyor — sembol hiç puanlanmadı'],
+  htf_veto:             ['üst dilim ters',     'Büyük zaman dilimi ters yönü gösteriyor'],
+  correlation_full:     ['korelasyon dolu',    'Açık pozisyonlara fazla benziyor; aynı bahsi ikinci kez almaz'],
+  max_positions:        ['pozisyon tavanı',    'Eşzamanlı pozisyon sınırı dolu'],
+  already_in_position:  ['zaten pozisyonda',   'Bu sembolde açık pozisyon var'],
+  spread_too_wide:      ['spread geniş',       'Alış-satış farkı işlemin beklediği kazancı yiyor'],
+  liquidity_too_low:    ['likidite düşük',     'Hacim bu pozisyon boyutunu kaldırmıyor'],
+  min_notional:         ['borsa minimumu',     'Risk-doğru boyut borsanın minimum emir büyüklüğünün altında kalıyor'],
+  insufficient_balance: ['bakiye yetmiyor',    'Serbest nakit bu girişe yetmiyor'],
+  llm_event_veto:       ['LLM olay vetosu',    'LLM bir olay riski gördü. LLM yalnız engelleyebilir; işlem başlatamaz'],
+  stale_data:           ['veri bayat',         'Son bar çok eski, puanlama yapılmadı'],
+  risk_budget_exhausted:['risk bütçesi bitti', 'Bu dönemin risk bütçesi tükendi'],
+  cooldown_same_bar:    ['aynı bar beklemesi', 'Aynı barda ikinci giriş yok'],
+  entered:              ['işleme girdi',       'Bu satır pozisyona dönüştü — red değil'],
+  eligible:             ['uygun',              'Engel yok'],
+};
+const EXIT = {
+  trailing_stop:      ['takip eden stop', 'Kârı takip eden stop tetiklendi'],
+  initial_stop:       ['ilk stop',        'Giriş anındaki stop tetiklendi — tanım gereği −1R'],
+  take_profit:        ['hedef',           'Kâr-al seviyesine ulaştı'],
+  regime_flip:        ['rejim döndü',     'İzin katmanı yön değiştirdi, pozisyonun gerekçesi kalmadı'],
+  conviction_collapse:['tez çöktü',       'Girişi haklı çıkaran puan dağıldı'],
+  volatility_shock:   ['volatilite şoku', 'Oynaklık pozisyonu taşınamaz hale getirdi'],
+  time_stop:          ['süre doldu',      'Pozisyon ilerlemeden çok bar geçirdi'],
+  manual_flatten:     ['elle kapatıldı',  'Panelden veya Telegram’dan kapatıldı'],
+  liquidation:        ['likidasyon',      'Borsa pozisyonu kapattı'],
+  backtest_end:       ['backtest sonu',   'Veri bitti, pozisyon hâlâ açıktı'],
+};
+const REGIME = {
+  trend_up:  ['yükseliş',  'Günlük rejim yukarı — long kurulumları puanlanır'],
+  trend_down:['düşüş',     'Günlük rejim aşağı — spot motorda giriş yok, perp motorda short'],
+  range:     ['yatay',     'Yönsüz; yalnız bant kurulumları puanlanır'],
+  high_vol:  ['yüksek vol','Oynaklık rejimi — kurulumların çoğu kapalı'],
+  unknown:   ['bilinmiyor','Rejim hesaplanamadı (ısınma verisi yetersiz)'],
+};
+const SETUP = {
+  donchian_breakout:    ['kanal kırılımı ↑', 'N barlık en yüksek kırıldı — trend başlangıcı'],
+  momentum_continuation:['momentum devamı ↑','Yükseliş trendinde geri çekilme sonrası devam'],
+  range_dip:            ['bant dibi ↑',      'Yatay bandın alt kenarından dönüş'],
+  donchian_breakdown:   ['kanal kırılımı ↓', 'N barlık en düşük kırıldı (short)'],
+  momentum_decline:     ['momentum devamı ↓','Düşüş trendinde devam (short)'],
+  range_rally:          ['bant tepesi ↓',    'Yatay bandın üst kenarından dönüş (short)'],
+  ranked_entry:         ['sıralı giriş',     'Kesitsel sıralamada üst desile girdiği için alındı'],
+};
+
+// Unknown code falls through as itself rather than as a blank: a label the
+// panel has not learned yet must still be readable and greppable.
+function term(map, code){
+  const k = String(code ?? '').trim();
+  if(!k) return '<span class="faint">—</span>';
+  const e = map[k];
+  return e
+    ? `<span data-tip title="${esc(e[1])}  ·  kod: ${esc(k)}">${esc(e[0])}</span>`
+    : esc(k);
 }
 
 /* ---- equity chart ------------------------------------------------------
@@ -257,7 +397,7 @@ function equityChart(canvas, rows, base){
   eqPts = [];
   if(!rows || rows.length<2){
     c.fillStyle='#6e7681'; c.font='12px ui-monospace,monospace';
-    c.fillText('not enough bars yet', 12, h/2); return;
+    c.fillText('henüz yeterli bar yok', 12, h/2); return;
   }
   const PL=58, PR=10, PT=10, PB=20;
   const vals = rows.map(r=>r.equity);
@@ -343,8 +483,9 @@ function scatter(canvas, points){
   c.strokeStyle='#30363d';
   c.beginPath(); c.moveTo(PL,h-PB); c.lineTo(w-PR,h-PB); c.moveTo(PL,PT); c.lineTo(PL,h-PB); c.stroke();
   c.fillStyle='#8b949e'; c.textAlign='right'; c.textBaseline='alphabetic';
-  c.fillText('MAE (R)', w-PR, h-4);
-  c.save(); c.translate(11,PT+34); c.rotate(-Math.PI/2); c.textAlign='left'; c.fillText('MFE (R)',0,0); c.restore();
+  c.fillText('en kötü nokta · MAE (R)', w-PR, h-4);
+  c.save(); c.translate(11,PT+34); c.rotate(-Math.PI/2); c.textAlign='left';
+  c.fillText('en iyi nokta · MFE (R)',0,0); c.restore();
   points.forEach(p=>{
     const x = PL + Math.abs(p.mae_r)/maxX*(w-PL-PR);
     const y = (h-PB) - Math.max(0,p.mfe_r)/maxY*(h-PT-PB);
@@ -362,19 +503,19 @@ function alerts(s){
   const out = [];
   const age = nz(s.updated_ts) ? (Date.now()-s.updated_ts)/1000 : null;
   if(s.status && s.status!=='running')
-    out.push(['bad','engine ' + s.status, s.degraded_reason || 'the engine is not processing bars']);
+    out.push(['bad','motor ' + s.status, s.degraded_reason || 'motor bar işlemiyor']);
   else if(nz(age) && age>180)
-    out.push(['bad','heartbeat stale', `state.json last written ${ago(s.updated_ts)} — the engine beats every 60s, so it may be stuck`]);
+    out.push(['bad','nabız durdu', `state.json en son ${ago(s.updated_ts)} yazıldı — motor 60 saniyede bir atar, takılmış olabilir`]);
   if(s.degraded_reason && s.status==='running')
-    out.push(['warn','degraded', s.degraded_reason + ' — risk is reduced, not stopped']);
+    out.push(['warn','riski kısılmış', s.degraded_reason + ' — bot durmadı, küçüldü']);
   if(s.last_error)
-    out.push(['warn','last error', `${s.last_error} (${ago(s.last_error_ts)})`]);
+    out.push(['warn','son hata', `${s.last_error} (${ago(s.last_error_ts)})`]);
   if(s.feed && s.feed.stale)
-    out.push(['warn','feed stale','between-bar checks are paused; the engine falls back to bar-close and the venue stop is untouched']);
+    out.push(['warn','fiyat akışı bayat','bar-arası kontroller duruyor; motor bar kapanışına düştü — borsadaki stop yerinde']);
   const sl = s.slippage||{};
   if(sl.worse_than_assumed)
-    out.push(['warn','slippage worse than assumed',
-      `median ${fmt(sl.median_bps,1)}bps · p90 ${fmt(sl.p90_bps,1)}bps vs assumed ${fmt(sl.assumed_bps,1)}bps over ${sl.samples} fills`]);
+    out.push(['warn','kayma varsayılandan kötü',
+      `medyan ${fmt(sl.median_bps,1)}bps · p90 ${fmt(sl.p90_bps,1)}bps, varsayılan ${fmt(sl.assumed_bps,1)}bps · ${sl.samples} dolum`]);
   $('alerts').innerHTML = out.map(([k,t,d])=>
     `<div class="alert ${k}"><b>${esc(t)}</b><span>${esc(d)}</span></div>`).join('');
 }
@@ -388,12 +529,13 @@ async function control(action, btn){
   if(!tok.value){ tok.focus(); return; }
   // flatten sells every open position at market. One click should not be able
   // to do that, so it costs a typed word.
-  if(action==='flatten' && prompt('This closes every open position at market.\nType "flatten" to confirm:') !== 'flatten') return;
+  if(action==='flatten' && prompt('Bu, açık her pozisyonu piyasa fiyatından kapatır.\nOnaylamak için "flatten" yaz:') !== 'flatten') return;
   btn.disabled = true;
   try{
-    const r = await fetch(`/api/control/${action}?token=${encodeURIComponent(tok.value)}`, {method:'POST'});
-    btn.textContent = r.ok ? action+' queued' : (r.status===403 ? 'bad token' : 'failed');
-  }catch{ btn.textContent = 'failed'; }
+    const target = ENGINE === 'combined' ? (ENGINES[0]?.name || 'main') : ENGINE;
+    const r = await fetch(`/api/control/${action}?token=${encodeURIComponent(tok.value)}&engine=${encodeURIComponent(target)}`, {method:'POST'});
+    btn.textContent = r.ok ? action+' sıraya alındı' : (r.status===403 ? 'token hatalı' : 'başarısız');
+  }catch{ btn.textContent = 'başarısız'; }
   setTimeout(()=>{ btn.textContent = action; btn.disabled = false; }, 2500);
   refresh();
 }
@@ -406,6 +548,14 @@ get('/api/meta').then(m => { if(m && m.unscored_reasons) UNSCORED = new Set(m.un
 let lastEq = null, lastEx = null, lastBase = null;
 
 async function refresh(){
+  // "Toplam" is a view over the engines rather than one of them, so it takes a
+  // different path entirely: nothing below this point makes sense when the
+  // numbers come from two databases.
+  const combined = ENGINE === 'combined';
+  $('grid').style.display = combined ? 'none' : '';
+  $('combined').style.display = combined ? '' : 'none';
+  if(combined) return renderCombined();
+
   // One round trip for all of it — sequential awaits made the page update in
   // visible stages, with the tables lagging the header by a second.
   const [s0, scan0, reasons, trades, eq, ex] = await Promise.all([
@@ -417,22 +567,22 @@ async function refresh(){
   $('status').textContent = s.status || '—';
   $('status').className = 'pill ' + (s.status||'');
   $('mode').textContent = `${s.mode||'—'} · ${s.venue||'—'}`;
-  $('uptime').textContent = s.uptime_human ? `up ${s.uptime_human} · ${s.bars_processed||0} bars` : '';
-  $('bar').textContent = s.last_bar_iso ? `bar ${s.last_bar_iso}` : '';
+  $('uptime').textContent = s.uptime_human ? `${s.uptime_human} ayakta · ${s.bars_processed||0} bar` : '';
+  $('bar').textContent = s.last_bar_iso ? `son bar ${s.last_bar_iso}` : '';
 
   // The between-bar feed is an improvement, never a dependency: when it is
   // stale the bot falls back to bar-close behaviour and the venue stop is
   // untouched. Say which of the two is happening rather than implying trouble.
   const f = s.feed||{}, fp = $('feed');
   if(!Object.keys(f).length){ fp.textContent=''; fp.className='pill'; }
-  else if(f.stale){ fp.textContent='feed stale — bar-close only'; fp.className='pill warn'; }
-  else { fp.textContent=`feed ${f.symbols||0} sym · ${fmt(f.age_seconds,1)}s`; fp.className='pill ok'; }
+  else if(f.stale){ fp.textContent='akış bayat — sadece bar kapanışı'; fp.className='pill warn'; }
+  else { fp.textContent=`akış ${f.symbols||0} sembol · ${fmt(f.age_seconds,1)}s`; fp.className='pill ok'; }
 
   // The heartbeat is the dead-man switch (60s). Showing when it last beat is
   // the difference between "waiting for the next bar" and "hung an hour ago".
   const age = nz(s.updated_ts) ? (Date.now()-s.updated_ts)/1000 : null;
   const bp = $('beat');
-  bp.textContent = nz(age) ? 'beat ' + ago(s.updated_ts) : '';
+  bp.textContent = nz(age) ? 'nabız ' + ago(s.updated_ts) : '';
   bp.className = 'pill ' + (!nz(age) ? '' : age>180 ? 'bad' : age>120 ? 'warn' : 'ok');
 
   alerts(s);
@@ -445,17 +595,29 @@ async function refresh(){
   const pos = s.open_positions||[];
   const sl = s.slippage||{};
   $('kpis').innerHTML = [
-    ['Equity',    fmt(s.equity),                 cls(delta), base?`start ${fmt(base)}`:''],
-    ['Return',    pct(ret),                      cls(ret),   nz(delta)?`${sign(delta)} USDT`:''],
-    ['Drawdown',  pct(s.drawdown),               s.drawdown>0.1?'warn':'', `peak ${fmt(s.peak_equity)}`],
-    ['Cash',      fmt(s.cash),                   '',         base?`${pct(s.cash/s.equity)} of equity`:''],
-    ['Risk mult', fmt(s.risk_multiplier)+'×',    s.risk_multiplier<1?'warn':'pos', s.risk_multiplier<1?'reduced':'full size'],
-    ['Threshold', fmt(s.threshold,0),            '',         'conviction to enter'],
-    ['Positions', pos.length,                    pos.length?'':'dim', `${s.universe_size||0} symbols scanned`],
-    ['Leverage',  fmt(s.leverage_allowed,1)+'×', '',         s.leverage_allowed>1?'gate passed':'spot only'],
-    ['Slippage',  sl.samples?fmt(sl.median_bps,1)+'bps':'—', sl.worse_than_assumed?'warn':'', sl.samples?`${sl.samples} fills · assumed ${fmt(sl.assumed_bps,0)}`:'no fills yet'],
-    ['Restarts',  s.restarts||0,                 (s.restarts||0)>5?'warn':'', 'this install'],
-  ].map(([l,v,k,sub])=>`<div class="kpi"><div class="label">${l}</div>
+    ['Equity',   fmt(s.equity), cls(delta), base?`başlangıç ${fmt(base)}`:'',
+      'Hesabın toplam değeri: nakit + açık pozisyonların güncel piyasa değeri. Canlıda borsadan okunur.'],
+    ['Getiri',   pct(ret), cls(ret), nz(delta)?`${sign(delta)} USDT`:'',
+      'Bu koşunun başlangıç equity\'sine göre değişim. Sabit bir tabana göre değil — hesap ne ile başladıysa ona göre.'],
+    ['Düşüş',    pct(s.drawdown), s.drawdown>0.1?'warn':'', `zirve ${fmt(s.peak_equity)}`,
+      'Gördüğü en yüksek equity\'den şu ana kadarki geri çekilme. Acının ölçüsü budur, getiri değil.'],
+    ['Nakit',    fmt(s.cash), '', base?`equity\'nin ${pct(s.cash/s.equity)}\'i`:'',
+      'Pozisyona bağlanmamış, yeni giriş için harcanabilir USDT.'],
+    ['Risk çarpanı', fmt(s.risk_multiplier)+'×', s.risk_multiplier<1?'warn':'pos',
+      s.risk_multiplier<1?'kısılmış':'tam boyut',
+      'Pozisyon boyutu bu çarpanla ölçekleniyor. Zararda bot durmaz, küçülür: çarpan düşer ama asla sıfır olmaz.'],
+    ['Eşik',     fmt(s.threshold,0), '', 'girmek için gereken puan',
+      'Bir sembolün işleme girmesi için geçmesi gereken conviction puanı (0-100). Piyasaya göre oynar.'],
+    ['Pozisyon', pos.length, pos.length?'':'dim', `${s.universe_size||0} sembol tarandı`,
+      'Şu anda açık pozisyon sayısı / bu barda taranan sembol sayısı.'],
+    ['Kaldıraç', fmt(s.leverage_allowed,1)+'×', '', s.leverage_allowed>1?'kapı geçildi':'kaldıraçsız',
+      'İzin verilen azami kaldıraç. Kod kendiliğinden 1.0\'ın üstüne çıkamaz; kapı geçilse bile senin tavanını aşamaz.'],
+    ['Kayma',    sl.samples?fmt(sl.median_bps,1)+'bps':'—', sl.worse_than_assumed?'warn':'',
+      sl.samples?`${sl.samples} dolum · varsayılan ${fmt(sl.assumed_bps,0)}`:'henüz dolum yok',
+      'Beklenen fiyat ile gerçekleşen fiyat arasındaki fark (baz puan). Varsayılandan kötüyse backtest sayıları iyimser demektir.'],
+    ['Restart',  s.restarts||0, (s.restarts||0)>5?'warn':'', 'bu kurulumda',
+      'Motorun kaç kez yeniden başladığı. Sürekli artıyorsa bir şey onu düşürüyor.'],
+  ].map(([l,v,k,sub,tip])=>`<div class="kpi"><div class="label"${tip?` title="${esc(tip)}"`:''}>${l}</div>
       <div class="value ${k}">${v}</div><div class="sub">${esc(sub||'')}</div></div>`).join('');
 
   // Price comes from the holdings read, so open R is the venue's number rather
@@ -464,16 +626,25 @@ async function refresh(){
   (s.balances||[]).forEach(b=>{ if(nz(b.price)) price[b.coin] = b.price; });
 
   table($('positions'),
-    [{t:'symbol'},{t:'setup'},{t:'entry',num:1},{t:'price',num:1},{t:'stop',num:1},
-     {t:'R now',num:1},{t:'MFE R',num:1},{t:'MAE R',num:1},{t:'to stop',num:1},
-     {t:'bars',num:1},{t:'conviction',num:1},{t:'',cl:'fill'}],
+    [{t:'sembol', h:'Hangi enstrümanda pozisyon açık'},
+     {t:'kurulum', h:'Girişi tetikleyen kurulum. Üzerine gelince ne olduğunu anlatır'},
+     {t:'giriş', num:1, h:'Pozisyona girilen fiyat'},
+     {t:'fiyat', num:1, h:'Borsadan okunan anlık fiyat — son bar kapanışı değil'},
+     {t:'stop', num:1, h:'Koruyucu stop seviyesi. Borsada duruyor, yani bot kapalıyken de korur'},
+     {t:'R şimdi', num:1, h:'Şu anki kâr/zarar, risk birimi cinsinden. 1R = giriş ile ilk stop arası mesafe. +1.05 = risk ettiğinin 1.05 katı kârda'},
+     {t:'en iyi', num:1, h:'MFE — pozisyon açıkken görülen en iyi nokta (R). Masada ne kadar kâr durmuştu'},
+     {t:'en kötü', num:1, h:'MAE — görülen en kötü nokta (R). −1.00 stop demektir'},
+     {t:'stop payı', num:1, h:'Şu anki fiyattan stop\'a yüzde kaç kaldı'},
+     {t:'bar', num:1, h:'Pozisyon kaç bardır açık'},
+     {t:'puan', num:1, h:'Girişteki conviction skoru (0-100)'},
+     {t:'',cl:'fill'}],
     pos, p=>{
       const px = price[(p.symbol||'').split('/')[0]];
       const risk = Math.abs(p.entry - p.stop) || null;
       const dir = p.side==='sell' ? -1 : 1;
       const r = nz(px) && risk ? dir*(px-p.entry)/risk : null;
       const toStop = nz(px) && px ? dir*(px-p.stop)/px : null;
-      return `<tr><td class="sym">${esc(p.symbol)}</td><td class="dim">${esc(p.setup)}</td>
+      return `<tr><td class="sym">${esc(p.symbol)}</td><td class="dim">${term(SETUP, p.setup)}</td>
         <td class="num">${fmt(p.entry,4)}</td>
         <td class="num">${nz(px)?fmt(px,4):'—'}</td>
         <td class="num warn">${fmt(p.stop,4)}</td>
@@ -488,7 +659,13 @@ async function refresh(){
   // Three columns, not one. Showing only "free" would report a position that
   // is correctly protected — its stop reserves the base asset — as no position.
   table($('balances'),
-    [{t:'coin'},{t:'free',num:1},{t:'locked',num:1},{t:'total',num:1},{t:'price',num:1},{t:'value',num:1},{t:'',cl:'fill'}],
+    [{t:'varlık', h:'Hesapta duran coin'},
+     {t:'serbest', num:1, h:'Şu anda harcanabilir ya da satılabilir miktar'},
+     {t:'kilitli', num:1, h:'Bekleyen bir emrin rezerve ettiği miktar. Koruyucu stop varlığın tamamını kilitler — korunan pozisyonun serbesti sıfırdır'},
+     {t:'toplam', num:1, h:'Sahip olunan miktar: serbest + kilitli'},
+     {t:'fiyat', num:1, h:'Birim fiyat (USDT)'},
+     {t:'değer', num:1, h:'Toplam × fiyat, USDT cinsinden'},
+     {t:'',cl:'fill'}],
     s.balances, b=>`<tr><td class="sym">${esc(b.coin)}</td>
       <td class="num">${fmt(b.free,6)}</td>
       <td class="num ${b.used>0?'warn':'faint'}">${fmt(b.used,6)}</td>
@@ -498,10 +675,15 @@ async function refresh(){
 
   const scan = scan0 || (s.scan_top||[]).map(r=>({...r,no_trade_reason:r.reason}));
   $('scanmeta').textContent = scan && scan.length
-    ? `${scan.length} symbols · ${scan.filter(r=>!UNSCORED.has(r.no_trade_reason)).length} scored`
-    : 'every symbol, every bar';
+    ? `${scan.length} sembol · ${scan.filter(r=>!UNSCORED.has(r.no_trade_reason)).length} tanesi puanlandı`
+    : 'her sembol, her bar';
   table($('scan'),
-    [{t:'symbol'},{t:'regime'},{t:'score',num:1},{t:'threshold',num:1},{t:'',w:'110px'},{t:'status',cl:'fill'}],
+    [{t:'sembol', h:'Taranan enstrüman'},
+     {t:'rejim', h:'Günlük piyasa rejimi. Hangi kurulumların puanlanabileceğini belirler'},
+     {t:'puan', num:1, h:'Conviction skoru (0-100). — ise sembol puanlanmadan elendi, sıfır değil: motor fikir oluşturmadı'},
+     {t:'eşik', num:1, h:'Bu barda girmek için gereken puan'},
+     {t:'', w:'110px', h:'Puanın eşiğe oranı — çubuk dolduğunda eşik geçilmiş demektir'},
+     {t:'durum', cl:'fill', h:'Bu barda neden işleme girmedi. Üzerine gelince açıklaması çıkar'}],
     scan, r=>{
       // A vetoed symbol was never scored (invariant 10) — "0.0" would claim a
       // measurement the engine never made.
@@ -510,27 +692,34 @@ async function refresh(){
       const ok = !unscored && score>=thr;
       const w = unscored ? 0 : Math.min(100, Math.max(2, score/thr*100));
       return `<tr class="${unscored?'muted':''}"><td class="sym">${esc(r.symbol)}</td>
-        <td class="dim">${esc(r.regime)}</td>
+        <td class="dim">${term(REGIME, r.regime)}</td>
         <td class="num ${unscored?'faint':ok?'pos':''}">${unscored?'—':fmt(score,1)}</td>
         <td class="num faint">${fmt(thr,0)}</td>
         <td><div class="bar ${unscored?'none':''}">${unscored?'':`<i class="${ok?'ok':''}" style="width:${w}%"></i>`}</div></td>
-        <td class="fill ${unscored?'faint':'dim'}">${esc(r.no_trade_reason||'eligible')}</td></tr>`;
+        <td class="fill ${unscored?'faint':'dim'}">${term(REASON, r.no_trade_reason||'eligible')}</td></tr>`;
     });
 
   const total = (reasons||[]).reduce((a,r)=>a+r.n,0) || 1;
-  table($('reasons'), [{t:'reason',cl:'fill'},{t:'count',num:1},{t:'',w:'80px'}], reasons,
-    r=>`<tr><td>${esc(r.reason||'eligible')}</td><td class="num">${r.n}</td>
+  table($('reasons'),
+    [{t:'sebep', cl:'fill', h:'Son 24 saatte taranan sembollerin neden işleme girmediği'},
+     {t:'adet', num:1, h:'Kaç sembol-bar bu sebeple elendi'},
+     {t:'', w:'80px'}], reasons,
+    r=>`<tr><td>${term(REASON, r.reason||'eligible')}</td><td class="num">${r.n}</td>
       <td><div class="bar"><i style="width:${r.n/total*100}%"></i></div></td></tr>`);
 
   table($('trades'),
-    [{t:'closed'},{t:'symbol'},{t:'R',num:1},{t:'bars',num:1},{t:'exit',cl:'fill'}], trades,
+    [{t:'kapanış', h:'Pozisyonun kapandığı zaman (UTC)'},
+     {t:'sembol'},
+     {t:'R', num:1, h:'Sonuç, risk birimi cinsinden. −1.00 tam stop, +2.00 risk ettiğinin iki katı kâr'},
+     {t:'bar', num:1, h:'Pozisyon kaç bar açık kaldı'},
+     {t:'çıkış sebebi', cl:'fill', h:'Pozisyonu hangi çıkış katmanı kapattı'}], trades,
     t=>`<tr><td class="faint">${stamp(t.exit_ts)}</td><td class="sym">${esc(t.symbol)}</td>
       <td class="num ${cls(t.r_multiple)}">${sign(t.r_multiple)}</td>
-      <td class="num dim">${t.bars_held}</td><td class="dim fill">${esc(t.exit_reason)}</td></tr>`);
+      <td class="num dim">${t.bars_held}</td><td class="dim fill">${term(EXIT, t.exit_reason)}</td></tr>`);
 
   lastEq = eq; lastBase = base; lastEx = ex;
   if(eq && eq.length){
-    $('eqrange').textContent = `${eq.length} bars · ${stamp(eq[0].ts)} → ${stamp(eq[eq.length-1].ts)}`;
+    $('eqrange').textContent = `${eq.length} bar · ${stamp(eq[0].ts)} → ${stamp(eq[eq.length-1].ts)}`;
   }
   equityChart($('equity'), eq, base);
   // An empty 260px canvas is worse than no panel: it reads as a chart that
@@ -546,7 +735,7 @@ async function refresh(){
     exCard.querySelector('.note').hidden = true;
     if(!exCard.querySelector('.empty'))
       exCard.insertAdjacentHTML('beforeend',
-        '<div class="empty">no closed trades yet — this fills in once the first position exits</div>');
+        '<div class="empty">henüz kapanmış işlem yok — ilk pozisyon çıkınca burası dolar</div>');
   }
 }
 
@@ -559,7 +748,75 @@ addEventListener('resize', ()=>{
 });
 bindTip($('equity'), $('eqtip'), 2);
 
-refresh(); setInterval(refresh, 10000);
+/* ---- engines and tabs -------------------------------------------------- */
+const LABEL = {main:'Ana motor', fast:'Hızlı motor'};
+
+function renderTabs(){
+  const box = $('tabs');
+  box.innerHTML = '';
+  for(const e of ENGINES){
+    const b = document.createElement('button');
+    const st = (e.state && e.state.status) || '';
+    const cls = st === 'running' ? 'running' : (st ? 'stopped' : '');
+    b.innerHTML = `<span class="dot ${cls}"></span>${LABEL[e.name] || e.name}`;
+    b.title = `${e.market} · ${e.runtime_dir} · :${e.port}`;
+    if(e.name === ENGINE) b.className = 'on';
+    b.onclick = () => { ENGINE = e.name; renderTabs(); refresh(); };
+    box.appendChild(b);
+  }
+  if(ENGINES.length > 1){
+    const b = document.createElement('button');
+    b.textContent = 'Toplam';
+    if(ENGINE === 'combined') b.className = 'on';
+    b.onclick = () => { ENGINE = 'combined'; renderTabs(); refresh(); };
+    box.appendChild(b);
+  }
+}
+
+async function loadEngines(){
+  const rows = await get('/api/engines');
+  if(!rows || !rows.length) return;
+  ENGINES = rows;
+  const primary = rows.find(e => e.primary);
+  if(primary && !rows.some(e => e.name === ENGINE)) ENGINE = primary.name;
+  renderTabs();
+}
+
+// Named apart from pct() on purpose. Both were called `pct`, and a function
+// declaration hoists over the whole script — so this one replaced the other
+// everywhere, and every percentage on the page rendered as "—".
+function pctChange(now, start){
+  if(!start || !isFinite(start) || !isFinite(now)) return '—';
+  return ((now/start - 1) * 100).toFixed(2) + '%';
+}
+
+async function renderCombined(){
+  // Asks every engine rather than trusting one: the account total is the sum
+  // of what each engine believes, and a disagreement is itself worth seeing.
+  const rows = await get('/api/engines') || [];
+  ENGINES = rows;
+  let total = 0, positions = 0, known = 0;
+  let html = '<table class="sum"><tr><th>motor</th><th>piyasa</th><th>durum</th>'
+           + '<th>equity</th><th>getiri</th><th>pozisyon</th></tr>';
+  for(const e of rows){
+    const st = e.state || {};
+    const eq = Number(st.equity);
+    if(isFinite(eq)){ total += eq; known++; }
+    positions += st.open_positions || 0;
+    const live = st.status === 'running';
+    html += `<tr><td>${LABEL[e.name] || e.name}</td><td>${e.market}</td>`
+         +  `<td class="${live?'ok':'faint'}">${st.status || 'hiç çalışmadı'}</td>`
+         +  `<td>${isFinite(eq) ? eq.toFixed(2) : '—'}</td>`
+         +  `<td>${pctChange(eq, Number(st.starting_equity))}</td>`
+         +  `<td>${st.open_positions ?? '—'}</td></tr>`;
+  }
+  html += `<tr class="total"><td>toplam</td><td></td><td></td>`
+       +  `<td>${known ? total.toFixed(2) : '—'}</td><td></td><td>${positions}</td></tr></table>`;
+  $('sumtable').innerHTML = html;
+}
+
+loadEngines().then(refresh);
+setInterval(refresh, 10000);
 </script>
 </body>
 </html>

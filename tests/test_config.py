@@ -87,11 +87,22 @@ def test_conviction_floor_cannot_exceed_base_threshold():
 
 
 def test_leverage_ceiling_is_capped_at_user_limit():
-    RiskConfig(max_leverage=2.0)
+    RiskConfig(max_leverage=3.0)  # the operator's authorised ceiling
     with pytest.raises(ValidationError):
-        RiskConfig(max_leverage=3.0)  # above the agreed 2x ceiling
+        RiskConfig(max_leverage=3.5)  # above it, and no flag raises it
     with pytest.raises(ValidationError):
         RiskConfig(max_leverage=0.5)  # sub-1x is not a thing
+
+
+def test_leverage_defaults_to_one_even_though_the_ceiling_is_higher():
+    """Raising the ceiling must not raise the usage. Invariant 8.
+
+    The ceiling moved from 2.0 to 3.0 because the operator authorised it. That
+    is a permission, not an instruction, and the two have to stay separable:
+    leverage multiplies expectancy without changing its sign, so applying it to
+    an unproven strategy just reaches the same answer faster.
+    """
+    assert RiskConfig().max_leverage == 1.0
 
 
 def test_zero_slippage_backtest_is_rejected():

@@ -65,7 +65,7 @@ from tbot.engine.portfolio import Portfolio
 from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.engine.watchdog import Watchdog
 from tbot.execution.broker import Broker, client_order_id
-from tbot.execution.ccxt_broker import CCXTBroker
+from tbot.execution.ccxt_broker import CCXTBroker, PerpBroker
 from tbot.execution.paper_broker import PaperBroker
 from tbot.execution.reconcile import apply as apply_reconcile
 from tbot.execution.reconcile import reconcile
@@ -84,8 +84,14 @@ from tbot.risk.leverage import LeverageGate
 from tbot.risk.sizing import correlation_conflict, size_position
 from tbot.strategy.conviction import UNSCORED_REASONS, ConvictionEngine, ScoringContext
 from tbot.strategy.exits import ExitManager
+from tbot.strategy.ranking import CrossSectionalRanker
 from tbot.strategy.regime import classify_series
-from tbot.strategy.setups import DEFAULT_SETUPS, detect_all, fallback_candidate
+from tbot.strategy.setups import (
+    DEFAULT_SETUPS,
+    detect_all,
+    fallback_candidate,
+    setups_for,
+)
 
 log = get_logger("engine.runner")
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -113,6 +119,7 @@ class Runner:
     edge_decay_bars: dict[str, int] = field(default_factory=dict)
 
     conviction: ConvictionEngine = field(init=False)
+    ranker: CrossSectionalRanker = field(init=False)
     exits: ExitManager = field(init=False)
     risk: RiskBudget = field(init=False)
     portfolio: Portfolio = field(init=False)
@@ -162,6 +169,11 @@ class Runner:
             selected_by_regime=self.selected_by_regime,
         )
         self.exits = ExitManager(self.config.exits, self.edge_decay_bars)
+        self.ranker = CrossSectionalRanker(
+            top_percentile=self.config.conviction.top_percentile,
+            min_universe=self.config.conviction.min_universe_for_ranking,
+            min_absolute_score=self.config.conviction.rank_absolute_floor,
+        )
         self.risk = RiskBudget(self.config.risk)
         self.portfolio = Portfolio(starting_cash=self.config.starting_balance)
         self.writer = StateWriter(self.config.state_path)
@@ -240,6 +252,27 @@ class Runner:
             # Invariant: in live mode the balance comes from the venue, never
             # from config. Seeding here keeps the portfolio, the sizing cash
             # limit and the equity curve on the same real number.
+            #
+            # ``max_capital`` is the exception, and it exists because the real
+            # number stops being *this engine's* number once two engines share
+            # an account. Measured on the demo account: a perpetual fill is
+            # settled out of the same Unified USDT balance the spot engine
+            # sizes against, so both engines would read the full balance, both
+            # would adopt it as their own starting equity, and between them
+            # they would risk twice what either believes it is risking.
+            #
+            # Capped, this engine's equity is its own profit and loss on its own
+            # allocation — which is also the only equity curve that means
+            # anything when judging its hypothesis.
+            cap = self.config.risk.max_capital
+            if cap > 0 and balance > cap:
+                log.info(
+                    "capital_capped",
+                    venue_balance=round(balance, 2),
+                    cap=cap,
+                    reason="this engine shares the account and sizes against its own allocation",
+                )
+                balance = cap
             self.portfolio.seed_from_venue(balance)
             balance = self.portfolio.equity({})
             self._check_balance_against_last_run(balance)
@@ -658,6 +691,11 @@ class Runner:
             regime=Regime(order.meta.get("regime", Regime.UNKNOWN.value)),
         )
         position.meta["entry_atr"] = self._atr_for(data, self.config.exits.trail_timeframe)
+        # What the symbol had already done before this entry. H17 pre-registers
+        # a counter-hypothesis: if the short side only pays in falling markets,
+        # it is a directional bet rather than an edge, and that cannot be told
+        # apart after the fact without this number.
+        position.meta["entry_drift_7d"] = self._recent_drift(data["trigger"])
         self.db.upsert_position(position)
 
         log.info(
@@ -1060,11 +1098,13 @@ class Runner:
             if position.current_stop <= position.initial_stop
             else ExitReason.TRAILING_STOP
         )
+        closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
         trade = self.portfolio.close_position(symbol, price, now_ms(), reason, fee)
         if trade is None:
             return
 
         self.db.record_trade(trade)
+        self._record_trade_context(closing_meta, trade)
         self.db.delete_position(symbol)
         self.risk.record_trade(trade)
         self.state.open_positions = self._positions_view()
@@ -1129,11 +1169,12 @@ class Runner:
             return
 
         order = self.broker.build_order(
+            namespace=self.config.engine.namespace,
             strategy=position.setup,
             symbol=position.symbol,
             bar_ts=bar_ts,
             action="scaleout",
-            side=Side.SELL,
+            side=position.side.opposite,
             quantity=wanted,
             order_type=OrderType.MARKET,
             reduce_only=True,
@@ -1365,25 +1406,50 @@ class Runner:
                 llm_veto=self._llm_veto,
             )
 
-            conviction = self.conviction.score(ctx, Side.BUY, drawdown_bump, streak_bump)
-            self.db.record_conviction(conviction)
+            # Both directions, when the market can express both. The scorer is
+            # already side-aware (``want = side.sign``), and ScanRow has carried
+            # a ``best_side`` field since before anything could ever set it to
+            # anything but BUY — spot cannot sell what it does not hold.
+            allow_short = self.config.entries.allow_short
+            best = None
+            for side in (Side.BUY, Side.SELL) if allow_short else (Side.BUY,):
+                scored = self.conviction.score(ctx, side, drawdown_bump, streak_bump)
+                self.db.record_conviction(scored)
+                if best is None:
+                    best = scored
+                    continue
+                # A side that is merely low-scoring still beats one the
+                # permission layer refused outright: a blocked side has no
+                # opinion, it is not a weak opinion (invariant 10).
+                blocked_now = scored.no_trade_reason is not None
+                blocked_best = best.no_trade_reason is not None
+                if (blocked_best and not blocked_now) or (
+                    blocked_best == blocked_now and scored.total > best.total
+                ):
+                    best = scored
 
+            conviction = best
             reason = conviction.no_trade_reason
-            if (
-                reason is None
-                and self.config.entries.require_setup
-                and not detect_all(
-                    setup, regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
-                )
-            ):
-                reason = NoTradeReason.NO_SETUP
+            if reason is None and self.config.entries.require_setup:
+                triggered = [
+                    c
+                    for c in detect_all(
+                        setup,
+                        regime,
+                        self.config.exits.initial_stop_atr_mult,
+                        setups_for(allow_short),
+                    )
+                    if c.side is conviction.side
+                ]
+                if not triggered:
+                    reason = NoTradeReason.NO_SETUP
 
             rows.append(
                 ScanRow(
                     symbol=symbol,
                     bar_ts=bar_ts,
                     regime=regime,
-                    best_side=Side.BUY,
+                    best_side=conviction.side,
                     score=conviction.total,
                     threshold=conviction.threshold,
                     no_trade_reason=reason,
@@ -1397,6 +1463,46 @@ class Runner:
 
         return rows
 
+    def _select(self, scans: list[ScanRow]) -> list[ScanRow]:
+        """Which scanned rows may be entered on this bar.
+
+        This existed only in the backtest. The live engine compared every symbol
+        to the absolute threshold and entered whatever cleared it, while
+        ``conviction.selection`` said ``cross_sectional`` and the backtest
+        obeyed it — so the two paths were answering different questions, and
+        every number in the repo comes from the backtest's answer.
+
+        The gap is not academic. Cross-sectional ranking re-admits symbols the
+        threshold rejected, as long as they are the best of the bar and clear
+        ``rank_absolute_floor`` (40). Live, nothing in the band between 40 and
+        the threshold could ever trade. Measured on the running engine, four to
+        six of twenty-one symbols clear the threshold on a typical bar, against
+        a top decile of about two — so the two rules also disagree about how
+        selective they are, in both directions.
+        """
+        if self.config.conviction.selection == "absolute":
+            return [r for r in scans if r.no_trade_reason is None]
+
+        # Rank only what passed the structural gates. A symbol the portfolio
+        # cannot take would otherwise occupy a place in the top slice.
+        open_rows = {
+            r.symbol: r
+            for r in scans
+            if r.no_trade_reason in (None, NoTradeReason.BELOW_THRESHOLD)
+        }
+        if not open_rows:
+            return []
+
+        selected: list[ScanRow] = []
+        for candidate in self.ranker.rank({s: r.score for s, r in open_rows.items()}):
+            row = open_rows[candidate.symbol]
+            if candidate.eligible:
+                row.no_trade_reason = None
+                selected.append(row)
+            elif row.no_trade_reason is None:
+                row.no_trade_reason = NoTradeReason.BELOW_THRESHOLD
+        return selected
+
     def _maybe_enter(self, frames: dict, scans: list[ScanRow], bar_ts: int) -> None:
         """Try candidates best-first, and leave a reason on every one of them.
 
@@ -1405,7 +1511,7 @@ class Runner:
         a symbol that was considered and passed over — and that table exists
         precisely so "why did it not trade?" is answered by query, not guess.
         """
-        candidates = sorted((r for r in scans if r.no_trade_reason is None), key=lambda r: -r.score)
+        candidates = sorted(self._select(scans), key=lambda r: -r.score)
         for index, row in enumerate(candidates):
             if len(self.portfolio.positions) >= self.config.risk.max_positions:
                 for remaining in candidates[index:]:
@@ -1421,9 +1527,20 @@ class Runner:
 
     def _enter(self, data: dict, row: ScanRow, bar_ts: int) -> bool:
         setup_frame = data["setup"]
-        setups = detect_all(
-            setup_frame, row.regime, self.config.exits.initial_stop_atr_mult, DEFAULT_SETUPS
-        )
+        side = row.best_side
+        # Only setups that agree with the side the scoring chose. A long setup
+        # firing on a bar the cross-section wants short is not a reason to go
+        # long; it is a different trade.
+        setups = [
+            c
+            for c in detect_all(
+                setup_frame,
+                row.regime,
+                self.config.exits.initial_stop_atr_mult,
+                setups_for(self.config.entries.allow_short),
+            )
+            if c.side is side
+        ]
         if setups:
             candidate = setups[0]
         elif self.config.entries.require_setup:
@@ -1432,14 +1549,16 @@ class Runner:
             return False
         else:
             candidate = fallback_candidate(
-                setup_frame, row.regime, self.config.exits.initial_stop_atr_mult
+                setup_frame, row.regime, self.config.exits.initial_stop_atr_mult, side
             )
             if candidate is None:
                 row.no_trade_reason = NoTradeReason.NO_SETUP
                 return False
         price = float(data["trigger"]["close"].iloc[-1])
-        stop = price - candidate.stop_distance
-        if stop >= price:
+        # The candidate's own stop was measured against the setup timeframe's
+        # close; re-anchor the same distance to the price actually being paid.
+        stop = price - candidate.stop_distance if side is Side.BUY else price + candidate.stop_distance
+        if (side is Side.BUY and stop >= price) or (side is Side.SELL and stop <= price):
             row.no_trade_reason = NoTradeReason.NO_SETUP
             return False
 
@@ -1472,11 +1591,12 @@ class Runner:
             return False
 
         order = self.broker.build_order(
+            namespace=self.config.engine.namespace,
             strategy=candidate.name,
             symbol=row.symbol,
             bar_ts=bar_ts,
             action="entry",
-            side=Side.BUY,
+            side=side,
             quantity=sizing.quantity,
             order_type=OrderType.MARKET,
         )
@@ -1686,7 +1806,9 @@ class Runner:
         if not sizing.ok:
             return False
 
-        client_id = client_order_id(candidate.name, row.symbol, bar_ts, "arm")
+        client_id = client_order_id(
+            candidate.name, row.symbol, bar_ts, "arm", self.config.engine.namespace
+        )
         order_id = self.watchdog.call(
             "place_stop_entry",
             lambda: self.broker.place_stop_entry(
@@ -1871,7 +1993,11 @@ class Runner:
         # venue already refused. Duplicate stops are prevented by place_stop
         # adopting an existing one, not by the id being stable.
         client_id = client_order_id(
-            position.setup, position.symbol, bar_ts, f"stop-{int(now_ms() / 1000)}"
+            position.setup,
+            position.symbol,
+            bar_ts,
+            f"stop-{int(now_ms() / 1000)}",
+            self.config.engine.namespace,
         )
         order_id = self.watchdog.call(
             "place_stop",
@@ -1885,6 +2011,7 @@ class Runner:
             # of reporting it as an orphan on every start — a warning nothing
             # can clear is a warning that gets ignored.
             position.meta["stop_client_id"] = client_id
+            self._place_venue_target(position)
             self.db.upsert_position(position)
         else:
             # The position is now protected only while this process is alive.
@@ -1898,6 +2025,70 @@ class Runner:
                     "Stop not placed at venue",
                     f"{position.symbol} is protected only while the bot is running.",
                 )
+
+    def _recent_drift(self, frame) -> float | None:
+        """The symbol's own return over the week before entry.
+
+        Not a signal — nothing reads it to make a decision. It is recorded so
+        the question "did this only work because everything was falling?" can be
+        answered by query later, rather than argued about.
+        """
+        bars = int(7 * 86_400_000 / tf_ms(self.config.timeframes.trigger))
+        closes = frame["close"]
+        if len(closes) <= bars:
+            return None
+        past = float(closes.iloc[-1 - bars])
+        if past <= 0:
+            return None
+        return float(closes.iloc[-1]) / past - 1.0
+
+    def _record_trade_context(self, meta: dict, trade) -> None:
+        """One row per closed trade, carrying what the hypothesis is judged on."""
+        self.db.record_event(
+            "trade_context",
+            f"{trade.symbol} {trade.side.value} {trade.r_multiple:+.2f}R",
+            payload={
+                "symbol": trade.symbol,
+                "side": trade.side.value,
+                "setup": trade.setup,
+                "regime_at_entry": trade.regime_at_entry.value,
+                "entry_drift_7d": meta.get("entry_drift_7d"),
+                "r_multiple": round(trade.r_multiple, 4),
+                "pnl": round(trade.pnl, 6),
+                "bars_held": trade.bars_held,
+                "exit_reason": trade.exit_reason.value,
+            },
+        )
+
+    def _place_venue_target(self, position) -> None:
+        """Put the profit target at the venue, where perpetuals allow it.
+
+        Invariant 39 says the target lives in the engine, and on spot it has to:
+        a resting stop locks the base asset, so the second reduce-only order is
+        refused ``170131``. That is a property of spot, not of the strategy —
+        and measured on perpetuals the venue accepts a stop and a take-profit on
+        the same position in one call.
+
+        The difference is worth taking. An engine-side target only works while
+        this process is running; a venue-side one survives a crash, a restart
+        and a lost network, which is the same argument that put the stop at the
+        venue in the first place.
+
+        Failure is not fatal. The engine still evaluates the target itself, so
+        the worst case is the behaviour spot has always had.
+        """
+        if not isinstance(self.broker, PerpBroker):
+            return
+        target = self.exits.target_price(position)
+        if target is None:
+            return
+        placed = self.watchdog.call(
+            "place_take_profit",
+            lambda: self.broker.place_take_profit(position.symbol, target),
+            default=False,
+        )
+        if placed:
+            position.meta["tp_price"] = target
 
     def _sync_protective_stop(self, position) -> None:
         """Move the venue stop when the trail ratchets up."""
@@ -1930,11 +2121,15 @@ class Runner:
             return
 
         order = self.broker.build_order(
+            namespace=self.config.engine.namespace,
             strategy=position.setup,
             symbol=symbol,
             bar_ts=bar_ts,
             action="exit",
-            side=Side.SELL,
+            # Closing a short is a buy. Hardcoding SELL was correct for as long
+            # as nothing could be short, and would have sent a second sell — at
+            # best rejected, at worst doubling the position.
+            side=position.side.opposite,
             quantity=position.quantity,
             order_type=OrderType.MARKET,
             reduce_only=True,
@@ -1956,6 +2151,7 @@ class Runner:
 
         spec = self.broker.market_spec(symbol)
         fee = price * position.quantity * spec.taker_fee
+        closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
         trade = self.portfolio.close_position(
             symbol, price, bar_ts, reason or ExitReason.TRAILING_STOP, fee
         )
@@ -1963,6 +2159,7 @@ class Runner:
             return
 
         self.db.record_trade(trade)
+        self._record_trade_context(closing_meta, trade)
         self.db.delete_position(symbol)
         self.risk.record_trade(trade)
 
@@ -2049,10 +2246,21 @@ class Runner:
         if self.config.mode is not Mode.LIVE:
             return
 
-        venue_positions = (
-            self.watchdog.call("fetch_positions", lambda: self.broker.fetch_positions(), default={})
-            or {}
+        # None means the venue could not be read. Treating that as an empty
+        # account here would file every local position as "missing at the
+        # venue" on a startup that merely began during a network blip, and the
+        # operator would be handed a page of warnings about positions that are
+        # fine. Refuse to reconcile instead of reconciling against nothing.
+        venue_positions = self.watchdog.call(
+            "fetch_positions", lambda: self.broker.fetch_positions(), default=None
         )
+        if venue_positions is None:
+            log.error(
+                "reconcile_skipped",
+                reason="venue positions could not be read",
+                consequence="local positions are kept as-is until the next successful read",
+            )
+            return
         open_orders = (
             self.watchdog.call(
                 "fetch_open_orders", lambda: self.broker.fetch_open_orders(), default=[]
@@ -2435,6 +2643,23 @@ def build_broker(config: Config, secrets: Secrets, symbols: list[str]) -> Broker
         )
 
     key, secret = secrets.credentials_for(config.venue)
+    if config.execution.market_type == "linear":
+        perp = PerpBroker(
+            key,
+            secret,
+            config.venue,
+            config.quote_currency,
+            margin_mode=config.execution.margin_mode,
+            leverage=config.risk.max_leverage,
+        )
+        perp.load_markets()
+        perp.refresh_fees(symbols)
+        # Before anything can be ordered. An engine that starts while the venue
+        # is set to a leverage it does not know about would size every position
+        # correctly and carry a liquidation risk nothing downstream measures.
+        perp.assert_venue_ready(symbols)
+        return perp
+
     broker = CCXTBroker(key, secret, config.venue, config.quote_currency)
     broker.load_markets()
     broker.refresh_fees(symbols)

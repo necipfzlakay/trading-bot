@@ -30,8 +30,103 @@ bir sonrakinin barını yükseltiyor.
 
 | 14 | Kurulum kapısı gereksiz — kesitsel sıralama tek başına yeter (açık hipotez #4) | mimari denetim | **test edildi, REDDEDİLDİ** — 3.6x işlem (103→367) ama Kapı 1'de 5/6 → **2/6**, PBO 0.33 → **0.67** | 1 |
 | 15 | Taker akış dengesizliği (CVD) kısa vadede edge taşır | fiyattan bağımsız tek kaynak | **taranıp REDDEDİLDİ** — üst desil lift +0.8 puan, gereken +13. Strateji koşulmadı | 0 (indikatör taraması) |
+| 16 | Perp ücret katmanı ve short tarafı kısa vadeli aritmetiği değiştirir | operatör sorusu | **tarandı** — maliyet %0.30→%0.07, short tabanı long'dan +2.1 puan iyi. Açık %8.8 puandan **%1.8 puana** indi, ama kapanmadı | 0 (bariyer taraması, strateji koşulmadı) |
+| 17 | **Kesitsel conviction skoru perp'te SHORT tarafında %0.07 maliyeti karşılar** | H16'nın bıraktığı açık | **ÖN-KAYITLI, ileri test koşuyor** — aşağıya bakın | 1 |
 
-**Kümülatif deneme: 16.** Bir sonraki CPCV koşusunda `--trials 16` geçirin.
+**Kümülatif deneme: 17.** Bir sonraki CPCV koşusunda `--trials 17` geçirin.
+
+## 17. deneme: H17 — ÖN-KAYIT (sonuç görülmeden yazıldı)
+
+**Tarih:** 2026-09-19 · **Motor:** `config/fast.yaml` · **Branch:** `feat/capital-recycling`
+
+Bu bölüm **motor çalıştırılmadan önce** yazıldı. Sebebi denetim #47 ve #49: kendi
+tamirimin ölçümüne başkasınınki kadar şüpheyle bakmadığım için bir kez yanlış
+atıf yaptım. Beklentiyi önceden yazmak, sonucu gördükten sonra hikâyeyi ona
+uydurmayı imkânsız kılıyor.
+
+### Hipotez
+
+> Bybit linear perpetual'da, kesitsel conviction skorunun **alt** ucunu short'layıp
+> üst ucunu long'lamak, %0.07'lik gidiş-dönüş maliyetini karşılayacak edge taşır.
+
+### Neden bu soru soruluyor
+
+Kısa vadeli al-sat üç ölçümle kapatılmıştı (değişmez kural 53). Operatörün
+"konuşmadığımız bir şey var mıydı" sorusu iki varsayımı kırdı:
+
+| varsayım | ölçüm |
+|---|---|
+| maliyet %0.30 | spot'ta öyle; **perp'te taker %0.06 / maker %0.01**, gerçekçi tur **%0.07** |
+| sadece long ölçüldü | short tabanı her ufukta long'dan **+1.4 ila +2.2 puan** iyi |
+
+H=24, +2%/−1% bariyerde (21 sembol × 3 yıl, D40 kötümser):
+
+```
+LONG  base   %31.8   |  SHORT base   %33.9   |  adil %33.3  |  gereken %35.7
+```
+
+Açık **%8.8 puandan %1.8 puana** indi. Dokümanda kayıtlı en iyi sinyal lifti
+**+2.6 puan**. Yani aritmetik olarak ilk kez geçilebilir bir açık var.
+
+### Beklenen sonuç (ön-kayıt)
+
+**NEGATİF. İşlem başına ≈ −0,05%.**
+
+Gerekçe: arşivde o +1.8 puanlık lifti **bulamadım**. Denenen ve başarısız olan:
+
+- 24 barlık `price_slope` alt desili + short: %32.6 — short tabanından (%33.9) **kötü**
+- volatilite koşullandırması: her ATR desilinde düz (%30.7–%32.8)
+- ATR'ye ölçeklenmiş bariyer: %30.4, adil oranın altında
+- daha kısa bar (5m/15m): gereken isabet %48.9 / %38.0'a çıkıyor, elimizdeki ~%33
+
+Bulunan tek pozitif hücre (1h, +3%/−1.5%, 48 bar, short: %35.2 vs gereken %34.9)
+iki sebeple sayılmıyor: **0.71 sigma**, ve örneklem ayı piyasası (12 sembolün
+medyanı −%51.5, 11'i düşmüş).
+
+### Karşı-hipotez, aynı anda ön-kayıtlı
+
+**Kâr yalnızca düşen rejim işlemlerinden geliyorsa bu edge değil, yön bahsidir.**
+Rejim ayrımı bunu zaten gösterdi:
+
+| giriş öncesi 1 haftalık getiri | isabet | edge |
+|---|---|---|
+| düşen (<−5%) | %37.11 | **+2.23%** |
+| yatay (±5%) | %33.15 | −1.74% |
+| yükselen (>+5%) | %34.15 | −0.74% |
+
+Bu yüzden her işlemle birlikte **giriş rejimi ve giriş öncesi 1 haftalık sembol
+getirisi** kaydediliyor. Ayrım yapılamazsa sonuç yorumlanamaz.
+
+### Tam şartname (serbest parametre araması YOK)
+
+| | |
+|---|---|
+| evren | linear perp, 24s hacimde üst 30, `min_history_days: 540` |
+| zaman dilimleri | 1d izin / 4h kurulum / 1h tetik — ana motorla **aynı** |
+| yön | kesitsel sıralamanın üstü long, altı short |
+| kurulumlar | long 3 + **aynalanmış short 3** (kapı kaldırılmadı — değişmez kural 52) |
+| çıkış | hedef 2×ATR, stop 1×ATR, **48 bar sert zaman stop'u** |
+| boyut | $300 sert tavan, %1.2 risk, **1x kaldıraç** |
+| eşitlik | aynı barda hedef ve stop → stop (değişmez kural 40) |
+
+### Kill kriterleri (koşmadan önce yazıldı)
+
+| durum | aksiyon |
+|---|---|
+| < 50 kapanmış işlem | **hiçbir yargı yok** — hiçbir istatistik bu sayıda anlamlı değil |
+| 50 işlemde beklenti bootstrap %95 CI'si tamamen sıfırın altında | **kapat** ve buraya yaz |
+| CI sıfırı içeriyor | 100 işleme uzat |
+| CI tamamen sıfırın üstünde | Kapı 1'e taşı (CPCV + DSR, `--trials 17`) |
+| kâr yalnızca düşen rejimden | **yön bahsi**, edge değil — kapat |
+| $300 tahsisinde −%15 | dondur: yeni giriş yok, mevcutlar yönetilir |
+
+### Neden bu bir deneme sayılıyor ama veri madenlenmiş değil
+
+Hipotezin **seçimi** arşive bakarak yapıldı, o yüzden DSR'a bir deneme olarak
+giriyor (16 → 17). Ama **testi** ileriye dönük, daha önce hiç sorgulanmamış veri
+üzerinde: farklı enstrüman (perp), farklı evren (30 kontrat, 12'si spot evreninde
+yok), farklı yön (short hiç işlem görmedi). `hypotheses.md`'nin "taze veri" çıkış
+yolu tam olarak bu.
 
 ## 14. deneme: kurulum kapısı gerçekten gerekliymiş
 

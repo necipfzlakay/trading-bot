@@ -134,18 +134,32 @@ def classify_latest(df: pd.DataFrame, **kwargs) -> Regime:
     return Regime(series.iloc[-1])
 
 
-def regime_allows(regime: Regime, side: str) -> bool:
+def regime_allows(regime: Regime, side: str, allow_short: bool = False) -> bool:
     """Whether the permission layer lets a side be considered at all.
 
-    Spot-only and long-only by default: in a downtrend the correct spot position
-    is cash, and in a volatility panic the correct position is whatever is
-    already open, not a new one.
+    Long-only by default, and that default is not conservatism — it is what
+    spot can express. Without a derivative there is nothing to sell, so in a
+    downtrend the correct spot position is cash.
+
+    ``allow_short`` opens the mirror image, and only a perpetual engine passes
+    it. The asymmetry that stays is HIGH_VOL and UNKNOWN: a volatility panic is
+    not a direction, and neither is an unclassified bar, so no new position is
+    opened in either regardless of side.
+
+    Opening TREND_DOWN to shorts is worth naming as a change of scope rather
+    than a setting: it is 16.5% of bars that the engine has never traded, and
+    the short side is the only measured asymmetry in this universe (base hit
+    rate 33.9% against 31.8% long, measured across three years in which the
+    market rose). It is pre-registered as H17.
     """
     if regime is Regime.TREND_UP:
         return side == "buy"
+    if regime is Regime.TREND_DOWN:
+        return allow_short and side == "sell"
     if regime is Regime.RANGE:
-        return side == "buy"  # dip buying only; shorts need the leverage gate
-    return False  # TREND_DOWN, HIGH_VOL, UNKNOWN
+        # Both edges of a range are tradeable once shorting is possible.
+        return side == "buy" or (allow_short and side == "sell")
+    return False  # HIGH_VOL, UNKNOWN
 
 
 def regime_stats(labels: pd.Series) -> pd.DataFrame:

@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 403 test
+.venv/bin/python -m pytest -q             # 434 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -104,7 +104,7 @@ testi oku — hepsinin kendini koruyan bir testi var.
     hesaplanmış bir sayıya fiyat değdi mi — tek izinli soru. Oluşmakta olan barda
     indikatör hesaplamak backtest'in canlı yolu üretmesini imkânsız kılar, ki bu
     repodaki her sayı ona dayanıyor. → `ExitManager.evaluate_intrabar`
-39. **Bybit spot'ta stop ve kar-al aynı anda duramaz.** Stop base varlığı
+39. **Bybit spot'ta stop ve kar-al aynı anda duramaz** (perp'te durabilir — bkz. 56). Stop base varlığı
     kilitliyor; ikinci reduce-only emir `170131` ile reddediliyor (demo'da
     ölçüldü). Bu yüzden **stop borsada, hedef motorda**. Asimetri kasıtlı:
     kaçırılan hedef fırsat kaybı, eksik stop sermaye kaybı.
@@ -137,6 +137,45 @@ testi oku — hepsinin kendini koruyan bir testi var.
     maliyeti karşılamak için isabet %43.3 gerekiyor; taban %31.9, en iyi fiyat
     sinyali %34.5, taker akış dengesizliği %30.7. Edge gerçek ama komisyonun
     sekizde biri. → `research/short_term_feasibility.md`
+
+54. **İki motor tek hesapta = emir kimliğinde isim alanı.** `client_id`
+    hash'i (strateji, sembol, bar, aksiyon) idi; `cross_sectional` modda her
+    motor `ranked_entry` ürettiği için iki motor aynı barda **birebir aynı
+    id**'yi hesaplıyor. İkincisinin `submit`'i birincinin emrini bulup kendi
+    emri sanıp benimsiyor. Boş isim alanı eski id'yi bit-bit koruyor, yani
+    çalışan motor migrasyon istemiyor. → `client_order_id(..., namespace)`
+55. **Okunamayan bakiye boş hesap değildir.** `_balances` hata yakalayınca boş
+    sözlük dönüyordu ve bu "her şey satıldı" ile ayırt edilemiyordu. 4 saatlik
+    ağ kesintisinde motor yerinde duran pozisyonu `position_inventory_missing`
+    diye işaretledi; kurtaran şey stop sorgusunun da aynı anda başarısız olup
+    akışı "yüksek sesle bildir" dalına düşürmesiydi — tasarım değil şans.
+    Artık `None` dönüyor ve `_reconcile` okuyamadığı borsayla mutabakat
+    yapmayı reddediyor.
+56. **Perp'te stop ve kar-al aynı anda durabilir.** Değişmez kural 39 spot'a
+    özgüymüş: orada stop base varlığı kilitlediği için ikinci reduce-only emir
+    `170131` alıyor. Perpetual'da ikisi de pozisyona bağlanıyor ve **tek
+    çağrıda kabul ediliyor** (demo'da ölçüldü). Yani hızlı motorda hedef
+    borsada yaşıyor ve süreç kapalıyken de korur. → `place_take_profit`
+57. **Kaldıraç, margin bayrağından daha bağlayıcı.** UTA hesapta
+    `marginMode: ISOLATED_MARGIN` kabul ediliyor ama pozisyon hâlâ
+    `tradeMode=0` (cross) raporluyor — bayrağı şart koşmak doğru kurulmuş bir
+    hesabı reddederdi. Asıl koruma kaldıraç: **1x'te pozisyon %100 teminatlı,
+    short likidasyonu girişten %99 uzakta; 3x'te bu %33'e iner.** Bu yüzden
+    doğrulanan şey kaldıraç, ve cross margin yalnız 1x'te tolere ediliyor.
+    → `PerpBroker.assert_venue_ready`
+58. **Daha kısa bar daha kötü, ölçüldü.** Operatörün sorusu üzerine Bybit
+    perp'ten 5m (90g) ve 15m (180g) çekilip aynı bariyer testi koşuldu:
+    gereken isabet 5m'de **%48.9**, 15m'de %38.0, 1h'te %35.7 — elimizdeki her
+    üçünde de ~%33. Maliyet hareketten önce yakalıyor. Günde birden fazla işlem
+    daha hızlı bardan değil, iki yönden + 771 sembolden + zaman stop'undan
+    gelir.
+59. **Canlı ile backtest aynı seçim kuralını kullanmak zorunda.**
+    `conviction.selection: cross_sectional` yazıyordu; backtest onu uyguluyor,
+    canlı runner'da sıralayıcı **hiç yoktu** — canlı mutlak eşik (62) ile
+    çalışıyordu. Backtest üst desili alıp `rank_absolute_floor`'a (40) kadar
+    eşik altındakileri geri kabul ediyor. 40–62 bandında backtest işlem açıyor,
+    canlı hiç açmıyordu. Repodaki her sayı backtest'in cevabından geliyor.
+    → `Runner._select`
 
 51. **Kuyruğu kesen her şey pahalıdır.** Kârın tamamı MFE 3R+ gören ~%20'lik
     işlemden geliyor (21 işlem +460, diğer 82 işlem −385). Erken çıkan her
@@ -271,6 +310,34 @@ Bunun hiçbir işlem güvenliği etkisi yok — panel ayrı süreç ve salt-okur
 çöküşünü yalnız kendi stderr'i biliyordu. Denetim #24'ün ("`bot.jsonl` hiç
 yazılmıyordu") aynı sınıftan bir tekrarı: ölçüm aracının ölçülmemesi.
 
+### Altıncı tur (2026-09-20, ikinci motor kurulurken)
+
+Üçü kod okurken, üçü borsaya sorarak bulundu.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 53 | **Canlı motor `conviction.selection`'ı hiç okumuyordu.** Config `cross_sectional` diyor, backtest uyguluyor, canlı runner'da sıralayıcı **yok** — canlı mutlak eşikle (62) çalışıyor. Backtest üst desili alıp eşik altındakileri `rank_absolute_floor`'a (40) kadar geri kabul ediyor, yani 40–62 bandında backtest işlem açıyor canlı açmıyor. **Repodaki her sayı backtest'in cevabından geliyor** | yüksek | `Runner._select` eklendi. Bot #1'in işlem popülasyonunu değiştirir → restart operatörün kararına bırakıldı |
+| 54 | **`_balances` başarısız okumada boş sözlük dönüyordu**, bu da "hesap boş" ile aynı değer. 4 saatlik kesintide yerinde duran pozisyon `position_inventory_missing` diye işaretlendi; kurtaran şey stop sorgusunun da aynı anda düşmesiydi — tasarım değil şans | yüksek | `None` dönüyor; `_reconcile` okunamayan borsayla mutabakatı reddediyor |
+| 55 | **`client_order_id`'de motor kimliği yoktu.** `cross_sectional` modda iki motor aynı barda birebir aynı id üretiyor; ikincisinin `submit`'i birincinin emrini benimsiyor | kritik (ikinci motor için) | `namespace` eklendi. Boş isim alanı eski id'yi bit-bit koruyor → çalışan motor migrasyon istemedi |
+| 56 | **`linear_symbol` zaten kontrat olan sembole quote'u ikinci kez ekliyordu** (`SOL/USDT:USDT:USDT`). Perp evreni sessizce **sıfır** funding, sıfır OI, sıfır long/short çekti; `derivatives` kategorisi (skorun %10'u) hiçbir şeye oy vermedi. Güvenli bozuluyor, o yüzden fark edilmesi zor | orta | düzeltildi; ölçüm: funding 2.191, OI 6.000, ls 6.000 satır/sembol |
+| 57 | **Kök `Config` bilinmeyen anahtarı yutuyordu.** Değişmez kural 50 her *bölümü* kapatmıştı ama kökü değil — üst seviye bir yazım hatası okunuyormuş gibi duruyordu | orta | kök de `extra="forbid"` |
+| 58 | `fetchTradingFees` perp'te `Illegal category`, demo'da hesap fee endpoint'i de 10001 — yani okunacak bir katman yok. Kalıcı `fee_fetch_failed` uyarısı üretiyordu | düşük | `fee_tier_unavailable` info'ya indi, market metadata kullanılıyor (probe'un ölçtüğüyle aynı: %0.06/%0.01) |
+
+### Ölçülmüş borsa gerçekleri — linear perpetual (2026-09-20, demo'da emirle)
+
+`scripts/perp_probe.py` ile tekrar üretilebilir. Tam çıktı: `research/perp_venue_facts.md`.
+
+| deneme | sonuç |
+|---|---|
+| Aynı pozisyonda stop **ve** kar-al, tek çağrıda | ✅ kabul — spot'ta `170131` idi (değişmez kural 39/56) |
+| Native trailing stop | ✅ kabul — spot'ta reddediliyordu |
+| Hesap tipi | UTA (`unifiedMarginStatus=3`), `marginMode=ISOLATED_MARGIN` |
+| Pozisyonun raporladığı `tradeMode` | ❌ `0` (cross) — **hesap bayrağı etkisiz**, bkz. değişmez kural 57 |
+| 1x short likidasyon mesafesi | girişten **+%99**; `positionIM` = notional'ın %100'ü |
+| Perp işlemi spot USDT'yi oynatıyor mu | ✅ **evet** — cüzdan paylaşımlı, izolasyon inşa edilmeli |
+| `$300` @ %1.2 risk, %2.6 stop → $138 notional | **400/400 sembol** ifade edilebiliyor (spot'ta $100'da adayların %97.5'i eleniyordu) |
+| Komisyon (market metadata, emirle doğrulandı) | taker %0.06, maker %0.01 → tur %0.12 taker, **%0.07 maker-giriş/taker-çıkış** |
+
 ### Ölçülmüş borsa gerçekleri (2026-09-18, demo hesapta tek tek denendi)
 
 Varsayım değil, ccxt bayrağı değil — gerçek emirlerle sınandı. `fetchTradingFees`
@@ -346,14 +413,16 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 | `backtest/engine.py` `align.py` `metrics.py` | Replay, hizalama, metrikler |
 | `backtest/cpcv.py` `dsr.py` `montecarlo.py` `excursion.py` | Kapı 1 aletleri |
 | `llm/provider.py` `roles.py` `redact.py` | 5 rol, bütçe, whitelist redaksiyon |
-| `web/app.py` | Yerel panel (localhost) |
+| `web/app.py` | Yerel panel (localhost), motor başına sekme |
+| `execution/ccxt_broker.py::PerpBroker` | Linear perpetual: short, borsa tarafı hedef, kaldıraç kapısı |
 
 ## Komutlar
 
 ```bash
 ./ops/pre-install.sh                                      # tüm kurulum + ölçüm
-./ops/bot.sh start paper|demo|live                        # 7/24 (launchd üretir)
-./ops/bot.sh status | stop | restart | logs -f
+./ops/bot.sh start paper|demo|live|fast                   # 7/24 (launchd üretir)
+./ops/bot.sh status | stop | restart | logs -f            # motor adı opsiyonel
+./ops/bot.sh engines                                      # tanımlı motorlar
 
 python scripts/backfill.py --years 3 --with-derivatives   # veri (resumable)
 python scripts/ic_report.py --timeframe 1d                # indikatör ölçümü
@@ -361,7 +430,8 @@ python scripts/backtest.py                                # backtest + rapor
 python scripts/cpcv_report.py --trials N                  # KAPI 1 kararı
 python scripts/exit_optimizer.py                          # MAE/MFE kalibrasyon
 python scripts/run.py --config config/paper.yaml          # canlı motor
-python scripts/dashboard.py                               # panel :8787
+python scripts/dashboard.py --config config/fast.yaml     # panel :8788 (sekmeli, iki motor)
+python scripts/perp_probe.py                              # perp borsa gerçekleri
 python scripts/report.py --since 30d                      # durum raporu
 python scripts/llm_impact.py                              # LLM karşı-olgusal
 ```
@@ -488,8 +558,9 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 16** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 16` geçirin — DSR her denemeyi fiyatlıyor.
+**Kümülatif deneme: 17** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 17` geçirin — DSR her denemeyi fiyatlıyor. 17'nci H17:
+perp + short, ön-kayıtlı, ileri testte.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir
@@ -511,3 +582,20 @@ barını yükseltiyor.
 - [x] Faz 8 — LLM rolleri + redaksiyon + etki ölçümü
 - [ ] Faz 9 — Bybit demo, 4 hafta (Kapı 1 geçilmeden anlamsız)
 - [ ] Faz 10 — canlı $100 (Kapı 3'e bağlı)
+
+### İkinci motor ("fast") — kurulu, başlatılmadı
+
+Ana motor (`config/demo.yaml`) hiç değişmeden çalışmaya devam ediyor. Yanında
+`config/fast.yaml`: linear perpetual, iki yönlü, $300 sert tavan, 1x kaldıraç.
+
+- [x] Borsa gerçekleri ölçüldü (`scripts/perp_probe.py`)
+- [x] İzolasyon: isim alanı, `runtime-fast/`, ayrı launchd etiketleri, panel sekmesi
+- [x] `PerpBroker` + kaldıraç kapısı + borsa tarafı hedef
+- [x] Short tarafı: rejim izni, 3 aynalanmış kurulum, portföy marj muhasebesi, backtest kolu
+- [x] Veri: 30 perp sembol × 3 TF × 2 yıl, 90/90 temiz, türevler dahil
+- [x] H17 ön-kaydı + kill kriterleri (`research/hypotheses.md`)
+- [ ] **Başlatma — operatör onayı bekliyor** (`./ops/bot.sh start fast`)
+
+**Beklenen sonuç ön-kayıtlı: negatif, işlem başına ≈ −%0.05.** İleri testin
+amacı bunu doğrulamak ya da çürütmek; taze veri DSR bütçesinden belgelenen tek
+çıkış yolu.

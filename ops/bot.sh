@@ -23,9 +23,73 @@ cd "$PROJ" || exit 1
 
 PY="$PROJ/.venv/bin/python"
 AGENTS="$HOME/Library/LaunchAgents"
+
+# One checkout can run more than one engine against the same exchange account:
+# the main spot engine and the short-horizon perpetual engine. Everything that
+# distinguishes them — launchd labels, runtime directory, log paths, panel port
+# — is derived from the engine's own config rather than a table kept here, for
+# the same reason installed_mode() reads the plist back instead of remembering
+# it: a second copy of the truth is a second thing that can drift.
+#
+# An empty namespace reproduces the original single-engine names exactly, so an
+# engine that is already installed keeps its labels, its plist and its paths.
 BOT=com.tbot.bot
 WEB=com.tbot.web
 HEALTH=com.tbot.health
+RUNTIME=runtime
+PORT=8787
+NS=""
+WANT_MODE=""
+WANT_VENUE=""
+
+engine_vars() {
+  local mode="$1" line
+  line=$("$PY" - "$mode" <<'ENGINE_VARS_PY' 2>/dev/null
+import pathlib
+import sys
+
+sys.path.insert(0, "src")
+from tbot.core.config import load_config
+
+cfg = load_config(f"config/{sys.argv[1]}.yaml")
+# runtime_dir is absolutised at load time; the shell wants it relative to PROJ.
+try:
+    runtime = cfg.runtime_dir.relative_to(pathlib.Path.cwd())
+except ValueError:
+    runtime = cfg.runtime_dir
+print(
+    "\t".join(
+        [cfg.engine.namespace, str(runtime), str(cfg.web.port), cfg.mode.value, cfg.venue.value]
+    )
+)
+ENGINE_VARS_PY
+  ) || return 1
+  [[ -n "$line" ]] || return 1
+
+  NS=$(printf '%s' "$line" | cut -f1)
+  RUNTIME=$(printf '%s' "$line" | cut -f2)
+  PORT=$(printf '%s' "$line" | cut -f3)
+  WANT_MODE=$(printf '%s' "$line" | cut -f4)
+  WANT_VENUE=$(printf '%s' "$line" | cut -f5)
+
+  if [[ -n "$NS" ]]; then
+    BOT="com.tbot.$NS.bot"; WEB="com.tbot.$NS.web"; HEALTH="com.tbot.$NS.health"
+  else
+    BOT=com.tbot.bot; WEB=com.tbot.web; HEALTH=com.tbot.health
+  fi
+}
+
+# Every config that defines an engine, so status and stop can act on all of
+# them without being told which ones exist.
+all_engines() {
+  local f base
+  for f in config/*.yaml; do
+    base=$(basename "$f" .yaml)
+    [[ "$base" == "base" ]] && continue
+    grep -q '^mode:' "$f" || continue
+    printf '%s\n' "$base"
+  done
+}
 
 if [[ -t 1 ]]; then
   B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; N=$'\033[0m'
@@ -41,20 +105,28 @@ head_() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
 
 usage() {
   cat <<'USAGE'
-Usage: ./ops/bot.sh <command> [args]
+Usage: ./ops/bot.sh <command> [engine] [args]
 
-  start [paper|demo|live]   preflight, install the launchd agents, verify start
-  stop                      unload every agent (this is the "manual shutdown")
-  restart                   stop, then start the mode that is currently installed
-  status                    what is installed, what is running, what it is doing
-  logs [-f] [N]             recent engine events (-f follows)
-  mode                      which mode is installed right now
+  start <engine>            preflight, install the launchd agents, verify start
+  stop [engine]             unload agents. With no engine, stops them all.
+  restart [engine]          stop, then start again
+  status [engine]           what is installed, what is running, what it is doing
+  logs [engine] [-f] [N]    recent engine events (-f follows)
+  mode                      which config the installed agent points at
+  engines                   every engine this checkout defines
 
-Modes:
+Engines (one config each, in config/):
   paper   live prices, simulated fills. No API key. Safe default.
   demo    real Bybit order flow against virtual money. Needs BYBIT_DEMO_* keys.
   live    REAL MONEY. Refuses to install unless Gate 1 passed and you type the
           confirmation phrase. Cannot be forced with a flag.
+  fast    short-horizon, two-sided, linear perpetuals. Separate runtime
+          directory, separate launchd labels, its own order namespace — it can
+          run alongside demo against the same account.
+
+An engine's namespace (engine.namespace in its config) decides its launchd
+labels and therefore whether it is a separate service. paper, demo and live
+share the default namespace and so replace one another; fast does not.
 USAGE
 }
 
@@ -63,9 +135,10 @@ USAGE
 installed_mode() {
   # The mode is whatever config the installed agent actually points at, read
   # back from the plist rather than remembered in a file that could drift.
-  [[ -f "$AGENTS/$BOT.plist" ]] || return 1
+  local label="${1:-$BOT}"
+  [[ -f "$AGENTS/$label.plist" ]] || return 1
   local cfg
-  cfg=$(grep -oE 'config/[a-z0-9_]+\.yaml' "$AGENTS/$BOT.plist" | head -1) || return 1
+  cfg=$(grep -oE 'config/[a-z0-9_]+\.yaml' "$AGENTS/$label.plist" | head -1) || return 1
   [[ -n "$cfg" ]] || return 1
   basename "$cfg" .yaml
 }
@@ -121,15 +194,18 @@ preflight() {
   # An engine already holding the lock means starting another would be refused
   # at best and duplicate every position at worst. Catch it here, not in a
   # restart loop.
-  if [[ -f runtime/engine.lock ]]; then
+  # Scoped to this engine's runtime directory. The lock is per-inode, so two
+  # engines with different runtime dirs legitimately hold two locks; checking a
+  # hardcoded path here would refuse the second engine for the first one's sake.
+  if [[ -f "$RUNTIME/engine.lock" ]]; then
     local holder
-    holder=$(cat runtime/engine.lock 2>/dev/null)
+    holder=$(cat "$RUNTIME/engine.lock" 2>/dev/null)
     if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
-      bad "an engine is already running (pid $holder) — ./ops/bot.sh stop first"
+      bad "engine '$mode' is already running (pid $holder) — ./ops/bot.sh stop $mode first"
       return 1
     fi
   fi
-  ok "no other engine holds the lock"
+  ok "no other engine holds $RUNTIME/engine.lock"
 
   # Everything the engine does before it trades, in the same order it does it.
   TBOT_CONFIRM_LIVE="${TBOT_CONFIRM_LIVE:-}" "$PY" - "$mode" <<'PYEOF'
@@ -269,7 +345,7 @@ WARNING
 # stale plist pointing at an old directory is a silent way to run the wrong code.
 write_plists() {
   local mode="$1"
-  mkdir -p "$AGENTS" "$PROJ/runtime/logs"
+  mkdir -p "$AGENTS" "$PROJ/$RUNTIME/logs"
 
   local live_env=""
   if [[ "$mode" == "live" ]]; then
@@ -311,9 +387,9 @@ write_plists() {
   <integer>30</integer>
 
   <key>StandardOutPath</key>
-  <string>$PROJ/runtime/logs/launchd.out.log</string>
+  <string>$PROJ/$RUNTIME/logs/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>$PROJ/runtime/logs/launchd.err.log</string>
+  <string>$PROJ/$RUNTIME/logs/launchd.err.log</string>
 
   <key>EnvironmentVariables</key>
   <dict>
@@ -343,6 +419,10 @@ PLIST
   <array>
     <string>$PY</string>
     <string>$PROJ/scripts/dashboard.py</string>
+    <!-- Without this the panel falls back to config/base.yaml, which pins it to
+         runtime/ and port 8787 no matter which engine it was installed for. -->
+    <string>--config</string>
+    <string>config/$mode.yaml</string>
   </array>
   <key>WorkingDirectory</key>
   <string>$PROJ</string>
@@ -353,9 +433,9 @@ PLIST
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>StandardOutPath</key>
-  <string>$PROJ/runtime/logs/web.out.log</string>
+  <string>$PROJ/$RUNTIME/logs/web.out.log</string>
   <key>StandardErrorPath</key>
-  <string>$PROJ/runtime/logs/web.err.log</string>
+  <string>$PROJ/$RUNTIME/logs/web.err.log</string>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>
@@ -378,6 +458,8 @@ PLIST
   <array>
     <string>$PY</string>
     <string>$PROJ/scripts/healthcheck.py</string>
+    <string>--config</string>
+    <string>config/$mode.yaml</string>
     <string>--backup</string>
     <string>--quiet</string>
   </array>
@@ -388,9 +470,9 @@ PLIST
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>$PROJ/runtime/logs/health.out.log</string>
+  <string>$PROJ/$RUNTIME/logs/health.out.log</string>
   <key>StandardErrorPath</key>
-  <string>$PROJ/runtime/logs/health.err.log</string>
+  <string>$PROJ/$RUNTIME/logs/health.err.log</string>
 </dict>
 </plist>
 PLIST
@@ -407,23 +489,25 @@ verify_started() {
   # running the mode I asked for".
   local waited=0
   while [[ $waited -lt 90 ]]; do
-    if "$PY" - "$mode" <<'PYEOF' 2>/dev/null
+    # What to expect comes from the engine's own config, not a table kept here.
+    # The table had to be edited for every new engine, which is exactly the
+    # kind of second copy that goes stale without anything noticing.
+    if "$PY" - "$RUNTIME" "$WANT_MODE" "$WANT_VENUE" <<'VERIFY_PY' 2>/dev/null
 import json, pathlib, sys, time
 
-mode = sys.argv[1]
-want = {"paper": ("paper", "bybit-demo"),
-        "demo": ("live", "bybit-demo"),
-        "live": ("live", "bybit-live")}[mode]
-
-p = pathlib.Path("runtime/state.json")
+runtime, want_mode, want_venue = sys.argv[1], sys.argv[2], sys.argv[3]
+p = pathlib.Path(runtime) / "state.json"
 if not p.exists():
     raise SystemExit(1)
 s = json.loads(p.read_text(encoding="utf-8"))
 fresh = (time.time() * 1000 - int(s.get("updated_ts", 0))) < 120_000
-if fresh and s.get("status") == "running" and (s.get("mode"), s.get("venue")) == want:
+if fresh and s.get("status") == "running" and (s.get("mode"), s.get("venue")) == (
+    want_mode,
+    want_venue,
+):
     raise SystemExit(0)
 raise SystemExit(1)
-PYEOF
+VERIFY_PY
     then
       ok "engine is up and reporting mode=$mode"
       return 0
@@ -441,10 +525,10 @@ PYEOF
   status=$(agent_exit_status "$BOT")
   [[ -n "$status" && "$status" != "0" ]] && say "  last exit status: $status"
 
-  if [[ -s runtime/logs/launchd.err.log ]]; then
+  if [[ -s "$RUNTIME/logs/launchd.err.log" ]]; then
     say ""
-    say "  ${DIM}runtime/logs/launchd.err.log (tail):${N}"
-    tail -15 runtime/logs/launchd.err.log | sed 's/^/    /'
+    say "  ${DIM}$RUNTIME/logs/launchd.err.log (tail):${N}"
+    tail -15 "$RUNTIME/logs/launchd.err.log" | sed 's/^/    /'
   fi
 
   say ""
@@ -458,12 +542,16 @@ PYEOF
 
 cmd_start() {
   local mode="${1:-paper}"
-  case "$mode" in
-    paper|demo|live) ;;
-    *) bad "unknown mode: $mode (paper, demo or live)"; exit 2 ;;
-  esac
+  if [[ ! -f "config/$mode.yaml" ]]; then
+    bad "unknown engine: $mode — no config/$mode.yaml"
+    say "  available: $(all_engines | tr '\n' ' ')"
+    exit 2
+  fi
+  engine_vars "$mode" || { bad "config/$mode.yaml could not be read"; exit 2; }
 
-  if [[ "$mode" == "live" ]]; then
+  # Real money is decided by the venue the config names, not by the file being
+  # called "live". A new config pointing at bybit-live gets the same gate.
+  if [[ "$WANT_VENUE" == "bybit-live" ]]; then
     confirm_live || exit 1
     # The plist carries TBOT_CONFIRM_LIVE; the preflight runs outside it, so it
     # needs the same variable or assert_runnable would refuse for the wrong reason.
@@ -489,32 +577,48 @@ cmd_start() {
   verify_started "$mode" || exit 1
 
   head_ "Running"
-  say "  mode      $mode"
-  say "  panel     http://127.0.0.1:8787"
-  say "  logs      ./ops/bot.sh logs -f"
+  say "  engine    $mode${NS:+ (namespace $NS)}"
+  say "  runtime   $RUNTIME"
+  say "  panel     http://127.0.0.1:$PORT"
+  say "  logs      ./ops/bot.sh logs $mode -f"
   say "  status    ./ops/bot.sh status"
-  say "  stop      ./ops/bot.sh stop"
+  say "  stop      ./ops/bot.sh stop $mode"
   say ""
   say "  ${DIM}Restarts after any crash and at every login. The health agent checks"
   say "  every 15 minutes and only speaks up when something is wrong.${N}"
 }
 
 cmd_stop() {
-  head_ "Stopping"
-  local any=0
-  for label in "$BOT" "$WEB" "$HEALTH"; do
-    if [[ -f "$AGENTS/$label.plist" ]]; then
-      launchctl unload -w "$AGENTS/$label.plist" 2>/dev/null
-      ok "$label unloaded"
-      any=1
-    fi
+  local want="${1:-}"
+  head_ "Stopping${want:+ $want}"
+  local any=0 mode
+  # With no argument this stops every engine. Stopping only the one whose
+  # labels happen to be loaded in this shell would leave the other trading
+  # while the command reported success.
+  for mode in $(all_engines); do
+    [[ -n "$want" && "$mode" != "$want" ]] && continue
+    engine_vars "$mode" || continue
+    for label in "$BOT" "$WEB" "$HEALTH"; do
+      if [[ -f "$AGENTS/$label.plist" ]]; then
+        launchctl unload -w "$AGENTS/$label.plist" 2>/dev/null
+        ok "$label unloaded"
+        any=1
+      fi
+    done
   done
-  [[ $any -eq 0 ]] && warn "no agents were installed"
+  [[ $any -eq 0 ]] && warn "no agents were installed${want:+ for $want}"
 
   # A manually started engine is not launchd's to stop; say so rather than
-  # reporting success while something is still trading.
-  if pgrep -f "scripts/run.py" >/dev/null 2>&1; then
-    warn "a manually started engine is still running: $(pgrep -f 'scripts/run.py' | tr '\n' ' ')"
+  # reporting success while something is still trading. Scoped to the engines
+  # this command was asked about: an unqualified pgrep reports the *other*
+  # engine, which launchd is managing perfectly well, as a stray process.
+  local stray=""
+  for mode in $(all_engines); do
+    [[ -n "$want" && "$mode" != "$want" ]] && continue
+    stray+="$(pgrep -f "scripts/run.py --config config/$mode.yaml" 2>/dev/null | tr '\n' ' ')"
+  done
+  if [[ -n "${stray// /}" ]]; then
+    warn "a manually started engine is still running: $stray"
   fi
 
   say ""
@@ -522,41 +626,36 @@ cmd_stop() {
   say "  not in this process. To close them instead, use /flatten before stopping.${N}"
 }
 
-cmd_status() {
-  local mode
-  mode=$(installed_mode) || mode=""
+status_one() {
+  local mode="$1"
+  engine_vars "$mode" || return 1
 
-  head_ "Agents"
-  if [[ -z "$mode" ]]; then
-    warn "nothing installed — ./ops/bot.sh start paper"
-  else
-    say "  mode      ${B}$mode${N}"
-    for label in "$BOT" "$WEB" "$HEALTH"; do
-      if is_loaded "$label"; then
-        local pid; pid=$(agent_pid "$label")
-        if [[ -n "$pid" ]]; then
-          ok "$label running (pid $pid)"
-        else
-          local st; st=$(agent_exit_status "$label")
-          if [[ "$label" == "$HEALTH" ]]; then
-            ok "$label scheduled (runs every 15 min)"
-          else
-            warn "$label loaded but not running (last exit ${st:-?})"
-          fi
-        fi
+  head_ "Engine: $mode${NS:+  [namespace $NS]}"
+  say "  runtime   $RUNTIME · panel http://127.0.0.1:$PORT"
+  for label in "$BOT" "$WEB" "$HEALTH"; do
+    if is_loaded "$label"; then
+      local pid; pid=$(agent_pid "$label")
+      if [[ -n "$pid" ]]; then
+        ok "$label running (pid $pid)"
       else
-        warn "$label not loaded"
+        local st; st=$(agent_exit_status "$label")
+        if [[ "$label" == "$HEALTH" ]]; then
+          ok "$label scheduled (runs every 15 min)"
+        else
+          warn "$label loaded but not running (last exit ${st:-?})"
+        fi
       fi
-    done
-  fi
+    else
+      warn "$label not loaded"
+    fi
+  done
 
-  head_ "Engine"
-  "$PY" - <<'PYEOF'
-import json, pathlib, time
+  "$PY" - "$RUNTIME" <<'STATUS_PY'
+import json, pathlib, sys, time
 
-p = pathlib.Path("runtime/state.json")
+p = pathlib.Path(sys.argv[1]) / "state.json"
 if not p.exists():
-    print("  no state.json — the engine has never run")
+    print("  no state.json — this engine has never run")
     raise SystemExit(0)
 
 s = json.loads(p.read_text(encoding="utf-8"))
@@ -567,7 +666,8 @@ G, Y = "\033[32m✓\033[0m", "\033[33m!\033[0m"
 mark = Y if stale else G
 print(f"  {mark} status     {s.get('status')} · updated {age:.0f} min ago")
 print(f"    mode       {s.get('mode')} on {s.get('venue')}")
-print(f"    uptime     {s.get('uptime_human')} · {s.get('bars_processed')} bars · {s.get('restarts')} restarts")
+print(f"    uptime     {s.get('uptime_human')} · {s.get('bars_processed')} bars · "
+      f"{s.get('restarts')} restarts")
 print(f"    equity     {s.get('equity', 0):.2f}  drawdown {s.get('drawdown', 0):.1%}  "
       f"risk x{s.get('risk_multiplier', 1):.2f}")
 
@@ -576,7 +676,7 @@ if positions:
     print(f"    positions  {len(positions)} open")
     for pos in positions[:5]:
         sym = pos.get("symbol", "?")
-        print(f"      {sym:<12} {pos.get('side','')} qty={pos.get('quantity', 0):g} "
+        print(f"      {sym:<14} {pos.get('side',''):<5} qty={pos.get('quantity', 0):g} "
               f"R={pos.get('r_multiple', 0):+.2f}")
 else:
     print("    positions  none")
@@ -587,35 +687,72 @@ if s.get("last_error"):
     print(f"  {Y} last error {s['last_error']}")
 if stale:
     print(f"  {Y} state is stale — if an agent shows as running, it may be wedged")
-PYEOF
+STATUS_PY
 
-  head_ "Health"
-  if "$PY" scripts/healthcheck.py >/dev/null 2>&1; then
+  if "$PY" scripts/healthcheck.py --config "config/$mode.yaml" >/dev/null 2>&1; then
     ok "healthy"
   else
-    warn "healthcheck reports a problem — .venv/bin/python scripts/healthcheck.py"
+    warn "healthcheck reports a problem — .venv/bin/python scripts/healthcheck.py --config config/$mode.yaml"
   fi
 
-  if code_is_stale; then
-    warn "source files are newer than the running engine — it is executing old code"
-    say "    ${DIM}./ops/bot.sh restart${N}"
+  if code_is_stale "$mode"; then
+    warn "source files are newer than this engine — it is executing old code"
+    say "    ${DIM}./ops/bot.sh restart $mode${N}"
+  fi
+}
+
+cmd_status() {
+  local want="${1:-}" mode shown=0
+  for mode in $(all_engines); do
+    [[ -n "$want" && "$mode" != "$want" ]] && continue
+    engine_vars "$mode" || continue
+    # Without an explicit argument, only report engines that are actually
+    # installed — otherwise every config in the directory prints as "not loaded"
+    # and the one real problem is lost in the noise.
+    if [[ -z "$want" ]]; then
+      [[ -f "$AGENTS/$BOT.plist" ]] || continue
+      # paper, demo and live all share the default namespace, so they share one
+      # plist. Only the config that plist actually points at is running; the
+      # others would print the same engine again under a different name.
+      local actual; actual=$(installed_mode) || actual=""
+      [[ "$actual" == "$mode" ]] || continue
+    fi
+    status_one "$mode"
+    shown=1
+  done
+  if [[ $shown -eq 0 ]]; then
+    head_ "Agents"
+    warn "nothing installed — ./ops/bot.sh start demo"
   fi
 }
 
 cmd_logs() {
-  local follow=0 lines=40
+  local follow=0 lines=40 mode="" arg
   for arg in "$@"; do
     case "$arg" in
       -f|--follow) follow=1 ;;
       [0-9]*) lines="$arg" ;;
+      *) [[ -f "config/$arg.yaml" ]] && mode="$arg" ;;
     esac
   done
 
-  local log="runtime/logs/bot.jsonl"
+  # No engine named: the one that is installed, or the first that is.
+  if [[ -z "$mode" ]]; then
+    for candidate in $(all_engines); do
+      engine_vars "$candidate" || continue
+      [[ -f "$AGENTS/$BOT.plist" ]] || continue
+      [[ "$(installed_mode)" == "$candidate" ]] || continue
+      mode="$candidate"; break
+    done
+  fi
+  [[ -z "$mode" ]] && { warn "no engine installed"; return 0; }
+  engine_vars "$mode" || return 1
+
+  local log="$RUNTIME/logs/bot.jsonl"
   if [[ ! -f "$log" ]]; then
     warn "no engine log yet ($log)"
     # launchd's own stderr catches failures that happen before logging starts.
-    [[ -s runtime/logs/launchd.err.log ]] && tail -20 runtime/logs/launchd.err.log
+    [[ -s "$RUNTIME/logs/launchd.err.log" ]] && tail -20 "$RUNTIME/logs/launchd.err.log"
     return 0
   fi
 
@@ -633,15 +770,42 @@ CMD="${1:-}"
 
 case "$CMD" in
   start)   cmd_start "$@" ;;
-  stop)    cmd_stop ;;
+  stop)    cmd_stop "$@" ;;
   restart)
-    mode=$(installed_mode) || { bad "nothing installed — ./ops/bot.sh start paper"; exit 1; }
-    cmd_stop
+    want="${1:-}"
+    if [[ -n "$want" ]]; then
+      engine_vars "$want" || { bad "unknown engine: $want"; exit 1; }
+      mode=$(installed_mode) || mode="$want"
+    else
+      mode=""
+      for candidate in $(all_engines); do
+        engine_vars "$candidate" || continue
+        [[ -f "$AGENTS/$BOT.plist" ]] || continue
+        [[ "$(installed_mode)" == "$candidate" ]] || continue
+        mode="$candidate"; break
+      done
+      [[ -n "$mode" ]] || { bad "nothing installed — ./ops/bot.sh start demo"; exit 1; }
+    fi
+    cmd_stop "$mode"
     cmd_start "$mode"
     ;;
-  status)  cmd_status ;;
+  status)  cmd_status "$@" ;;
   logs)    cmd_logs "$@" ;;
-  mode)    installed_mode || { echo "not installed"; exit 1; } ;;
+  engines) all_engines ;;
+  mode)
+    found=0
+    for candidate in $(all_engines); do
+      engine_vars "$candidate" || continue
+      [[ -f "$AGENTS/$BOT.plist" ]] || continue
+      if [[ "$(installed_mode)" == "$candidate" ]]; then
+        installed_mode
+        found=1
+      fi
+    done
+    # Without this the loop's last failed comparison becomes the exit status,
+    # so `bot.sh mode` printed the right answer and reported failure.
+    [[ $found -eq 1 ]] || { echo "not installed"; exit 1; }
+    ;;
   ""|-h|--help|help) usage ;;
   *) bad "unknown command: $CMD"; say ""; usage; exit 2 ;;
 esac

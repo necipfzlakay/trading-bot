@@ -116,6 +116,7 @@ class ExitReason(StrEnum):
     REGIME_FLIP = "regime_flip"
     CONVICTION_COLLAPSE = "conviction_collapse"
     VOLATILITY_SHOCK = "volatility_shock"
+    TIME_STOP = "time_stop"
     MANUAL_FLATTEN = "manual_flatten"
     LIQUIDATION = "liquidation"
     BACKTEST_END = "backtest_end"

@@ -62,7 +62,10 @@ class BybitFetcher:
 
     # -- universe ----------------------------------------------------------
 
-    def listing_ts(self, symbol: str) -> int | None:
+    def _client(self, category: str) -> ccxt.bybit:
+        return self.linear if category == "linear" else self.spot
+
+    def listing_ts(self, symbol: str, category: str = "spot") -> int | None:
         """Timestamp of the earliest daily candle Bybit has for a symbol.
 
         Costs one request, so it is only called when refreshing the universe.
@@ -71,7 +74,9 @@ class BybitFetcher:
         which would make every symbol look freshly listed.
         """
         try:
-            first = self.spot.fetch_ohlcv(symbol, "1d", since=EPOCH_PROBE_MS, limit=1)
+            first = self._client(category).fetch_ohlcv(
+                symbol, "1d", since=EPOCH_PROBE_MS, limit=1
+            )
         except ccxt.BaseError:
             return None
         return int(first[0][0]) if first else None
@@ -83,17 +88,25 @@ class BybitFetcher:
         min_volume_24h: float = 5_000_000,
         exclude: list[str] | None = None,
         min_history_days: int = 0,
+        category: str = "spot",
     ) -> list[str]:
-        """Most liquid spot pairs by 24h turnover, filtered by volume and history.
+        """Most liquid pairs by 24h turnover, filtered by volume and history.
 
         Two filters, both deliberate. Stablecoin pairs carry volume but no
         directional opportunity. Newly listed pairs carry both volume and
         opportunity but cannot be validated: a strategy tested on a six-week
         listing has been tested against one regime, which is no test at all.
+
+        ``category="linear"`` selects USDT-margined perpetuals instead of spot.
+        The venue names them ``BTCUSDT`` in the ticker feed either way; ccxt
+        calls the perpetual ``BTC/USDT:USDT``, and that settled form is what
+        every downstream caller must see, because it is what distinguishes the
+        contract from the spot pair of the same name.
         """
         self.load_markets()
         exclude_set = set(exclude or [])
-        response = self.spot.publicGetV5MarketTickers({"category": "spot"})
+        client = self._client(category)
+        response = client.publicGetV5MarketTickers({"category": category})
         rows = response["result"]["list"]
 
         candidates: list[tuple[str, float]] = []
@@ -101,10 +114,11 @@ class BybitFetcher:
             raw = row["symbol"]
             if not raw.endswith(quote):
                 continue
-            symbol = f"{raw[: -len(quote)]}/{quote}"
-            if symbol in exclude_set:
+            base = raw[: -len(quote)]
+            symbol = f"{base}/{quote}:{quote}" if category == "linear" else f"{base}/{quote}"
+            if symbol in exclude_set or f"{base}/{quote}" in exclude_set:
                 continue
-            market = self.spot.markets.get(symbol)
+            market = client.markets.get(symbol)
             if not market or not market.get("active"):
                 continue
             turnover = float(row.get("turnover24h") or 0.0)
@@ -121,7 +135,7 @@ class BybitFetcher:
             for symbol, _ in candidates:
                 if len(selected) >= top_n:
                     break
-                listed = self.listing_ts(symbol)
+                listed = self.listing_ts(symbol, category)
                 if listed is None or listed > cutoff:
                     too_young.append(symbol)
                     continue
@@ -132,6 +146,7 @@ class BybitFetcher:
 
         log.info(
             "universe_selected",
+            category=category,
             count=len(selected),
             considered=len(rows),
             passed_volume=len(candidates),
@@ -146,7 +161,7 @@ class BybitFetcher:
     def market_spec(self, symbol: str) -> dict:
         """Exchange constraints for one spot symbol."""
         self.load_markets()
-        m = self.spot.markets[symbol]
+        m = (self.linear if ":" in symbol else self.spot).markets[symbol]
         return {
             "symbol": symbol,
             "base": m["base"],
@@ -160,10 +175,19 @@ class BybitFetcher:
             "active": bool(m.get("active")),
         }
 
-    def linear_symbol(self, spot_symbol: str) -> str | None:
-        """Matching USDT perpetual for a spot pair, if one is listed."""
+    def linear_symbol(self, symbol: str) -> str | None:
+        """Matching USDT perpetual for a symbol, if one is listed.
+
+        A symbol that is *already* a settled contract is returned unchanged.
+        Appending the settle currency a second time produced
+        ``SOL/USDT:USDT:USDT``, which matches no market — so a perpetual
+        universe silently backfilled zero funding, zero open interest and zero
+        long/short ratio, and the derivatives category (10% of the conviction
+        score) voted on nothing at all. It degrades safely, which is exactly
+        what makes it easy to miss.
+        """
         self.load_markets()
-        candidate = f"{spot_symbol}:{spot_symbol.split('/')[1]}"
+        candidate = symbol if ":" in symbol else f"{symbol}:{symbol.split('/')[1]}"
         market = self.linear.markets.get(candidate)
         if market and market.get("active") and market.get("swap"):
             return candidate
@@ -186,7 +210,11 @@ class BybitFetcher:
         rows: list[list[float]] = []
 
         while cursor < until_ts:
-            batch = self.spot.fetch_ohlcv(symbol, timeframe, since=cursor, limit=OHLCV_PAGE)
+            # ``BTC/USDT:USDT`` is a contract and ``BTC/USDT`` is a pair. They
+            # have different prices, different history and different minimums,
+            # so the settled form has to be fetched from the linear market.
+            client = self.linear if ":" in symbol else self.spot
+            batch = client.fetch_ohlcv(symbol, timeframe, since=cursor, limit=OHLCV_PAGE)
             if not batch:
                 break
             rows.extend(batch)
