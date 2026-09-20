@@ -146,3 +146,33 @@ def test_capital_diagnostic_matches_the_sizing_rule():
     )
     assert just_inside.ok
     assert not just_outside.ok
+
+
+def test_healthcheck_process_lookup_is_scoped_to_one_engine(monkeypatch):
+    """A dead-man switch that cannot tell two engines apart is not one.
+
+    ``pgrep -f scripts/run.py`` answers about whichever engine started first.
+    Run against the stopped engine while the other one was up, it reported the
+    *other* engine's pid as proof of life — so the one check that exists to
+    notice a vanished engine would have said it was fine.
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import healthcheck
+
+    seen = {}
+
+    class Result:
+        stdout = ""
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return Result()
+
+    monkeypatch.setattr(healthcheck.subprocess, "run", fake_run)
+
+    alive, message = healthcheck.check_process("config/fast.yaml")
+
+    assert seen["cmd"][:2] == ["pgrep", "-f"]
+    assert seen["cmd"][2] == "scripts/run.py --config config/fast.yaml"
+    assert not alive
+    assert "config/fast.yaml" in message, "the message must name which engine is missing"

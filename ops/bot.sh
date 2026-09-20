@@ -160,11 +160,32 @@ is_loaded() { launchctl list "$1" >/dev/null 2>&1; }
 # keeps executing the old code, silently, for as long as it stays up. Nothing
 # else in the system would ever mention it.
 code_is_stale() {
-  local pid newest started
-  pid=$(pgrep -f "scripts/run.py" | head -1)
+  local mode="${1:-}" pid newest started
+  # Match the config as well as the script: with two engines running, a pgrep
+  # on "scripts/run.py" alone answers about whichever one started first.
+  if [[ -n "$mode" ]]; then
+    pid=$(pgrep -f "scripts/run.py --config config/$mode.yaml" | head -1)
+  else
+    pid=$(pgrep -f "scripts/run.py" | head -1)
+  fi
   [[ -n "$pid" ]] || return 1
 
-  newest=$(find src scripts config -type f \( -name '*.py' -o -name '*.yaml' \) -print0 2>/dev/null \
+  # Only the files this engine actually executes. Globbing all of config/ made
+  # every engine's warning fire whenever any *other* engine's config was
+  # touched — a warning that no restart can clear, which is how a channel
+  # teaches you to ignore it. A profile inherits through `extends:`, so the
+  # parent it names counts too.
+  local -a watched=(src scripts)
+  if [[ -n "$mode" && -f "config/$mode.yaml" ]]; then
+    watched+=("config/$mode.yaml")
+    local parent
+    parent=$(awk '/^extends:/ {print $2; exit}' "config/$mode.yaml")
+    [[ -n "$parent" && -f "config/$parent" ]] && watched+=("config/$parent")
+  else
+    watched+=(config)
+  fi
+
+  newest=$(find "${watched[@]}" -type f \( -name '*.py' -o -name '*.yaml' \) -print0 2>/dev/null \
     | xargs -0 stat -f '%m' 2>/dev/null | sort -rn | head -1)
   started=$(ps -o lstart= -p "$pid" 2>/dev/null)
   [[ -n "$newest" && -n "$started" ]] || return 1

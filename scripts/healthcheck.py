@@ -63,17 +63,26 @@ def check_freshness(cfg, max_age: int) -> tuple[bool, str, dict]:
     return True, f"healthy: {status}, updated {age / 60:.1f} minutes ago", state
 
 
-def check_process() -> tuple[bool, str]:
+def check_process(config_path: str) -> tuple[bool, str]:
+    """Is *this* engine's process alive — not merely some engine's.
+
+    The pattern includes the config. Matching ``scripts/run.py`` alone answers
+    about whichever engine started first, so with two engines running a check
+    on the stopped one reported the other one's pid as proof of life. A
+    dead-man switch that cannot tell the two apart is not one. ``ops/bot.sh``
+    scopes its own process lookups the same way and for the same reason.
+    """
+    pattern = f"scripts/run.py --config {config_path}"
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "scripts/run.py"], capture_output=True, text=True, timeout=10
+            ["pgrep", "-f", pattern], capture_output=True, text=True, timeout=10
         )
     except (subprocess.SubprocessError, OSError) as exc:
         return False, f"could not check for the process: {exc}"
 
     pids = [p for p in result.stdout.split() if p]
     if not pids:
-        return False, "no engine process found"
+        return False, f"no engine process found for {config_path}"
     return True, f"process alive (pid {', '.join(pids)})"
 
 
@@ -128,7 +137,7 @@ def main() -> int:
     secrets = load_secrets()
 
     fresh, fresh_msg, state = check_freshness(cfg, args.max_age)
-    alive, alive_msg = check_process()
+    alive, alive_msg = check_process(args.config)
     disk_ok, disk_msg = check_disk(cfg)
 
     checks = [
