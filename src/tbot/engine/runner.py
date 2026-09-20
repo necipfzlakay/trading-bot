@@ -1407,6 +1407,13 @@ class Runner:
                     self.config.risk.max_correlation,
                 ),
                 llm_veto=self._llm_veto,
+                # Without this the permission layer refuses every short before
+                # it is scored, whatever the config says: the scan loop below
+                # asks for both sides, and ``regime_allows`` answers with the
+                # context's flag, not the config's. The backtest passed it and
+                # the live engine did not — the same split that made
+                # ``conviction.selection`` mean two different things.
+                allow_short=self.config.entries.allow_short,
             )
 
             # Both directions, when the market can express both. The scorer is

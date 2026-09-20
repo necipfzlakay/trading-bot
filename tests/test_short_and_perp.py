@@ -452,3 +452,64 @@ def test_the_rank_floor_still_binds_on_a_uniformly_bad_bar():
     rows = [_row(f"S{i}/USDT", 20.0 - i, NoTradeReason.BELOW_THRESHOLD) for i in range(12)]
     assert _runner_with("cross_sectional")._select(rows) == []
     assert all(r.no_trade_reason is NoTradeReason.BELOW_THRESHOLD for r in rows)
+
+
+# --------------------------------------------------------------------------
+# The short side must survive the trip from config to the permission layer
+# --------------------------------------------------------------------------
+
+
+def _downtrend_frames(bars: int = 400):
+    """One symbol in a steady decline — the regime only the short side may take."""
+    import numpy as np
+    import pandas as pd
+
+    close = pd.Series(400 * np.exp(np.linspace(0, -0.9, bars)))
+    frame = pd.DataFrame(
+        {
+            "open": close.shift(1).fillna(close.iloc[0]),
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": pd.Series(np.full(bars, 1000.0)),
+        }
+    )
+    frame.index = pd.date_range("2024-01-01", periods=bars, freq="1h", tz="UTC")
+    return {"SOL/USDT:USDT": {"trigger": frame, "setup": frame, "permission": frame}}
+
+
+def test_the_live_scan_carries_allow_short_into_the_scoring_context():
+    """The flag reached the loop but never the context it was read from.
+
+    ``_scan`` asked for both sides, and the scorer then asked
+    ``regime_allows(ctx.regime, side, ctx.allow_short)`` — where the context's
+    flag was still its default. Every short was refused as ``regime_veto``
+    before it was scored, on a config that says ``allow_short: true``. The
+    backtest passed the flag, so the two paths measured different strategies,
+    and the short side is the whole of what the fast engine pre-registered.
+    """
+    from tbot.core.config import Config
+    from tbot.core.models import NoTradeReason
+    from tbot.engine.runner import Runner
+    from tbot.risk.budget import RiskBudget
+    from tbot.strategy.conviction import ConvictionEngine
+
+    config = Config()
+    config.entries.allow_short = True
+
+    runner = Runner.__new__(Runner)
+    runner.config = config
+    runner.conviction = ConvictionEngine(config=config.conviction)
+    runner.db = type("D", (), {"record_conviction": lambda self, _c: None})()
+    runner.portfolio = Portfolio(starting_cash=1000.0)
+    runner.risk = RiskBudget(config.risk)
+    runner._microstructure = {}
+    runner._llm_veto = False
+
+    rows = runner._scan(_downtrend_frames(), bar_ts=1_758_300_000_000)
+
+    # A downtrend is the short side's own regime. With the flag lost, both
+    # sides came back vetoed and the row kept the long it had scored first.
+    assert rows[0].regime is Regime.TREND_DOWN
+    assert rows[0].best_side is Side.SELL
+    assert rows[0].no_trade_reason is not NoTradeReason.REGIME_VETO
