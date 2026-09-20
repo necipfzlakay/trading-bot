@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($10
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 434 test
+.venv/bin/python -m pytest -q             # 440 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -177,6 +177,31 @@ testi oku — hepsinin kendini koruyan bir testi var.
     canlı hiç açmıyordu. Repodaki her sayı backtest'in cevabından geliyor.
     → `Runner._select`
 
+60. **Dolum şartları borsadan okunur, istekten değil.** Bybit'in emir onayı id
+    ve durumdan ibaret: dolan miktar yok, ortalama fiyat yok, komisyon yok.
+    `average_price or price` geri-düşüşü muhafazakâr değil **yanlış** — ödenmemiş
+    fiyatı R'nin, MAE'nin, MFE'nin ölçüldüğü sütuna yazar ve kayma izleyicisine
+    her işlemde tam sıfır sürüklenme verir, yani izleyici borsa ne yaparsa yapsın
+    ateşleyemez. Market emri gönderildikten sonra borsaya sorulur; bilinmeyen
+    sıfır değildir, okuma başarısızsa geri-düşüş **loglanır**.
+    → `CCXTBroker._settle`, `Runner._fill_terms`
+61. **Spot alışın komisyonu base varlıkta, defter quote'ta.** 1.31 VVV alımında
+    `cumExecFee` 0.00131 **VVV** = 0.034 USDT (demo'da ölçüldü). Ham sayıyı dolar
+    sütununa yazmak turu neredeyse komisyonun tamamı kadar eksik gösterir.
+    Değişmez 23'ün öteki yarısı: orada bu gerçek stop miktarını kısıyordu, burada
+    PnL'i. Çevrim notional'ın %1'ini aşarsa birim yanlış okunmuştur — varsayılan
+    orana düşülür ve bağırılır. → `_fee_in_quote`
+62. **Yanlış v5 kategorisinin cevabı boş liste, hata değil.** `category` sınıf
+    niteliği, çünkü `__new__` ile kurulan bir broker'da bile doğru olmalı.
+    `SOL/USDT:USDT` düz `replace("/","")` ile `SOLUSDT:USDT` oluyor ve her emir
+    araması "böyle bir emir yok" diyor — çift emir çözümü, dolum uzlaştırma ve
+    borsa-çıkış tespiti perp'te sessizce körleşiyordu.
+    → `CCXTBroker.category`, `_venue_symbol`
+63. **Ölü-adam anahtarı motoru adıyla arar.** `pgrep -f scripts/run.py` ilk
+    başlayan motoru bulur; durmuş motorun sağlık kontrolü çalışan motorun pid'ini
+    kanıt sayıyordu. İki motoru ayırt edemeyen anahtar, anahtar değildir.
+    → `healthcheck.check_process(config_path)`
+
 51. **Kuyruğu kesen her şey pahalıdır.** Kârın tamamı MFE 3R+ gören ~%20'lik
     işlemden geliyor (21 işlem +460, diğer 82 işlem −385). Erken çıkan her
     mekanizma — conviction çöküşü, kısmi kâr alma — vasatlarda kurtardığından
@@ -322,6 +347,24 @@ yazılmıyordu") aynı sınıftan bir tekrarı: ölçüm aracının ölçülmeme
 | 56 | **`linear_symbol` zaten kontrat olan sembole quote'u ikinci kez ekliyordu** (`SOL/USDT:USDT:USDT`). Perp evreni sessizce **sıfır** funding, sıfır OI, sıfır long/short çekti; `derivatives` kategorisi (skorun %10'u) hiçbir şeye oy vermedi. Güvenli bozuluyor, o yüzden fark edilmesi zor | orta | düzeltildi; ölçüm: funding 2.191, OI 6.000, ls 6.000 satır/sembol |
 | 57 | **Kök `Config` bilinmeyen anahtarı yutuyordu.** Değişmez kural 50 her *bölümü* kapatmıştı ama kökü değil — üst seviye bir yazım hatası okunuyormuş gibi duruyordu | orta | kök de `extra="forbid"` |
 | 58 | `fetchTradingFees` perp'te `Illegal category`, demo'da hesap fee endpoint'i de 10001 — yani okunacak bir katman yok. Kalıcı `fee_fetch_failed` uyarısı üretiyordu | düşük | `fee_tier_unavailable` info'ya indi, market metadata kullanılıyor (probe'un ölçtüğüyle aynı: %0.06/%0.01) |
+
+### Yedinci tur (2026-09-20, rutin "bot nasıl gidiyor" kontrolünde)
+
+Dördü de motor çalışırken, borsaya sorarak bulundu. Hiçbiri teste takılmamıştı.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 59 | **Kaydedilen giriş fiyatı hiç ödenmemişti.** Bybit'in create-order yanıtı dolumu taşımıyor (`filled=0`, `average=0`, `fee=0`), `_merge` de sıfırları yazıyor; `average_price or price` planlanan fiyata düşüyordu. Borsaya soruldu: ETH gerçekte 2587.76'dan doldu, DB 2588.06 diyordu; VVV 26.078 doldu, DB 26.171. **R, MAE, MFE hepsi ödenmemiş bir fiyattan ölçülüyordu** (VVV'de 1R %3.5 şişik). Aynı sebeple `orders.status` sonsuza dek `open` kalıyor ve kısmi dolum dalı erişilemez oluyordu | yüksek | `_settle`: market emri gönderildikten sonra borsadan okunuyor |
+| 60 | **Kayma izleyicisi yapısal olarak ölüydü.** `slippage.record(price, fill_price)` çağrısı `fill_price == price` aldığı için sürüklenme **her işlemde tam 0.0**; `median_bps > assumed_bps` (5.0) hiçbir örneklem sayısında doğru olamazdı. Denetim #9 "kayma ölçümü eklendi" diyordu — mekanizma kuruluydu, veri hiç gelmiyordu. #40 ile aynı sınıf | yüksek | #59 ile birlikte düzeldi. Ölçüm: ETH −1.2bps, VVV −35.5bps (ikisi de lehte) |
+| 61 | **Komisyon defterde hiç görünmüyordu.** `fills.fee` 3/3 satırda 0.0, `positions.fees_paid` 0.0, çıkış komisyonu varsayılan orandan hesaplanıyordu. Kapanan ilk işlemde `trades.fees` sıfır çıkacaktı, yani PnL tur maliyeti kadar şişik | orta | gerçek `cumExecFee` okunuyor, base→quote çevriliyor (değişmez 61) |
+| 62 | **Perp emir aramaları `category: "spot"` sabitliydi** ve sembolü `SOLUSDT:USDT` yapıyordu. `order_state`, `_find_in_history` — ikisi de boş liste alır, "emir yok" der. `fast` motoru başlatılmadığı için ısırmamıştı; `_detect_venue_exits` ve çift-id çözümü orada kör olacaktı | orta (fast için yüksek) | `category` sınıf niteliği + `_venue_symbol` |
+| 63 | **`healthcheck.py` iki motoru ayırt etmiyordu.** `pgrep -f scripts/run.py`; `--config config/fast.yaml` ile koşturunca **demo'nun pid'ini** "process alive" diye raporladı. `ops/bot.sh` bu hatayı `code_is_stale`'de zaten düzeltmiş ve yorumunda tarif etmiş, düzeltme healthcheck'e taşınmamıştı | orta | pattern config'i içeriyor |
+| 64 | **`code_is_stale` tüm `config/` dizinini tarıyordu**, bu yüzden `config/fast.yaml`'a dokunmak *demo*'nun "eski kod çalıştırıyor" uyarısını tetikliyordu — hiçbir restart'ın temizleyemeyeceği bir uyarı. Denetim #32'nin dersi | düşük | motorun kendi config'i + `extends` ebeveyni + `src`/`scripts` |
+
+#59–#61 tek kök: **borsanın onayı ile borsanın yaptığı şey aynı sanılmıştı.**
+Emir kabulü bir makbuz değil; makbuzu ayrıca istemek gerekiyor. Bu üçü birlikte,
+repodaki "ölçüm aracının kendisi ölçülmemiş" serisinin (#24, #40, #52) dördüncü
+üyesi — ve bu kez aracı bozan şey, aracı besleyen verinin hiç var olmamasıydı.
 
 ### Ölçülmüş borsa gerçekleri — linear perpetual (2026-09-20, demo'da emirle)
 
