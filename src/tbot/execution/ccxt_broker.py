@@ -69,6 +69,12 @@ def _order_state(raw: dict) -> dict[str, float | str]:
 class CCXTBroker(Broker):
     """Bybit spot via ccxt, for demo and live alike."""
 
+    # Every v5 endpoint is scoped by category, and the wrong one comes back as
+    # an empty list rather than an error — an order lookup then reports that the
+    # order never existed. Declared on the class so a subclass trading somewhere
+    # else has to say so, and so it survives construction via ``__new__``.
+    category = "spot"
+
     def __init__(
         self,
         api_key: str,
@@ -96,6 +102,16 @@ class CCXTBroker(Broker):
 
         self._markets_loaded = False
         self._specs: dict[str, MarketSpec] = {}
+
+    def _venue_symbol(self, symbol: str) -> str:
+        """``VVV/USDT`` or ``SOL/USDT:USDT`` -> ``VVVUSDT`` / ``SOLUSDT``.
+
+        The v5 endpoints want the bare id. Dropping the settle suffix matters:
+        a contract symbol run through a plain ``replace("/", "")`` becomes
+        ``SOLUSDT:USDT``, which every lookup answers with an empty list — no
+        error, no order found, and the caller concludes the order never existed.
+        """
+        return symbol.split(":")[0].replace("/", "")
 
     # -- setup -------------------------------------------------------------
 
@@ -305,7 +321,11 @@ class CCXTBroker(Broker):
         """The order's final state, including terminal ones open-order calls hide."""
         try:
             response = self.exchange.privateGetV5OrderHistory(
-                {"category": "spot", "symbol": symbol.replace("/", ""), "orderLinkId": client_id}
+                {
+                    "category": self.category,
+                    "symbol": self._venue_symbol(symbol),
+                    "orderLinkId": client_id,
+                }
             )
         except ccxt.BaseError as exc:
             log.warning("order_history_lookup_failed", symbol=symbol, error=str(exc)[:120])
@@ -667,12 +687,16 @@ class CCXTBroker(Broker):
         cancelled, and the engine would have to guess which of the two emptied
         its position.
         """
-        market = symbol.replace("/", "")
-        for query in (
-            {"category": "spot", "symbol": market, "orderFilter": "tpslOrder"},
-            {"category": "spot", "symbol": market, "orderFilter": "StopOrder"},
-            {"category": "spot", "symbol": market},
-        ):
+        market = self._venue_symbol(symbol)
+        queries: list[dict[str, str]] = [{"category": self.category, "symbol": market}]
+        if self.category == "spot":
+            # Conditional orders are invisible to an unfiltered spot query, and
+            # a triggered stop is exactly the order a caller most needs to find.
+            queries[:0] = [
+                {"category": "spot", "symbol": market, "orderFilter": "tpslOrder"},
+                {"category": "spot", "symbol": market, "orderFilter": "StopOrder"},
+            ]
+        for query in queries:
             try:
                 response = self.exchange.privateGetV5OrderRealtime(query)
             except ccxt.BaseError:
@@ -683,7 +707,7 @@ class CCXTBroker(Broker):
 
         try:
             response = self.exchange.privateGetV5OrderHistory(
-                {"category": "spot", "symbol": market, "orderId": order_id}
+                {"category": self.category, "symbol": market, "orderId": order_id}
             )
         except ccxt.BaseError as exc:
             log.warning("order_state_lookup_failed", symbol=symbol, error=str(exc)[:120])
@@ -889,6 +913,11 @@ class PerpBroker(CCXTBroker):
     only tolerated while leverage is 1.0.
     """
 
+    # Contract orders live under a different v5 category, and every identity
+    # lookup — duplicate resolution, order settlement, venue-exit detection —
+    # runs through it. Left at "spot" these all answer "no such order".
+    category = "linear"
+
     def __init__(
         self,
         api_key: str,
@@ -906,7 +935,7 @@ class PerpBroker(CCXTBroker):
 
     def _bare(self, symbol: str) -> str:
         """``SOL/USDT:USDT`` -> ``SOLUSDT``, the form the v5 endpoints want."""
-        return symbol.split(":")[0].replace("/", "")
+        return self._venue_symbol(symbol)
 
     def _symbol_from_id(self, venue_id: str) -> str | None:
         """``SOLUSDT`` -> ``SOL/USDT:USDT``, via ccxt's own market table.

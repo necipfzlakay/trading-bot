@@ -1069,3 +1069,34 @@ def test_no_notification_path_is_defined_but_never_called():
         f"advertises and the engine never sends is a promise the operator "
         f"relies on and does not get."
     )
+
+
+def test_perp_order_lookups_use_the_linear_category():
+    """``SOL/USDT:USDT`` through a spot lookup finds nothing, silently.
+
+    The v5 endpoints answer a wrong category with an empty list rather than an
+    error, so duplicate resolution, settlement and venue-exit detection would
+    all conclude the order never existed.
+    """
+    from tbot.execution.ccxt_broker import PerpBroker
+
+    seen = []
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            seen.append(params)
+            return {"result": {"list": []}}
+
+        def privateGetV5OrderHistory(self, params):
+            seen.append(params)
+            return {"result": {"list": []}}
+
+    broker = PerpBroker.__new__(PerpBroker)
+    broker.exchange = Exchange()
+    broker.quote = "USDT"
+
+    broker.order_state("SOL/USDT:USDT", "ex-1")
+
+    assert seen, "the lookup must actually query the venue"
+    assert all(p["category"] == "linear" for p in seen)
+    assert all(p["symbol"] == "SOLUSDT" for p in seen)
