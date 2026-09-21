@@ -3,8 +3,15 @@
 
     python scripts/venue_reset.py --usdt 1000
 
-Cancels every resting order, sells every non-quote holding back to the quote
+Closes every perpetual position and cancels every perpetual order, cancels
+every resting spot order, sells every non-quote holding back to the quote
 currency, then adjusts the quote balance to the target.
+
+The perpetual side comes first and is not optional. Three engines share this
+account, two of them trade linear perpetuals, and on a Unified account a perp
+position's margin and PnL live in the same USDT this script is about to set: a
+balance adjusted around an open perp position is a balance that moves again
+the moment that position closes.
 
 Refuses to run against real money, unconditionally and with no override flag.
 Selling an account's holdings is not something that should ever be one typo
@@ -14,6 +21,7 @@ away, and a demo reset has no legitimate live counterpart.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 
 from _bootstrap import setup
@@ -63,6 +71,49 @@ def cancel_all_orders(broker: CCXTBroker, symbols: list[str]) -> int:
                 except Exception as exc:  # noqa: BLE001
                     print(f"  ! cancel {order_id[-8:]}: {str(exc)[:80]}")
     return cancelled
+
+
+def flatten_linear(broker: CCXTBroker, settle: str) -> tuple[int, list[str]]:
+    """Cancel every linear order, then close every linear position at market.
+
+    Orders first: a resting entry could open a new position the moment the old
+    one is closed, and the position-attached stop and target go with the
+    position anyway. Returns (positions closed, positions still open).
+    """
+    try:
+        broker.exchange.privatePostV5OrderCancelAll({"category": "linear", "settleCoin": settle})
+        print("  cancelled every linear order")
+    except Exception as exc:  # noqa: BLE001 — "no orders" comes back as an error too
+        print(f"  cancel-all: {str(exc)[:100]}")
+
+    def open_positions() -> list[dict]:
+        rows = broker.exchange.privateGetV5PositionList(
+            {"category": "linear", "settleCoin": settle}
+        )["result"]["list"]
+        return [r for r in rows if float(r.get("size") or 0) > 0]
+
+    closed = 0
+    for row in open_positions():
+        side = "Sell" if row["side"] == "Buy" else "Buy"
+        try:
+            broker.exchange.privatePostV5OrderCreate(
+                {
+                    "category": "linear",
+                    "symbol": row["symbol"],
+                    "side": side,
+                    "orderType": "Market",
+                    "qty": row["size"],
+                    "reduceOnly": True,
+                    "positionIdx": 0,
+                }
+            )
+            print(f"  closed {row['symbol']} {row['side']} {row['size']}")
+            closed += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! close {row['symbol']}: {str(exc)[:100]}")
+    time.sleep(2)
+    left = [f"{r['symbol']} {r['side']} {r['size']}" for r in open_positions()]
+    return closed, left
 
 
 def liquidate(broker: CCXTBroker, quote: str) -> tuple[int, list[str]]:
@@ -126,13 +177,18 @@ def set_quote_balance(broker: CCXTBroker, quote: str, target: float) -> float:
 
     adjust_type = 0 if delta > 0 else 1
     verb = "adding" if delta > 0 else "removing"
-    print(f"  {verb} {abs(delta):.2f} {quote} (have {current:.2f}, want {target:.2f})")
+    # Whole units only. Measured: "656.46" came back retCode 0 / SUCCESS and
+    # moved nothing; "656" moved 656. A request the venue silently ignores is
+    # why the result is read back below rather than trusted. Adding rounds up
+    # so the account never lands short of the target.
+    amount = math.ceil(abs(delta)) if delta > 0 else math.floor(abs(delta))
+    print(f"  {verb} {amount} {quote} (have {current:.2f}, want {target:.2f})")
 
     try:
         broker.exchange.privatePostV5AccountDemoApplyMoney(
             {
                 "adjustType": adjust_type,
-                "utaDemoApplyMoney": [{"coin": quote, "amountStr": f"{abs(delta):.2f}"}],
+                "utaDemoApplyMoney": [{"coin": quote, "amountStr": str(amount)}],
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -179,7 +235,16 @@ def main() -> int:
     held = [f"{c}/{quote}" for c in _balances(broker) if c != quote]
     symbols = sorted(set(held) | set(cfg.universe.symbols or []))
 
-    print("\nCancelling resting orders…")
+    print("\nPerpetuals…")
+    closed, still_open = flatten_linear(broker, quote)
+    print(f"  {closed} position(s) closed")
+    if still_open:
+        # A balance set around a live perp position is not the balance it will
+        # be. Stop here rather than report a clean account that is not.
+        print(f"  ! still open: {still_open}")
+        return 1
+
+    print("\nCancelling resting spot orders…")
     print(f"  {cancel_all_orders(broker, symbols)} cancelled")
 
     print("\nSelling holdings…")

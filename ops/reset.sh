@@ -65,9 +65,36 @@ ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 head_() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
 
+# Every engine's runtime directory. Three engines share this account now, each
+# with its own database and state; resetting one and not the others would
+# leave two books describing positions the venue no longer holds.
+RUNTIMES=$("$PY" - <<'RUNTIMES_PY' 2>/dev/null
+import pathlib, sys
+sys.path.insert(0, "src")
+from tbot.core.config import load_config
+seen = []
+for path in sorted(pathlib.Path("config").glob("*.yaml")):
+    if path.stem == "base":
+        continue
+    try:
+        cfg = load_config(str(path))
+    except Exception:
+        continue
+    if cfg.mode.value != "live":
+        continue
+    rel = str(cfg.runtime_dir.relative_to(pathlib.Path.cwd()))
+    if rel not in seen:
+        seen.append(rel)
+print(" ".join(seen))
+RUNTIMES_PY
+)
+[[ -n "$RUNTIMES" ]] || RUNTIMES="runtime"
+
 # A live agent would restart mid-wipe and reconcile against a half-reset account.
-head_ "Stopping the bot"
-"$PROJ/ops/bot.sh" stop >/dev/null 2>&1
+head_ "Stopping every engine"
+for engine in $("$PROJ/ops/bot.sh" engines 2>/dev/null); do
+  "$PROJ/ops/bot.sh" stop "$engine" >/dev/null 2>&1
+done
 if pgrep -f "scripts/run.py" >/dev/null 2>&1; then
   warn "an engine is still running; killing it"
   pkill -f "scripts/run.py"
@@ -77,19 +104,21 @@ ok "stopped"
 
 head_ "This will permanently delete"
 if [[ $DO_VENUE -eq 1 ]]; then
-  say "  ${R}venue${N}  every resting order and protective stop on bybit-demo"
+  say "  ${R}venue${N}  every perpetual position, closed at market, and every perp order"
+  say "  ${R}venue${N}  every resting spot order and protective stop on bybit-demo"
   say "  ${R}venue${N}  every holding, sold to USDT at market"
   say "  ${R}venue${N}  the USDT balance, set to ${USDT}"
 fi
 if [[ $DO_LOCAL -eq 1 ]]; then
-  say "  ${R}local${N}  runtime/tbot.db — every trade, scan, order, fill and equity point"
-  say "  ${R}local${N}  runtime/state.json, gate1.json, restarts.json, promotion.json"
-  say "  ${R}local${N}  runtime/logs/*.jsonl and the launchd logs"
+  say "  ${R}local${N}  in each of: ${RUNTIMES}"
+  say "  ${R}local${N}    tbot.db — every trade, scan, order, fill and equity point"
+  say "  ${R}local${N}    state.json, gate1.json, restarts.json, promotion.json, logs"
+  say "  ${R}local${N}  runtime-shared/claims.sqlite — which engine owns which perpetual"
   if [[ $WIPE_ALL -eq 1 ]]; then
     say "  ${R}local${N}  runtime/data/ — the whole market-data archive"
     say "  ${R}local${N}  runtime/indicator_selection.json, universe.json, reports/"
   else
-    say "  ${DIM}kept${N}   runtime/data/, indicator_selection.json, universe.json, reports/"
+    say "  ${DIM}kept${N}   data/, indicator_selection.json, universe.json, reports/ (each engine)"
   fi
 fi
 say ""
@@ -125,37 +154,41 @@ fi
 if [[ $DO_LOCAL -eq 1 ]]; then
   head_ "Local state"
 
-  if [[ -f runtime/tbot.db ]]; then
-    mkdir -p runtime/backups
-    BACKUP="runtime/backups/pre-reset-$(date +%Y%m%d-%H%M%S).db"
-    # sqlite3 .backup rather than cp: a WAL database copied file-by-file can
-    # land mid-transaction and come back corrupt.
-    if sqlite3 runtime/tbot.db ".backup '$BACKUP'" 2>/dev/null; then
-      ok "database backed up to $BACKUP"
-    else
-      cp runtime/tbot.db "$BACKUP" 2>/dev/null && warn "backed up with cp (sqlite3 unavailable)"
+  for RT in $RUNTIMES; do
+    if [[ -f "$RT/tbot.db" ]]; then
+      mkdir -p "$RT/backups"
+      BACKUP="$RT/backups/pre-reset-$(date +%Y%m%d-%H%M%S).db"
+      # sqlite3 .backup rather than cp: a WAL database copied file-by-file can
+      # land mid-transaction and come back corrupt.
+      if sqlite3 "$RT/tbot.db" ".backup '$BACKUP'" 2>/dev/null; then
+        ok "$RT database backed up to $BACKUP"
+      else
+        cp "$RT/tbot.db" "$BACKUP" 2>/dev/null && warn "$RT backed up with cp (sqlite3 unavailable)"
+      fi
     fi
-  fi
 
-  rm -f runtime/tbot.db runtime/tbot.db-shm runtime/tbot.db-wal
-  rm -f runtime/state.json runtime/gate1.json runtime/restarts.json \
-        runtime/promotion.json runtime/engine.lock runtime/command.json \
-        runtime/last_backtest.json
-  ok "trading history cleared"
+    rm -f "$RT/tbot.db" "$RT/tbot.db-shm" "$RT/tbot.db-wal"
+    rm -f "$RT/state.json" "$RT/gate1.json" "$RT/restarts.json" \
+          "$RT/promotion.json" "$RT/engine.lock" "$RT/command.json" \
+          "$RT/last_backtest.json"
+    rm -f "$RT"/logs/*.jsonl "$RT"/logs/*.jsonl.* \
+          "$RT"/logs/launchd.*.log "$RT"/logs/web.*.log "$RT"/logs/health.*.log
+    ok "$RT: trading history and logs cleared"
 
-  rm -f runtime/logs/*.jsonl runtime/logs/*.jsonl.* \
-        runtime/logs/launchd.*.log runtime/logs/web.*.log runtime/logs/health.*.log
-  ok "logs cleared"
+    if [[ $WIPE_ALL -eq 1 ]]; then
+      rm -rf "$RT/data" "$RT/reports"
+      rm -f "$RT/indicator_selection.json" "$RT/universe.json" \
+            "$RT/polarity.json" "$RT/plateau.json" "$RT/exit_calibration.json"
+      rm -f "$RT/.preinstall.state"
+      ok "$RT: market data and measurements deleted"
+    fi
+  done
 
-  if [[ $WIPE_ALL -eq 1 ]]; then
-    rm -rf runtime/data runtime/reports
-    rm -f runtime/indicator_selection.json runtime/universe.json \
-          runtime/polarity.json runtime/plateau.json runtime/exit_calibration.json
-    rm -f runtime/.preinstall.state
-    ok "market data and measurements deleted"
-  else
-    ok "market data and measurements kept"
-  fi
+  # Claims describe positions; with the venue flat there are none to describe.
+  rm -f runtime-shared/claims.sqlite runtime-shared/claims.sqlite-shm \
+        runtime-shared/claims.sqlite-wal
+  ok "symbol claims cleared"
+  [[ $WIPE_ALL -eq 1 ]] || ok "market data and measurements kept"
 fi
 
 # ------------------------------------------------------------------- summary
@@ -166,7 +199,7 @@ if [[ $WIPE_ALL -eq 1 ]]; then
   say "    ./ops/pre-install.sh"
 else
   say "  The archive and measurements are intact, so you can start straight away:"
-  say "    ./ops/bot.sh start demo"
+  say "    ./ops/bot.sh start demo; ./ops/bot.sh start fast; ./ops/bot.sh start scalp"
 fi
 say ""
 say "  ${DIM}Verify first with: ./ops/bot.sh status${N}"
