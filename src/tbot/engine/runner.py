@@ -383,6 +383,19 @@ class Runner:
                 if bar_ts > last_processed:
                     self._process_bar(bar_ts)
                     last_processed = bar_ts
+                    if last_closed_bar(timeframe) > last_processed:
+                        # Another bar closed while this one was processing.
+                        # Waiting for the *next* close from here skipped it
+                        # outright: measured, the fast engine started at 12:58,
+                        # took until 13:02 over 79 symbols, and the bar that
+                        # closed at 13:00 was never processed — an hour of
+                        # decisions dropped without a line in the log.
+                        log.warning(
+                            "bar_closed_during_processing",
+                            processed=iso(last_processed),
+                            catching_up=iso(last_closed_bar(timeframe)),
+                        )
+                        continue
 
                 # Wake shortly after the next close rather than polling hot,
                 # but keep checking for controls while waiting. Bars can be an

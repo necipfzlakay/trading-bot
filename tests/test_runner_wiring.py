@@ -1673,3 +1673,33 @@ def test_a_perp_level_the_venue_holds_is_left_to_the_venue():
     assert runner._venue_holds_level(position, ExitReason.TRAILING_STOP) is False
     position.meta["stop_at_venue"] = 111.5
     assert runner._venue_holds_level(position, ExitReason.TRAILING_STOP) is True
+
+
+def test_a_bar_that_closes_while_the_previous_one_is_processing_is_not_skipped(monkeypatch):
+    """Measured: the fast engine started at 12:58, needed until 13:02 for 79
+    symbols, and then waited for the *next* close — the bar that closed at
+    13:00 was never processed."""
+    from tbot.engine import runner as runner_module
+    from tbot.engine.runner import Runner
+
+    clock = {"bar": 11 * 3_600_000}
+    processed: list[int] = []
+
+    class Loop(Runner):
+        def _process_bar(self, bar_ts):
+            processed.append(bar_ts)
+            if len(processed) == 1:
+                clock["bar"] += 3_600_000  # the next bar closes meanwhile
+
+        def _wait_for_next_bar(self, _tf):
+            self._running = False  # one wait ends the test
+
+    monkeypatch.setattr(runner_module, "last_closed_bar", lambda _tf: clock["bar"])
+    from tbot.core.config import Config
+
+    loop = Loop.__new__(Loop)
+    loop.config = Config()
+    loop._running = True
+    loop._loop()
+
+    assert processed == [11 * 3_600_000, 12 * 3_600_000]

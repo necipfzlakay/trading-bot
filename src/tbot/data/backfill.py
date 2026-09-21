@@ -41,6 +41,10 @@ class BackfillResult:
     error: str | None = None
 
 
+# Pauses before retrying a request Bybit refused with 10006.
+RATE_LIMIT_BACKOFF_S = (1.5, 4.0)
+
+
 class BybitFetcher:
     """Public-data client. No API key needed for anything in this module."""
 
@@ -59,6 +63,26 @@ class BybitFetcher:
     def _pace(self) -> None:
         if self.rate_limit_ms:
             time.sleep(self.rate_limit_ms / 1000)
+
+    def _fetch_page(self, client, symbol: str, timeframe: str, since: int) -> list:
+        """One request, paced, and retried when the venue says "too many".
+
+        The pause used to sit only *between pages of one series*, so a refresh
+        of many short series — every symbol on every bar — went out unpaced at
+        ccxt's own 20ms spacing, and Bybit answered ``10006 Too many visits``.
+        A refused request is retried after a pause instead of costing the
+        symbol its place in this bar's scan.
+        """
+        for attempt, backoff in enumerate((*RATE_LIMIT_BACKOFF_S, None)):
+            self._pace()
+            try:
+                return client.fetch_ohlcv(symbol, timeframe, since=since, limit=OHLCV_PAGE)
+            except ccxt.RateLimitExceeded:
+                if backoff is None:
+                    raise
+                log.info("rate_limited_retry", symbol=symbol, tf=timeframe, attempt=attempt + 1)
+                time.sleep(backoff)
+        return []
 
     # -- universe ----------------------------------------------------------
 
@@ -214,7 +238,7 @@ class BybitFetcher:
             # have different prices, different history and different minimums,
             # so the settled form has to be fetched from the linear market.
             client = self.linear if ":" in symbol else self.spot
-            batch = client.fetch_ohlcv(symbol, timeframe, since=cursor, limit=OHLCV_PAGE)
+            batch = self._fetch_page(client, symbol, timeframe, cursor)
             if not batch:
                 break
             rows.extend(batch)
@@ -224,7 +248,6 @@ class BybitFetcher:
             cursor = last + step
             if len(batch) < OHLCV_PAGE:
                 break
-            self._pace()
 
         if not rows:
             return pd.DataFrame(columns=OHLCV_COLUMNS)
@@ -368,6 +391,22 @@ class Backfiller:
 
         stored_last = self.store.last_ts(symbol, timeframe)
         since = stored_last + tf_ms(timeframe) if stored_last is not None else target_start
+
+        # Nothing has closed since the last stored bar: the only candle the
+        # venue could return is the forming one, which the store refuses
+        # (invariant 1). Asking anyway was most of the traffic — refreshing 79
+        # symbols every hour re-requested each 4h and 1d series that had not
+        # closed a bar, ~160 of ~237 calls, and the burst drew 10006 refusals
+        # that knocked 12 symbols out of one bar's scan (measured, fast engine).
+        if stored_last is not None and since + tf_ms(timeframe) > until_ts:
+            return BackfillResult(
+                symbol=symbol,
+                timeframe=timeframe,
+                bars_fetched=0,
+                total_bars=len(self.store.read_ohlcv(symbol, timeframe)),
+                first_ts=self.store.first_ts(symbol, timeframe),
+                last_ts=stored_last,
+            )
 
         try:
             df = self.fetcher.fetch_ohlcv_range(symbol, timeframe, since, until_ts)
