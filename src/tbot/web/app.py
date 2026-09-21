@@ -40,12 +40,12 @@ def discover_engines() -> dict[str, Config]:
 
     Keyed by namespace rather than by filename because that is what actually
     separates two engines: runtime directory, database, state file and launchd
-    labels all follow from it. ``paper``, ``demo`` and ``live`` share the
-    default namespace, so they are one engine as far as the panel is concerned
-    — they read the same ``runtime/`` and only one can be installed at a time.
-    Which of the three wins the key is therefore irrelevant: the panel never
-    reads ``mode`` or ``venue`` from a config, only from the ``state.json`` the
-    running engine writes.
+    labels all follow from it. ``demo`` and ``live`` share the default
+    namespace, so they are one engine as far as the panel is concerned — they
+    read the same ``runtime/`` and only one can be installed at a time. Which of
+    the two wins the key is therefore irrelevant: the panel never reads ``mode``
+    or ``venue`` from a config, only from the ``state.json`` the running engine
+    writes.
     """
     engines: dict[str, Config] = {}
     config_dir = PROJECT_ROOT / "config"

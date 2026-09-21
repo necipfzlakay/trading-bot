@@ -1,6 +1,6 @@
 # TRADING-BOT — proje haritası
 
-Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($100).
+Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
@@ -33,8 +33,12 @@ testi oku — hepsinin kendini koruyan bir testi var.
    bile kullanıcı tavanını aşamaz. → `risk/leverage.py`
 9. **Gerçek para ek onay ister.** `TBOT_CONFIRM_LIVE=yes` olmadan başlamaz.
 10. **NaN = "fikrim yok", 0 değil.** Isınma nötr oy olarak sayılmaz.
-11. **Paper emirleri sonraki barın açılışında dolar**, gönderildiğinde değil.
-    Aksi halde paper backtest ile aynı yolu izlemez. → `_drain_paper_fills`
+11. **Simülatör backtest'in dolum motoru, bir çalışma modu değil.** `paper`
+    modu kaldırıldı: demo aynı soruyu gerçek emir defteriyle cevaplıyor (gerçek
+    red, gerçek komisyon, gerçek kısmi dolum) ve simülatörün üretemediği her
+    arıza bu reponun zaten ısırıldığı bir arıza. Yalnız simülatörün yürüdüğü
+    ikinci bir icra yolu güvenlik ağı değil, bug saklanacak yerdi — denetim #66
+    tam buydu. → `Mode`, `build_broker`
 12. **Canlıda stop borsada da durur.** Süreç kapalıyken bellekteki stop hiçbir
     şeyi korumaz. → `_place_protective_stop`
 13. **Çekim yetkili API anahtarı reddedilir.** Bot buna hiç ihtiyaç duymaz;
@@ -50,7 +54,7 @@ testi oku — hepsinin kendini koruyan bir testi var.
 18. **Minimum bakiye yapısal.** `risk.min_equity` (ölçülen: 183) altında yeni
     giriş yok. Altında bot test edilen stratejiyi küçültmez, evrenin daha sakin
     bir alt kümesini işler. → `scripts/capital_check.py`
-19. **`starting_balance` sadece paper/backtest.** Canlıda bakiye borsadan okunur.
+19. **`starting_balance` sadece backtest.** Canlıda bakiye borsadan okunur.
 20. **Pozisyon tavanları sadece kısar.** `max_position_notional` / `_pct` /
     `max_risk_amount` — hangisi önce bağlarsa. Tavan bağlasa bile
     `1R = adet × stop_mesafesi` korunur. → `risk/sizing.py`
@@ -206,7 +210,7 @@ testi oku — hepsinin kendini koruyan bir testi var.
     girişin yanlış tarafında duran bir stop demek. Aynı şekilde giriş/çıkış
     ayracı da yön değil, emrin üstündeki **plan**. Spot-yalnız dünyada `Side.BUY`
     literali tek olasılığı yazdığı için ikisi de doğru görünüyordu.
-    → `Runner._enter`, `_apply_paper_fill`, `_maybe_scale_out`
+    → `Runner._enter`, `_maybe_scale_out`
 65. **Perp'te stop düzenlenmez, üzerine yazılır.** Stop pozisyonun bir özelliği,
     ayrı bir emir değil — gerçek bir emir id'si yok. Spot'un `edit_order` yolunu
     miras almak her trailing güncellemesini sessizce no-op yapar ve borsa
@@ -215,6 +219,25 @@ testi oku — hepsinin kendini koruyan bir testi var.
     dönük bir yetkilendirme; borsaya kurulan sayı `LeverageGate`'in izin
     verdiğidir. Aksi halde motor 1x boyutlandırırken hesap 3x'te durur —
     teminat %100 değil %33 (değişmez 57). → `build_broker`
+
+67. **Borsadaki stop seviyesi doğrulanır, varsayılmaz.** Taşıma çağrısının
+    dönüşü okunur ve borsanın onayladığı seviye `meta["stop_at_venue"]`'da
+    taşınır; her bar yerel stop'la karşılaştırılır, tutmuyorsa yeniden denenir.
+    Taşıma "ratchet oldu mu" koşuluna bağlanamaz: bir kez başarısız olan taşıma
+    bir sonraki ratchet'i bekler, ve bir daha ratchet yapmayan pozisyon için bu
+    hiçbir zamandır. Ayrıca dönüş `bool` olamaz — *yerine konmuş* bir stop yeni
+    bir id taşır, onu saklamayan motor kendi stop'unun tutamağını kaybeder
+    (denetim #37). → `_sync_protective_stop`, `CCXTBroker.amend_stop`
+69. **Evren açılışta okunur, bir daha yenilenmez — ve bu bildirilir.**
+    `select_universe`'ün tek çağıranı `scripts/backfill.py`. Hacmi çöken sembol
+    evrende kalır; motor bunu her bar kontrol edip **raporlar**, düşürmez.
+    İleri testin ortasında evreni değiştirmek, testin ölçtüğü şeyi değiştirir.
+    → `_check_universe_liquidity`
+68. **v5 çağrısının kategorisi ve sembolü sınıfın, literal değil.** ccxt'nin
+    yardımcıları türev sözleşme varsayıyor; `category: "spot"` ve
+    `replace("/","")` perp'te ya boş liste ya `10001` döndürüyor — ikisi de
+    hata gibi görünmüyor. Üç kez ısırdı (#56, #62, #73). → `self.category`,
+    `_venue_symbol`
 
 51. **Kuyruğu kesen her şey pahalıdır.** Kârın tamamı MFE 3R+ gören ~%20'lik
     işlemden geliyor (21 işlem +460, diğer 82 işlem −385). Erken çıkan her
@@ -316,7 +339,7 @@ Hepsi gerçek borsaya sorularak bulundu; hiçbiri test paketine takılmamıştı
 | 41 | **Motor kendi borsa stop'unun dolduğunu bar kapanışına kadar öğrenmiyordu** — saatlik barda 1 saate kadar. O süre boyunca portföy yanlış, equity yanlış, pozisyon slotu boşa kilitli ve sonraki bar olmayan bir pozisyon için ikinci satış emri gönderiyor. `_manage_positions` borsaya sormuyor, `_reconcile` sadece açılışta çalışıyor | yüksek | `_detect_venue_exits`, 60s'de bir, iki okuma şartıyla |
 | 42 | **`_score_category` blok collapse uygulamıyordu** — değişmez kural 3 ihlali. Kategori içi yönlü indikatörlerin **ham ortalaması** alınıyordu, blok temsilcisi değil | orta | düzeltildi; **ölçülen etki ~sıfır** (PF 1.41 → 1.41, expectancy +0.364 → +0.362R). Gerçek sızıntı başka yerdeymiş: `vwap_distance`'ın blok arkadaşları (`rsi`, `bb_percent_b`, `donchian_pos`) **başka kategorilerde**, dolayısıyla kategori-içi collapse onları yakalayamaz. Asıl soru `vwap_distance`'ın `flow` sayılması — kategorizasyon sorunu, collapse sorunu değil. Sonucu değiştireceği için sessizce yapılmadı, işaretlendi |
 | 43 | **Bybit public spot WS 10 topic sınırı — sessiz askıda kalma.** 21 sembolün hepsi tek subscribe ile isteniyordu; 11'inci sembolde future hiç çözülmüyor. Hata yok, exception yok, reconnect yok. Tüm evren kararıyor ve loglarda hiçbir şey yazmıyor | yüksek | 10'luk parçalara bölündü, her parça bağımsız reconnect ediyor. Ölçüm: 21/21 sembol 3 saniyede |
-| 44 | **Spread ve hacim verisi hiç toplanmıyordu.** `ScanRow.spread_bps`/`volume_24h` hep 0, conviction'ın ceza dalları erişilemez, `NoTradeReason.SPREAD_TOO_WIDE` hiç atanmıyor, `universe.max_spread_bps: 8.0` hiçbir kod tarafından okunmuyor | orta | tek istekle 21 sembol için toplanıyor ve `scans` tablosuna yazılıyor. **Ceza dalları kapalı** (`microstructure_penalties: false`) — ölçülen spread 0.01–2.7bps, ceza tabanı 10bps, yani bugün hiçbir şeyi değiştirmezdi; bu da bir bulgu |
+| 44 | **Spread ve hacim verisi hiç toplanmıyordu.** `ScanRow.spread_bps`/`volume_24h` hep 0, conviction'ın ceza dalları erişilemez, `NoTradeReason.SPREAD_TOO_WIDE` hiç atanmıyor, `universe.max_spread_bps: 8.0` hiçbir kod tarafından okunmuyor | orta | tek istekle 21 sembol için toplanıyor ve `scans` tablosuna yazılıyor. **Ceza dalları kapalı** (`microstructure_penalties: false`) — ~~ölçülen spread 0.01–2.7bps, ceza tabanı 10bps, yani bugün hiçbir şeyi değiştirmezdi~~ **bu gerekçe düştü, bkz. #78** |
 | 45 | **Bot çalışırken alınan backtest ölçümü tekrarlanabilir değil.** İki koşu arasında 113 → 114 işlem, PF 1.41 → 1.39 farkı çıktı ve kod bit-bit aynıydı: motor her barda 63 parquet serisini yeniden yazıyor | orta | A/B'ler artık `--to <tarih>` ile sabitleniyor. Ölçüm disiplini sorunu, işlem güvenliği sorunu değil — ama yanlış atıf üretiyordu |
 
 | 46 | **Motor barları 7-38 dakika geç işliyordu.** Bekleme döngüsü `slept += step` ile *niyet edilen* süreyi topluyor, `time.sleep()` dışında geçen zamanı hiç saymıyordu. Telegram `getUpdates` bu makineden **3-8 saniye** sürüyor ve her 5s tick'te çağrılıyordu → her tur ~9s gerçek, 5s kayıtlı, döngü %80 aşıyor. Giriş fiyatı yarım saat bayat bir kapanıştan hesaplanıyordu ve **hiçbir logda tek satır yoktu** | yüksek | `_wait_for_next_bar`: bütün zaman aşımları `time.monotonic()`'e karşı; Telegram 15s'lik yavaş şeride alındı, poll timeout 5s→3s. Ölçüm: nabız aralığı ~110s → **64s** (hedef 60) |
@@ -406,6 +429,29 @@ Bu yüzden yedisinin de artık kendini koruyan bir testi var (448), ve her biri
 fix'i geri alarak **doğrulandı** — denetim #47'nin dersi: tamirin işe yaradığını
 göstermeyen bir test, tamirin kendisi kadar değersiz.
 
+### Dokuzuncu tur (2026-09-21, "bot nasıl gidiyor" kontrolünde, iki motor da çalışırken)
+
+Üçü borsaya sorarak bulundu, biri temizlik.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 72 | **Spot'ta trailing stop borsaya hiç ulaşmıyordu.** ccxt'nin `edit_order`'ı Bybit spot amend'ine `triggerBy` ekliyor, borsa `10001 Request parameter error` veriyor. Docstring cancel-and-replace geri düşüşü vaat ediyordu — **kodda yoktu**; bir warning basılıp `False` dönüyordu ve çağıran dönüşü hiç okumuyordu. Borsaya soruldu: VVV yerel 26.45 / borsa 23.43, ETH yerel 2588.06 / borsa 2506.63, ikisinde de `updatedTime == createdTime`. Yani trail yapmış her pozisyonun borsa tarafı koruması **giriş stop'uydu**; açık fark $16.5 (equity'nin %1.6'sı). Denetim #67'nin (perp `amend_stop`) spot ikizi — o düzeltilirken spot'a bakılmamıştı | kritik | çıplak v5 amend (`category/symbol/orderId/triggerPrice`, borsada ilk denemede kabul edildi) + gerçek cancel-and-replace geri düşüşü + dönüş `str \| None` + `stop_at_venue` ile her bar doğrulama. İki pozisyonun borsa stop'u elle onarıldı |
+| 73 | **Perp'te mikroyapı verisi tamamen sıfırdı.** `fetch_microstructure` `{"category": "spot"}` sabitliyor ve `replace("/","")` kullanıyordu → `SOLUSDT:USDT` hiçbir satırla eşleşmiyor, üstelik spot ticker listesinde perp sembolü zaten yok. 10 saatlik koşunun **1213/1213** tarama satırı `spread_bps = 0` taşıyordu, ki bu "ölçülmedi" değil "mükemmel dar" diye okunuyor. `universe.max_spread_bps` perp'te hiçbir şeye karar vermiyordu. #56 ve #62'nin ulaşmadığı son metot | orta | `self.category` + `_venue_symbol`. Ölçüm: 79/79 sembol, medyan **2.503 bps**, maks **12.87 bps** — spot'ta ilk okuma 0.01–2.7 demişti; 1302 satırla ölçünce spot'ta da erişilebilir (bkz. #78). Açmak ayrı bir karar |
+| 74 | **`bot.sh status` R alanı yapısal olarak ölüydü.** `pos.get('r_multiple', 0)` okuyordu, `_positions_view` o alanı hiç yazmıyordu: üç açık pozisyon (+2.67R, +0.92R, −0.02R) yıllardır `R=+0.00` gösteriyordu. Denetim #60 sınıfı — ölçüm aracı kuruldu, veri hiç gelmedi | düşük | alan yazılıyor; okunamayan mark `None` (invariant 10), panel `R=?` basıyor |
+| 75 | **Paper modu kaldırıldı.** Operatör kararı: demo aynı soruyu gerçek emir defteriyle cevaplıyor ve simülatörün üretemediği her arıza (#20–#27, #59–#61) bu reponun zaten ısırıldığı arıza. Yalnız simülatörün yürüdüğü ikinci icra yolu güvenlik ağı değil, bug saklanacak yerdi — #66 tam olarak buydu | — | `Mode.PAPER`, `config/paper.yaml`, `_drain_paper_fills`, `_apply_paper_fill` ve dört `isinstance(broker, PaperBroker)` dalı silindi. **`PaperBroker` duruyor**: backtest'in dolum motoru o, ve repodaki her sayı ona dayanıyor |
+
+| 79 | **Perp'in ilk işleminde dolum fiyatı yine ödenmemiş fiyattı.** `_settle` 5×0.25s = 1.25 saniye deniyor; Bybit linear emri o sürede sorgulanabilir yapmıyor, `order_settle_failed` düşüyor ve fiyat istenen değere geri dönüyor. Borsaya soruldu: gerçek `avgPrice` **112.58**, `cumExecFee` 0.061919; defterde **112.09** ve fee 0. **43.7 bps kayma sıfır olarak kaydedildi**, 1R %25 eksik ölçüldü — ve bu H17'nin ön-kayıtlı ileri testinin **ilk işlemi**. Ayrıca `order_state`'in realtime sorgusu filtresizdi, o da tanım gereği yalnız *açık* emirleri döner: az önce dolmuş bir market emri orada olamaz. Denetim #59 spot'ta tamamlanmış görünüyordu çünkü spot geçmişi daha hızlı yerleşiyor | yüksek | realtime sorgusu artık `orderId` ile (ölçüldü: dolmuş emri döndürüyor), settle penceresi 1.25s → ~5.25s büyüyen beklemeyle. **Mevcut SOL kaydı hâlâ yanlış** — operatör kararı |
+| 80 | **Perp'te pozisyonun kendi stop'u ve hedefi her açılışta "orphan" diye raporlanıyordu.** İkisi de pozisyonun özelliği, emir değil; borsa `orderLinkId: ""` ile bildiriyor, mutabakat ise client id ile eşleştiriyor. Açık pozisyon başına iki uyarı, tam olarak tasarlandığı gibi çalışan bir koruma için, ve hiçbir eylemin temizleyemeyeceği. Denetim #32'nin aynısı | düşük | `PerpBroker.fetch_open_orders` `stopOrderType` dolu + client id boş olanları eliyor; kurulu giriş emri (gerçek client id'si var) elenmiyor |
+| 78 | **Üç ölü şey ve bir yalan yorum, hepsi mikroyapı verisinin hiç var olmadığı dönemden kalma.** (a) `NoTradeReason.SPREAD_TOO_WIDE` ve `LIQUIDITY_TOO_LOW` repoda **hiçbir yerde atanmıyordu**; (b) `universe.max_spread_bps: 8.0` hiçbir kod tarafından okunmuyordu — değişmez 50'nin bir üst katı: varsayılana dönen ayar değil, **hiçbir şeye karar vermeyen** ayar; (c) `config.py` evrenin "refreshed daily" olduğunu söylüyordu, oysa `select_universe`'ün tek çağıranı `scripts/backfill.py` — motor `universe.json`'ı açılışta okuyup bir daha bakmıyor; (d) hem kodda hem CLAUDE.md'de duran "spread 0.01–2.7bps, ceza tabanı 10bps, bugün hiçbir şeyi değiştirmezdi" gerekçesi birkaç bardan okunmuştu | orta | (a)+(b) `_blocking_reason`'a bağlandı, sıfır taban = kontrol yok, ikisi de `UNSCORED_REASONS`'a girdi (değişmez 48); (c) yorum düzeltildi + `_check_universe_liquidity` her bar tabanın altına düşen sembolü **bildiriyor**, düşürmüyor — ileri testin ortasında evreni değiştirmek ölçtüğü şeyi değiştirir; (d) 1302 satırla yeniden ölçüldü: **%4.5'i 10bps üstünde** (BR 44, VVV 10, maks 24.8), **%26.8'i 10M altında**, perp'te medyan 2.5 / maks 12.9. Gerekçe düştü: açmak artık işlem popülasyonunu değiştirir, yani ön-kayıtlı bir hipotez |
+| 77 | **Kapı 1'in DSR kontrolü hiçbir stratejinin geçemeyeceği bir eşik kullanıyordu.** Bailey & López de Prado'da eşik `sqrt(V)·[...]` ve **V denemeler arası Sharpe varyansı**; kod `sd**2` (getiri varyansı) geçirip `sd`'ye bölüyordu, yani V=1. Sonuç: 16 denemede eşik 1.80 **bar-başına** Sharpe = yıllık 34. Ölçüldü: sentetik yıllık Sharpe 0.5 / 2.0 / **10.0** — üçü de `trials=16`'da p=1.0000. Kapı sıkı değil **geçilemezdi**, ve reponun "istatistiksel bütçe tükendi, tek çıkış taze veri" sonucu bu sayıdan okunmuştu. Mevcut iki DSR testi yakalayamazdı: aralarında yalnız `trials=1` (eşik tanım gereği 0, iki sürüm aynı) ve zaten reddedilmesi gereken bir sonuçta `trials=500` deneniyordu | kritik | eşik tahmincinin kendi standart hatası ölçeğine taşındı (`sqrt(denom/(n-1))`). Düzeltilmiş kapı: Sharpe 0 → p=0.96, Sharpe 2.0 → p=0.0497, Sharpe 3.0 → p=0.0004 (hepsi 16 denemede). **Kapı 1 yeniden ölçülmedi** — bot durdurulup `--to` ile sabitlenmeli |
+| 76 | **Tamirin kendisi bir tur daha istedi.** Yeni `amend_stop` ilk restart'ta üç pozisyonun da stop'unu gereksiz yere yerine koydu: Bybit "değişecek bir şey yok"u genel `10001` altında bildiriyor (`"The order remains unchanged as the parameters entered match the existing ones"`), kod bunu hata sayıp cancel-and-replace'e düşüyordu. Sonuç doğruydu ama yol yanlış: her barda ~1 saniyelik korumasız pencere açıp aynı seviyeye geri dönmek | orta | mesaj ayırt ediliyor, no-op başarı sayılıyor. Kodu değil **mesajı** okumak gerekiyor: 10001 gerçek parametre hatasıyla ortak |
+
+#72 serinin dördüncü üyesi ve en pahalısı: **docstring'in vaat ettiği şeyin
+yazıldığı hiç doğrulanmamıştı.** "Falls back to cancel-and-replace" cümlesi
+kodun yanında duruyordu, kod öyle yapmıyordu, ve dönüş değerini kimse okumadığı
+için borsa ile defter arasındaki fark hiçbir yerde görünmüyordu. Bir yorumun
+doğru olduğunu gösteren tek şey, yanlış olduğunda kırılan bir testtir.
+
 ### Ölçülmüş borsa gerçekleri — linear perpetual (2026-09-20, demo'da emirle)
 
 `scripts/perp_probe.py` ile tekrar üretilebilir. Tam çıktı: `research/perp_venue_facts.md`.
@@ -443,8 +489,8 @@ ise mümkün — yön borsa tarafından çıkarsandığı için tetik fiyatını
 okunup anında dolar.
 
 **Açık, düzeltilmedi:** `report.py` ve panel `run_id`/`mode` filtrelemiyor. `runs`
-tablosunda mod var (`paper` / `live`), ama equity eğrisi ve işlem istatistikleri
-paper ($1.000 ölçek) ile demo ($50.000 ölçek) koşularını tek seriye karıştırıyor.
+tablosunda mod var, ama equity eğrisi ve işlem istatistikleri farklı ölçekteki
+koşuları ($1.000 / $50.000) tek seriye karıştırıyor.
 İşlem güvenliği sorunu değil, **rapor doğruluğu** sorunu. Çözüm: sorguları aktif
 moda göre filtrelemek, ya da mod başına ayrı `runtime/` dizini.
 
@@ -488,7 +534,7 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 | `strategy/conviction.py` | Seçicilik motoru, 0-100, dinamik eşik |
 | `strategy/exits.py` | 4 katmanlı çıkış, sabit süre yok |
 | `risk/budget.py` `sizing.py` `leverage.py` | Sürekli merdiven, stop'tan boyut, promosyon kapısı |
-| `execution/broker.py` `paper_broker.py` `ccxt_broker.py` | Tek arayüz, üç uygulama |
+| `execution/broker.py` `paper_broker.py` `ccxt_broker.py` | Tek arayüz; `paper_broker` **yalnız backtest'in dolum motoru** |
 | `execution/reconcile.py` | Açılışta mutabakat; anlaşmazlıkta borsa kazanır |
 | `data/feed.py` | Bar-arası WS fiyat akışı. Yalnız son/yüksek/düşük |
 | `engine/runner.py` | Canlı döngü |
@@ -503,7 +549,7 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 
 ```bash
 ./ops/pre-install.sh                                      # tüm kurulum + ölçüm
-./ops/bot.sh start paper|demo|live|fast                   # 7/24 (launchd üretir)
+./ops/bot.sh start demo|live|fast                         # 7/24 (launchd üretir)
 ./ops/bot.sh status | stop | restart | logs -f            # motor adı opsiyonel
 ./ops/bot.sh engines                                      # tanımlı motorlar
 
@@ -512,7 +558,7 @@ python scripts/ic_report.py --timeframe 1d                # indikatör ölçüm�
 python scripts/backtest.py                                # backtest + rapor
 python scripts/cpcv_report.py --trials N                  # KAPI 1 kararı
 python scripts/exit_optimizer.py                          # MAE/MFE kalibrasyon
-python scripts/run.py --config config/paper.yaml          # canlı motor
+python scripts/run.py --config config/demo.yaml           # canlı motor
 python scripts/dashboard.py --config config/fast.yaml     # panel :8788 (sekmeli, iki motor)
 python scripts/perp_probe.py                              # perp borsa gerçekleri
 python scripts/report.py --since 30d                      # durum raporu
@@ -578,24 +624,43 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 | işlem ≥ 50 | 116 | ✅ |
 | profit factor ≥ 1.2 | 1.36 | ✅ |
 | maks düşüş ≤ %20 | %15.8 | ✅ |
-| DSR anlamlı | p=1.000 | ❌ |
+| DSR anlamlı | p=1.000 | ⚠️ **geçersiz — bkz. denetim #77** |
 | CPCV yollarının çoğu pozitif | %51.1 | ✅ |
 | PBO ≤ 0.5 | 0.33 | ✅ |
 
-Altı kontrolden **beşi geçiyor**; kalan tek engel DSR. `--trials 11`, bot
-durdurulmuş, tekrarlanabilir (iki ardışık koşu birebir aynı).
+Altı kontrolden beşi geçiyor. Kalan tek engel DSR'dı, **ve o satır bozuk bir
+sayıdan okunmuştu**: `expected_max_sharpe` denemeler arası Sharpe varyansı
+yerine *getiri* varyansı alıyordu, yani eşik 16 denemede 1.80 **bar-başına**
+Sharpe — yıllıklandırılmış 34. Ölçüldü: yıllık Sharpe **10.0** olan sentetik
+bir strateji de p=1.0000 alıyordu. Kapı sıkı değildi, **geçilemezdi**.
+
+Düzeltildikten sonra kapı çalışıyor (3 yıl günlük, n=1095):
+
+| deneme | p<0.05 için gereken yıllık Sharpe |
+|---|---|
+| 1 | 0.95 |
+| 17 | **2.01** |
+| 30 | 2.15 |
+| 100 | 2.42 |
+| 1000 | 2.84 |
+
+Eşik `sqrt(2 ln N)` gibi büyüyor: 17'den 100'e çıkmak sadece +0.41 Sharpe.
+**Deneme sayısı bağlayıcı kısıt değil ve hiç olmadı.** Gözlenen Sharpe 0.40;
+tek denemede bile 0.95 gerekiyor. Eksik olan bütçe değil, edge.
+
+⚠️ Tablo **yeniden ölçülmedi** — bot durdurulup `--to` ile sabitlenmesi gerekiyor
+(değişmez 45, 49). DSR satırı o koşuya kadar geçersiz sayılmalı.
 
 ⚠️ **Bu iyileşme bir kod değişikliğine atfedilemez.** Önce denetim #40'ın tamirine
 bağlanmıştı; sabit ölçüm o tamirin no-op olduğunu gösterdi (#47, #49). PBO'nun
 1.00'den 0.33'e düşmesi arşivin büyümesiyle geldi — yani *daha fazla veri*, daha
 iyi kod değil. Bu, DSR'ın hâlâ neden reddettiğini de açıklıyor.
 
-DSR bu stratejiyle değil **deneme sayısıyla** ilgili — oradan çıkış ayar değil
-taze veri.
-
-Ölçüm `--trials 16` ile, bot durdurulmuş, tekrarlanabilir. Aynı koşu `--trials 1` ile DSR'ı p=0.352 gösteriyor —
-deneme sayısını eksik saymak kapıyı geçirmeye yeten farkı üretiyor. Sayaç
-`research/hypotheses.md`'de ve `ops/pre-install.sh` oradan okuyor.
+~~DSR bu stratejiyle değil **deneme sayısıyla** ilgili~~ — bu sonuç bozuk
+eşikten okunmuştu (#77). Düzeltilmiş hesapta deneme sayısının payı küçük:
+17 → 30 deneme eşiği %7 yükseltiyor. Sayaç yine de tutuluyor
+(`research/hypotheses.md`, `ops/pre-install.sh` oradan okuyor) — ceza gerçek,
+sadece bağlayıcı olan o değil.
 
 ### İki yapısal bulgu (v1 → v2)
 
@@ -629,15 +694,17 @@ sonra min_notional'a takılıyordu. Mekanizma muhafazakâr değil **işlevsizdi*
 +%3.66→+%0.95. Önceki sayının bir kısmı yapaydı — bozuk ölçekleyici farkında
 olmadan şanslı bir alt küme seçiyordu. Düzeltme ölçümü güvenilir yaptı.
 
-### İstatistiksel bütçe tükendi
+### ~~İstatistiksel bütçe tükendi~~ — gerekçe düzeltildi (#77)
 
-9 denemeden sonra DSR'ın beklenen maks Sharpe eşiği ~1.5; gözlenen 0.24. Bu veri
+~~9 denemeden sonra DSR'ın beklenen maks Sharpe eşiği ~1.5; gözlenen 0.24. Bu veri
 setinde (21 sembol × 3 yıl) **daha fazla ayar yapıp sonuca güvenmek matematiksel
-olarak mümkün değil.** PBO (1.00) aynı şeyi bağımsız söylüyor: her bölünmede
+olarak mümkün değil.**~~ O eşik bozuk birimden geliyordu. Düzeltilmiş hesapta
+17 denemede gereken yıllık Sharpe 2.01, 100 denemede 2.42 — yani deneme yapmak
+pahalı ama yasak değil. PBO (1.00) aynı şeyi bağımsız söylüyor: her bölünmede
 içeride en iyi olan konfigürasyon dışarıda medyanın altında kalıyor.
 
 Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var ve
-ödendi. Çıkış yolu ayar değil **taze veri**: paper ileri testi (maliyeti sıfır,
+ödendi. Çıkış yolu ayar değil **taze veri**: demo ileri testi (maliyeti sıfır,
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
@@ -660,7 +727,7 @@ barını yükseltiyor.
 - [x] Faz 3 — kurulumlar, conviction motoru, backtest motoru
 - [x] Faz 4 — CPCV + DSR + PBO + Monte Carlo → **Kapı 1: GEÇİLMEDİ**
 - [x] Faz 5 — MAE/MFE çıkış kalibrasyonu
-- [x] Faz 6 — risk bütçesi, paper/ccxt broker, runner, watchdog, launchd
+- [x] Faz 6 — risk bütçesi, broker katmanı, runner, watchdog, launchd
 - [x] Faz 7 — panel + Telegram
 - [x] Faz 8 — LLM rolleri + redaksiyon + etki ölçümü
 - [ ] Faz 9 — Bybit demo, 4 hafta (Kapı 1 geçilmeden anlamsız)

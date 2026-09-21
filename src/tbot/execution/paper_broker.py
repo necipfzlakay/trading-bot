@@ -1,8 +1,12 @@
 """Simulated execution with explicit, pessimistic cost assumptions.
 
-Used by both the backtester and paper mode, so a paper run and a backtest of the
-same period produce the same trades. Divergence between them means a bug, and
-having a single implementation is what makes that comparison meaningful.
+**This is the backtester's fill engine, not a way to run the bot.** There used
+to be a ``paper`` mode that drove the live loop with this broker; it was removed
+once the demo venue made it redundant — demo answers the same question against a
+real order book, with real rejections, real fees and real partial fills. A
+second execution path that only the simulator exercised turned out to be a place
+for bugs to hide: audit #66 found every simulated short being dropped on the
+floor, in code nobody was running.
 
 Three deliberate pessimism choices, because a simulator that flatters the
 strategy is worse than no simulator:

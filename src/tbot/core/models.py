@@ -31,13 +31,20 @@ from typing import Any
 class Mode(StrEnum):
     """How the engine sources data and routes orders.
 
-    ``BACKTEST`` replays stored candles, ``PAPER`` uses the live feed with a
-    simulated broker, ``LIVE`` sends real orders (to demo or real credentials —
-    that distinction is :class:`Venue`, not mode).
+    ``BACKTEST`` replays stored candles; ``LIVE`` sends real orders, to demo or
+    real credentials — that distinction is :class:`Venue`, not mode.
+
+    There used to be a third, ``PAPER``: the live loop driving a simulated
+    broker. It was removed once the demo venue made it redundant. Demo answers
+    the same question with a real order book, real rejections, real fees and
+    real partial fills, and every failure the simulator could not produce is
+    one this repo has since been bitten by (audits #20-#27, #59-#61). A second
+    execution path that only the simulator exercised was a place for bugs to
+    hide, not a safety net — audit #66 was exactly that: every paper short was
+    dropped on the floor, and nothing noticed because nothing ran it.
     """
 
     BACKTEST = "backtest"
-    PAPER = "paper"
     LIVE = "live"
 
 

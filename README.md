@@ -10,7 +10,7 @@ kabul etmeye değil, reddetmeye ayarlı. Şu anda kendi stratejisini reddediyor
 
 ```bash
 ./ops/pre-install.sh          # kurulum + ölçüm + kontrol (bir kez)
-./ops/bot.sh start paper      # 7/24 çalıştır — bot + panel + sağlık kontrolü
+./ops/bot.sh start demo       # 7/24 çalıştır — bot + panel + sağlık kontrolü
 ./ops/bot.sh status           # ne oluyor
 ./ops/bot.sh stop             # durdur
 ```
@@ -20,7 +20,7 @@ Kapı 1'i çalıştırır, sonra motorun açılış yolunu kilide kadar yürüye
 adımın **gerçekten** işe yaradığını doğrular. İlk koşu ~20 dakika, yarıda
 kesilirse kaldığı yerden devam eder. Botu başlatmaz — o ayrı bir karar.
 
-`bot.sh` launchd agent'larını moda göre üretir (`paper` · `demo` · `live`),
+`bot.sh` launchd agent'larını moda göre üretir (`demo` · `live` · `fast`),
 **kurmadan önce o modun başlayabildiğini doğrular**, sonra motorun gerçekten
 kalktığını bekler. Elle python çalıştırmak gerekmiyor. Gerçek para Kapı 1 ve
 elle yazılan bir onay cümlesi istiyor.

@@ -286,6 +286,54 @@ def test_many_trials_penalise_the_same_result():
     assert not many.is_significant
 
 
+def test_a_strong_edge_still_passes_after_a_realistic_number_of_trials():
+    """Audit #77: the gate was not strict, it was unpassable.
+
+    ``expected_max_sharpe`` wants the variance of the Sharpe ratios *across the
+    trials*; it was being handed the variance of the returns and then divided
+    by their standard deviation, which sets that variance to 1. The benchmark
+    became 1.80 in per-period units at 16 trials — an annualised Sharpe of 34.
+
+    Nothing clears that. Measured before the fix: an annualised Sharpe of 10.0
+    scored p = 1.0000 at 16 trials, as did 2.0 and 0.5. And Gate 1's standing
+    verdict — "the statistical budget is exhausted, the only way out is fresh
+    data" — was read off that number.
+
+    The two existing DSR tests could not catch it because between them they only
+    exercised ``trials=1`` (where the benchmark is zero by definition, so both
+    versions agree) and ``trials=500`` on a result that ought to fail anyway.
+    """
+    rng = np.random.default_rng(7)
+    daily = rng.normal(0, 1, 1095)
+    # An annualised Sharpe of 3.0: strong, but nothing a real strategy has not
+    # reached over three years.
+    strong = (daily - daily.mean()) / daily.std(ddof=1) * 0.01 + 3.0 / np.sqrt(365) * 0.01
+
+    assert deflated_sharpe(strong, trials=1, periods_per_year=365).is_significant
+    assert deflated_sharpe(strong, trials=16, periods_per_year=365).is_significant
+    assert deflated_sharpe(strong, trials=100, periods_per_year=365).is_significant
+
+    # Still a penalty, and still able to refuse: the same series at a Sharpe the
+    # trials could plausibly have produced by chance does not pass.
+    modest = (daily - daily.mean()) / daily.std(ddof=1) * 0.01 + 0.5 / np.sqrt(365) * 0.01
+    assert not deflated_sharpe(modest, trials=16, periods_per_year=365).is_significant
+
+
+def test_the_benchmark_is_in_the_same_units_as_the_sharpe_it_is_compared_against():
+    """A dimensional check, because that is what actually broke.
+
+    The benchmark must sit on the scale of the *estimator's own* sampling
+    error. At 16 trials it is a few standard errors of a per-period Sharpe,
+    which for a three-year daily sample is a small number — not 1.8.
+    """
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0.0002, 0.01, 1095)
+    result = deflated_sharpe(returns, trials=16, periods_per_year=365)
+
+    standard_error = 1.0 / np.sqrt(len(returns) - 1)  # ≈ 0.03 per-period
+    assert 1.0 * standard_error < result.expected_max_sharpe < 4.0 * standard_error
+
+
 def test_expected_max_sharpe_grows_with_the_number_of_trials():
     assert expected_max_sharpe(1) == 0.0
     assert expected_max_sharpe(10) < expected_max_sharpe(100) < expected_max_sharpe(1000)

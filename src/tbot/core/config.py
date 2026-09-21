@@ -86,8 +86,16 @@ class StrictModel(BaseModel):
 class UniverseConfig(StrictModel):
     """Which symbols get scanned.
 
-    ``symbols`` pins an explicit list; leaving it empty auto-selects the most
-    liquid pairs by 24h volume, refreshed daily.
+    ``symbols`` pins an explicit list; leaving it empty makes the engine read
+    the list ``scripts/backfill.py`` last wrote to ``runtime/universe.json``.
+
+    That list is **not** refreshed by the engine, and saying it was "refreshed
+    daily" here was wrong: ``select_universe`` has exactly one caller and it is
+    the backfill script. A symbol whose turnover collapses stays in the traded
+    universe until someone runs backfill again — measured on the live spot
+    universe, three symbols have since fallen under the very threshold that
+    admitted them. ``_check_universe_liquidity`` reports that drift every bar
+    rather than hiding it; acting on it is a separate decision.
     """
 
     symbols: list[str] = Field(default_factory=list)
@@ -352,7 +360,7 @@ class IndicatorConfig(StrictModel):
 
 class ExecutionConfig(StrictModel):
     order_type: Literal["market", "limit"] = "market"
-    # Backtest/paper cost assumptions. Live fees are fetched from the exchange
+    # Backtest cost assumptions. Live fees are fetched from the exchange
     # and override these; if the real cost is worse, the backtest was optimistic.
     assumed_taker_fee: float = Field(default=0.001, ge=0, le=0.01)
     assumed_maker_fee: float = Field(default=0.001, ge=0, le=0.01)
@@ -365,10 +373,16 @@ class ExecutionConfig(StrictModel):
     # Collection is free and always on in live mode; see the flag below for
     # whether it is allowed to change a decision.
     microstructure_enabled: bool = True
-    # Let spread and liquidity reach the conviction score. Off by default: the
-    # penalty branches have never run against real data, and switching them on
-    # changes the trade population without any measurement behind it. Phase one
-    # is to collect and look; phase two is a separate, recorded decision.
+    # Let spread and liquidity reach a decision — both the soft penalties in
+    # the conviction score and the hard floors below, which is what makes
+    # ``universe.max_spread_bps`` a setting that is read rather than one that
+    # merely looks read (invariant 50).
+    #
+    # Off by default, and the reason has changed. It used to be "the floors are
+    # never crossed anyway": measured over 1302 live scan rows that is false —
+    # 4.5% of rows sit above 10bps and 26.8% below the 10M turnover floor. So
+    # turning this on now moves the trade population, and that makes it a
+    # pre-registered hypothesis with a trial attached, not a tidy-up.
     microstructure_penalties: bool = False
     # How often the engine asks the venue whether a protective stop has filled,
     # while it is waiting between bars. Without this the engine learns its own
@@ -607,7 +621,9 @@ class Config(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Mode = Mode.PAPER
+    # The default cannot send an order. A config that forgets to say what it
+    # is gets the harmless reading, not the expensive one.
+    mode: Mode = Mode.BACKTEST
     venue: Venue = Venue.BYBIT_DEMO
     starting_balance: float = Field(default=100.0, gt=0)
     quote_currency: str = "USDT"
@@ -645,7 +661,7 @@ class Config(BaseModel):
             )
         if self.execution.slippage_bps == 0 and self.mode is not Mode.LIVE:
             raise ValueError(
-                "zero slippage in backtest/paper produces fiction; set execution.slippage_bps > 0"
+                "zero slippage in a backtest produces fiction; set execution.slippage_bps > 0"
             )
         return self
 
@@ -738,7 +754,7 @@ def assert_runnable(cfg: Config, secrets: Secrets) -> None:
         raise RuntimeError(
             "Refusing to start with REAL money. This run would place live orders on "
             "bybit-live. If that is genuinely intended, set TBOT_CONFIRM_LIVE=yes in "
-            "the environment. Paper and demo modes need no such flag."
+            "the environment. The demo venue needs no such flag."
         )
     if cfg.llm.enabled and cfg.llm.primary_provider == "gemini" and not secrets.gemini_api_key:
         raise RuntimeError("llm.enabled with primary_provider=gemini but GEMINI_API_KEY is unset")

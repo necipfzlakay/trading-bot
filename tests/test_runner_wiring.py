@@ -1280,3 +1280,238 @@ def test_perp_order_lookups_use_the_linear_category():
     assert seen, "the lookup must actually query the venue"
     assert all(p["category"] == "linear" for p in seen)
     assert all(p["symbol"] == "SOLUSDT" for p in seen)
+
+
+# --------------------------------------------------------------------------
+# Audit #72: the venue stop and the local stop drifted apart, silently
+# --------------------------------------------------------------------------
+
+
+def _sync_fixture(amend_result):
+    """A runner reduced to what ``_sync_protective_stop`` actually touches."""
+    from tbot.core.models import Position, Venue
+    from tbot.engine.runner import Runner
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {}
+    calls: list[tuple] = []
+
+    def amend_stop(symbol, order_id, stop_price):
+        calls.append((symbol, order_id, stop_price))
+        return amend_result
+
+    broker.amend_stop = amend_stop
+
+    class Watchdog:
+        def call(self, _name, fn, default=None):
+            return fn()
+
+    class Database:
+        def __init__(self):
+            self.events: list[tuple] = []
+            self.saved = 0
+
+        def upsert_position(self, _position):
+            self.saved += 1
+
+        def record_event(self, name, message, level="info", payload=None):
+            self.events.append((name, message, level))
+
+    runner = Runner.__new__(Runner)
+    runner.broker = broker
+    runner.watchdog = Watchdog()
+    runner.db = Database()
+    runner.notifier = None
+
+    position = Position(
+        symbol="VVV/USDT",
+        side=Side.BUY,
+        quantity=1.31,
+        entry_price=26.171,
+        entry_ts=0,
+        initial_stop=23.43,
+        current_stop=26.455,
+        setup="momentum_continuation",
+        risk_amount=3.59,
+    )
+    position.meta["stop_order_id"] = "old"
+    return runner, position, calls
+
+
+def test_a_venue_stop_that_could_not_be_moved_is_retried_and_reported():
+    """The sync used to be fire-and-forget, and the caller gated it on a ratchet.
+
+    Both halves had to go. A refused amend was logged once and the return value
+    thrown away, so the venue kept the entry stop for the life of the position
+    while every local view showed the trailed one (measured: ETH local 2588.06
+    / venue 2506.63). And because the call only ran when the trail moved, a
+    failure waited for the *next* ratchet, which for a position that never
+    ratchets again is never.
+    """
+    runner, position, calls = _sync_fixture(amend_result=None)
+
+    runner._sync_protective_stop(position)
+
+    assert len(calls) == 1
+    assert position.meta["stop_at_venue"] is None
+    assert [e[0] for e in runner.db.events] == ["stop_not_synced"]
+
+    # Next bar, nothing ratcheted. It must try again anyway.
+    runner._sync_protective_stop(position)
+    assert len(calls) == 2
+
+
+def test_a_confirmed_venue_stop_is_not_re_sent_every_bar():
+    runner, position, calls = _sync_fixture(amend_result="old")
+
+    runner._sync_protective_stop(position)
+    assert calls == [("VVV/USDT", "old", 26.455)]
+    assert position.meta["stop_at_venue"] == 26.455
+
+    runner._sync_protective_stop(position)
+    assert len(calls) == 1  # nothing moved, nothing asked
+
+    position.current_stop = 27.0
+    runner._sync_protective_stop(position)
+    assert calls[-1] == ("VVV/USDT", "old", 27.0)
+
+
+def test_a_replaced_stop_hands_its_new_id_back_to_the_position():
+    """A cancel-and-replace produces a different order id.
+
+    Keeping the old one leaves the engine unable to move, cancel or recognise
+    its own stop — the failure audit #37 already paid for once.
+    """
+    runner, position, _calls = _sync_fixture(amend_result="new-order-id")
+
+    runner._sync_protective_stop(position)
+
+    assert position.meta["stop_order_id"] == "new-order-id"
+    assert position.meta["stop_at_venue"] == 26.455
+    assert runner.db.events == []
+
+
+def test_an_open_position_reports_where_it_stands_in_r():
+    """``bot.sh status`` read ``r_multiple``; ``_positions_view`` never wrote it.
+
+    So every open position printed ``R=+0.00`` regardless of where it was —
+    three live trades at +2.67R, +0.92R and -0.02R all shown as flat. The panel
+    that was supposed to answer "how is this going" answered "nothing is
+    happening", which is worse than answering nothing.
+    """
+    from tbot.core.models import Position
+    from tbot.engine.runner import Runner
+
+    class Marked(Runner):
+        """``Runner`` is slotted, so the mark is overridden rather than patched."""
+
+        mark = 33.744
+
+        def _mark_for(self, _symbol):
+            return self.mark
+
+    runner = Marked.__new__(Marked)
+    runner.portfolio = Portfolio(starting_cash=1000.0)
+    runner.portfolio.positions["VVV/USDT"] = Position(
+        symbol="VVV/USDT",
+        side=Side.BUY,
+        quantity=1.31,
+        entry_price=26.171,
+        entry_ts=0,
+        initial_stop=23.431,
+        current_stop=26.455,
+        setup="momentum_continuation",
+        risk_amount=3.59,
+    )
+    (row,) = runner._positions_view()
+
+    # (33.744 - 26.171) / (26.171 - 23.431)
+    assert row["r_multiple"] == pytest.approx(2.76, abs=0.01)
+
+    # An unreadable mark is not a flat trade.
+    Marked.mark = None
+    assert runner._positions_view()[0]["r_multiple"] is None
+
+
+def test_a_symbol_that_falls_under_the_liquidity_floor_is_reported():
+    """The engine reads ``universe.json`` once and never refreshes it.
+
+    ``select_universe`` has exactly one caller and it is ``scripts/backfill.py``,
+    while the config claimed the list was "refreshed daily". So a symbol whose
+    turnover collapses keeps being scanned, scored and entered — measured on the
+    live spot universe, three symbols have fallen under the very 5M threshold
+    that admitted them, one of them sitting at 4.8M, and nothing said so.
+
+    Reporting only. Dropping a symbol mid forward test changes the trade
+    population, which is the thing the run exists to measure.
+    """
+    from tbot.core.config import Config
+    from tbot.engine.runner import Runner
+
+    class Database:
+        def __init__(self):
+            self.events: list[tuple] = []
+
+        def record_event(self, name, message, level="info", payload=None):
+            self.events.append((name, message, level))
+
+    config = Config()
+    config.universe.min_volume_24h_usd = 5_000_000
+
+    runner = Runner.__new__(Runner)
+    runner.config = config
+    runner.db = Database()
+    runner.symbols = ["BTC/USDT", "UNI/USDT", "FLOCK/USDT"]
+    runner._thin_symbols = {}
+    runner._microstructure = {
+        "BTC/USDT": {"turnover_24h": 365_000_000.0},
+        "UNI/USDT": {"turnover_24h": 4_800_000.0},
+        "FLOCK/USDT": {"turnover_24h": 5_400_000.0},
+    }
+
+    runner._check_universe_liquidity()
+    assert [e[0] for e in runner.db.events] == ["universe_below_liquidity_floor"]
+    assert "UNI/USDT" in runner.db.events[0][1]
+    assert "FLOCK" not in runner.db.events[0][1]  # 5.4M clears the 5M floor
+
+    # Same picture next bar: said once, not every hour.
+    runner._check_universe_liquidity()
+    assert len(runner.db.events) == 1
+
+    # A second symbol drops. That is a change, so it is worth saying again.
+    runner._microstructure["FLOCK/USDT"] = {"turnover_24h": 3_100_000.0}
+    runner._check_universe_liquidity()
+    assert len(runner.db.events) == 2
+    assert "FLOCK/USDT" in runner.db.events[1][1]
+
+
+def test_an_unreadable_turnover_is_not_a_thin_book():
+    """Zero means the venue was not asked, or could not answer (invariant 10).
+
+    Reading it as "no volume" would report the entire universe as illiquid on
+    the first bar of any run with microstructure collection switched off.
+    """
+    from tbot.core.config import Config
+    from tbot.engine.runner import Runner
+
+    class Database:
+        events: list = []
+
+        def record_event(self, *a, **k):
+            raise AssertionError("nothing was measured, so nothing can be reported")
+
+    config = Config()
+    config.universe.min_volume_24h_usd = 5_000_000
+
+    runner = Runner.__new__(Runner)
+    runner.config = config
+    runner.db = Database()
+    runner.symbols = ["BTC/USDT"]
+    runner._thin_symbols = {}
+    runner._microstructure = {"BTC/USDT": {"turnover_24h": 0.0}}
+
+    runner._check_universe_liquidity()

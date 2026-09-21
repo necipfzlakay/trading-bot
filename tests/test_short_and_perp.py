@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 
+import ccxt
 import pytest
 
 from tbot.core.config import ConvictionConfig, EntryConfig, ExitConfig, RiskConfig, load_config
@@ -635,61 +636,6 @@ def test_a_live_short_entry_is_recorded_as_a_short():
     assert position.initial_stop > position.entry_price
 
 
-def test_a_paper_short_entry_becomes_a_position():
-    """``_apply_paper_fill`` gated on ``fill.side is not Side.BUY``.
-
-    That was an entry/exit discriminator only for as long as every entry was a
-    buy. Once the scoring could choose SELL, the simulated venue filled the
-    short and moved its balances while the engine recorded nothing: no stop, no
-    exit, the symbol free to re-enter next bar, and equity wrong for the rest
-    of the run. Exits never reach this path — they fill through
-    ``force_fill_at``, which removes the order from ``pending`` — so the plan on
-    the order, not the side, is what marks an entry.
-    """
-    from tbot.core.config import Config
-    from tbot.core.models import Order, OrderType
-
-    config = Config()
-    config.entries.allow_short = True
-
-    runner = _live_runner(config)
-    data = _downtrend_frames()["SOL/USDT:USDT"]
-
-    order = Order(
-        client_id="x",
-        symbol="SOL/USDT:USDT",
-        side=Side.SELL,
-        type=OrderType.MARKET,
-        quantity=2.0,
-        price=None,
-        created_ts=0,
-        updated_ts=0,
-    )
-    order.meta = {
-        "stop": 168.0,
-        "setup": "momentum_decline",
-        "conviction": 80.0,
-        "regime": Regime.TREND_DOWN.value,
-        "risk_amount": 25.0,
-        "planned_entry": 160.0,
-    }
-    fill = Fill(
-        order_client_id="x",
-        symbol="SOL/USDT:USDT",
-        side=Side.SELL,
-        quantity=2.0,
-        price=160.0,
-        fee=0.19,
-        ts=1_758_300_000_000,
-    )
-
-    runner._apply_paper_fill(fill, order, data, bar_ts=1_758_300_000_000)
-
-    position = runner.portfolio.positions["SOL/USDT:USDT"]
-    assert position.side is Side.SELL
-    assert position.initial_stop > position.entry_price
-
-
 def test_scaling_out_of_a_short_is_recorded_as_a_buy_to_cover():
     """The order was built with ``position.side.opposite`` and the ``Fill``
     with a literal ``Side.SELL``. Reducing a short is a buy, so the fills table
@@ -750,10 +696,13 @@ def test_the_perp_trailing_stop_actually_reaches_the_venue():
     Its ``place_stop`` returns ``position:<symbol>`` rather than an order id,
     because the venue tracks a perpetual's stop as a property of the position.
     The inherited ``amend_stop`` called ``edit_order`` against that string, the
-    venue refused, the exception was caught and ``False`` returned — so the
-    local book showed a trailed stop while the venue kept the original one for
-    the life of the position. The gap opens exactly when this process is down,
+    venue refused, the exception was caught and failure returned — so the local
+    book showed a trailed stop while the venue kept the original one for the
+    life of the position. The gap opens exactly when this process is down,
     which is the only reason a venue-side stop exists (invariant 12).
+
+    The return is the id now protecting the position, so that a caller whose
+    stop had to be *replaced* rather than amended keeps a working handle to it.
     """
     from tbot.core.models import Venue
     from tbot.execution.ccxt_broker import PerpBroker
@@ -779,7 +728,7 @@ def test_the_perp_trailing_stop_actually_reaches_the_venue():
     assert order_id == "position:SOLUSDT"
 
     # The trail ratchets the stop up. This is the call that used to be a no-op.
-    assert broker.amend_stop("SOL/USDT:USDT", order_id, 155.0) is True
+    assert broker.amend_stop("SOL/USDT:USDT", order_id, 155.0) == "position:SOLUSDT"
     assert sent[-1]["stopLoss"] == "155.0"
     assert sent[-1]["symbol"] == "SOLUSDT"
 
@@ -870,3 +819,269 @@ def test_a_duplicate_id_is_not_resolved_against_a_venue_that_cannot_be_read():
 
     assert resolved.status is OrderStatus.REJECTED
     assert "balance read failed" in resolved.reject_reason
+
+
+# --------------------------------------------------------------------------
+# Audit #72: the spot stop amend was refused on every trail, silently
+# --------------------------------------------------------------------------
+
+
+def _spot_broker(exchange):
+    from tbot.core.models import Venue
+    from tbot.execution.ccxt_broker import CCXTBroker
+
+    broker = CCXTBroker.__new__(CCXTBroker)
+    broker.exchange = exchange
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {}
+    return broker
+
+
+def test_the_spot_stop_amend_uses_the_shape_bybit_actually_accepts():
+    """ccxt's ``edit_order`` builds a derivatives amend and adds ``triggerBy``.
+
+    Bybit **spot** answers that with ``10001 Request parameter error`` — on
+    every trail, measured. The bare v5 amend (category, symbol, orderId,
+    triggerPrice) is accepted, also measured, on the first attempt.
+
+    The test pins the request shape rather than the outcome: an implementation
+    that goes back through ``edit_order`` would pass an outcome assertion
+    against a fake and fail against the venue, which is precisely how this got
+    to production in the first place.
+    """
+    sent: list[dict] = []
+
+    class Exchange:
+        def price_to_precision(self, _symbol, price):
+            return str(price)
+
+        def privatePostV5OrderAmend(self, params):
+            sent.append(params)
+            return {"retCode": 0, "result": {"orderId": params["orderId"]}}
+
+        def edit_order(self, **_kwargs):  # pragma: no cover - must not be called
+            raise AssertionError("edit_order mangles the spot amend; use v5 directly")
+
+    broker = _spot_broker(Exchange())
+
+    assert broker.amend_stop("VVV/USDT", "2306901319086247168", 26.455) == (
+        "2306901319086247168"
+    )
+    assert sent == [
+        {
+            "category": "spot",
+            "symbol": "VVVUSDT",
+            "orderId": "2306901319086247168",
+            "triggerPrice": "26.455",
+        }
+    ]
+
+
+def test_a_refused_amend_falls_back_to_cancel_and_replace():
+    """The docstring promised this fallback; the code never had it.
+
+    A refused amend logged one warning and returned failure, and the caller
+    ignored the result — so the venue went on holding the entry stop while
+    every local view showed the trailed one.
+    """
+    calls: list[str] = []
+
+    class Exchange:
+        def price_to_precision(self, _symbol, price):
+            return str(price)
+
+        def privatePostV5OrderAmend(self, _params):
+            calls.append("amend")
+            raise ccxt.BaseError("bybit 10001 Request parameter error")
+
+        def cancel_order(self, **_kwargs):
+            calls.append("cancel")
+            return {}
+
+    broker = _spot_broker(Exchange())
+    broker._resting_stops = lambda _s: [{"orderId": "old", "qty": "1.31"}]
+    placed: list[tuple] = []
+
+    def place_stop(symbol, quantity, stop_price, client_id):
+        placed.append((symbol, quantity, stop_price, client_id))
+        return "new-order-id"
+
+    broker.place_stop = place_stop
+
+    assert broker.amend_stop("VVV/USDT", "old", 26.455) == "new-order-id"
+    assert calls == ["amend", "cancel"]
+    # The replacement covers what the cancelled stop covered, not what the
+    # local book thinks the position is: a spot buy's fee comes out of the base
+    # asset, so the two differ (invariant 23).
+    assert placed[0][1] == 1.31
+
+
+def test_a_stop_that_could_not_be_moved_is_reported_not_assumed():
+    """Both calls fail. The engine must not carry on believing it is protected."""
+
+    class Exchange:
+        def price_to_precision(self, _symbol, price):
+            return str(price)
+
+        def privatePostV5OrderAmend(self, _params):
+            raise ccxt.BaseError("bybit 10001 Request parameter error")
+
+        def cancel_order(self, **_kwargs):
+            raise ccxt.BaseError("bybit 110001 order does not exist")
+
+    broker = _spot_broker(Exchange())
+    broker._resting_stops = lambda _s: []
+
+    assert broker.amend_stop("VVV/USDT", "old", 26.455) is None
+
+
+def test_microstructure_is_fetched_for_the_category_the_broker_trades():
+    """Hardcoded ``"spot"`` made this silently useless on the perp engine.
+
+    Two failures in one method: the wrong ticker list, and ``SOLUSDT:USDT`` as
+    the key to index it by. Measured on a ten-hour run — 1213 of 1213 scan rows
+    carried ``spread_bps = 0``, which reads as "perfectly tight" rather than
+    "never measured", and ``universe.max_spread_bps`` therefore decided nothing
+    at all.
+    """
+    from tbot.core.models import Venue
+    from tbot.execution.ccxt_broker import PerpBroker
+
+    asked: list[dict] = []
+
+    class Exchange:
+        def publicGetV5MarketTickers(self, params):
+            asked.append(params)
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "SOLUSDT",
+                            "bid1Price": "199.95",
+                            "ask1Price": "200.05",
+                            "turnover24h": "1000000",
+                        }
+                    ]
+                }
+            }
+
+    broker = PerpBroker.__new__(PerpBroker)
+    broker.exchange = Exchange()
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {}
+
+    out = broker.fetch_microstructure(["SOL/USDT:USDT"])
+
+    assert asked == [{"category": "linear"}]
+    assert out["SOL/USDT:USDT"]["spread_bps"] == pytest.approx(5.0, rel=1e-3)
+    assert out["SOL/USDT:USDT"]["turnover_24h"] == 1_000_000.0
+
+
+def test_an_amend_the_venue_had_nothing_to_change_is_success():
+    """Bybit files "nothing to change" under the same 10001 as a real error.
+
+    Read as a failure it sends the cancel-and-replace path down a route that
+    leaves the position with no stop at all for a moment, every bar, to arrive
+    back at the level it already had. Observed live on the first restart after
+    the amend was fixed: all three open positions were needlessly replaced.
+    """
+    cancelled: list[str] = []
+
+    class Exchange:
+        def price_to_precision(self, _symbol, price):
+            return str(price)
+
+        def privatePostV5OrderAmend(self, _params):
+            raise ccxt.BaseError(
+                'bybit {"retCode":10001,"retMsg":"The order remains unchanged as '
+                'the parameters entered match the existing ones."}'
+            )
+
+        def cancel_order(self, **kwargs):  # pragma: no cover - must not be called
+            cancelled.append(kwargs.get("id", ""))
+            raise AssertionError("a no-op amend must not churn the resting stop")
+
+    broker = _spot_broker(Exchange())
+
+    assert broker.amend_stop("VVV/USDT", "resting", 26.455) == "resting"
+    assert cancelled == []
+
+
+def test_the_positions_own_stop_and_target_are_not_reported_as_orphans():
+    """On a perpetual the stop and take-profit belong to the position.
+
+    The venue reports them as orders with an empty ``orderLinkId``, because no
+    client id was ever sent for them. Reconciliation matches on client id, so
+    both came back as orphans on every start — two warnings per open position,
+    for protection working exactly as designed, that no action could clear.
+    Observed the first time the fast engine opened a position.
+    """
+    from tbot.core.models import Venue
+    from tbot.execution.ccxt_broker import PerpBroker
+
+    class Exchange:
+        def fetch_open_orders(self, _symbol=None):
+            return [
+                {
+                    "symbol": "SOL/USDT:USDT", "side": "sell", "type": "market",
+                    "amount": 1.0, "price": None, "status": "open", "id": "a",
+                    "timestamp": 0,
+                    "info": {"orderLinkId": "", "stopOrderType": "StopLoss"},
+                },
+                {
+                    "symbol": "SOL/USDT:USDT", "side": "sell", "type": "market",
+                    "amount": 1.0, "price": None, "status": "open", "id": "b",
+                    "timestamp": 0,
+                    "info": {"orderLinkId": "", "stopOrderType": "TakeProfit"},
+                },
+                {
+                    "symbol": "SOL/USDT:USDT", "side": "buy", "type": "limit",
+                    "amount": 1.0, "price": 100.0, "status": "open", "id": "c",
+                    "timestamp": 0,
+                    "info": {"orderLinkId": "tbfa-sol-entr-1234", "stopOrderType": ""},
+                },
+            ]
+
+    broker = PerpBroker.__new__(PerpBroker)
+    broker.exchange = Exchange()
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {}
+
+    kept = broker.fetch_open_orders()
+
+    # The armed entry is a real order and must still be reconciled.
+    assert [o.client_id for o in kept] == ["tbfa-sol-entr-1234"]
+
+
+def test_a_market_order_is_looked_up_by_id_not_scanned_out_of_the_open_list():
+    """An unfiltered realtime query answers with the *open* orders.
+
+    A market order that just filled is by definition not among them, so the
+    scan found nothing and the settle fell through to the requested price —
+    H17's first trade was recorded at 112.09 against the 112.58 it paid.
+    """
+    asked: list[dict] = []
+
+    class Exchange:
+        def privateGetV5OrderRealtime(self, params):
+            asked.append(params)
+            if "orderId" not in params:
+                return {"result": {"list": []}}
+            return {"result": {"list": [{
+                "orderId": params["orderId"], "orderStatus": "Filled",
+                "cumExecQty": "1", "avgPrice": "112.58", "cumExecValue": "112.58",
+                "cumExecFee": "0.061919", "side": "Buy",
+            }]}}
+
+    broker = _spot_broker(Exchange())
+    state = broker.order_state("SOL/USDT:USDT", "dc8c794c")
+
+    assert asked[0]["orderId"] == "dc8c794c"  # asked for by id first
+    assert state["average_price"] == 112.58
+    assert state["filled"] == 1.0

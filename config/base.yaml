@@ -2,10 +2,13 @@
 # sadece farklarını yazar. Buradaki her değer pydantic ile doğrulanır —
 # geçersiz bir değer botu açılışta durdurur, işlem sırasında değil.
 
-mode: paper
+# base tek başına backtest profilidir; demo.yaml / live.yaml / fast.yaml bunu
+# `mode: live` ile ezer. Canlı motorun paper karşılığı yok — simülatör yalnız
+# backtest'in dolum motoru olarak yaşıyor.
+mode: backtest
 venue: bybit-demo
-# SADECE paper ve backtest için başlangıç bakiyesi. Canlı modda gerçek bakiye
-# borsadan okunur; buradaki değer kullanılmaz.
+# SADECE backtest için başlangıç bakiyesi. Canlı modda gerçek bakiye borsadan
+# okunur; buradaki değer kullanılmaz.
 starting_balance: 1000.0
 quote_currency: USDT
 log_level: INFO

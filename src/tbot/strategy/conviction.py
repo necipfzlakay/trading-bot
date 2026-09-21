@@ -70,6 +70,12 @@ UNSCORED_REASONS = frozenset(
         NoTradeReason.LLM_EVENT_VETO,
         NoTradeReason.REGIME_VETO,
         NoTradeReason.CORRELATION_FULL,
+        # These two join the set by construction, not by preference: they are
+        # returned from ``_blocking_reason``, so nothing is computed for them
+        # either. Leaving them out would hand the collapse exit a 0.0 it would
+        # read as a dead thesis, when all it means is that the book was thin.
+        NoTradeReason.SPREAD_TOO_WIDE,
+        NoTradeReason.LIQUIDITY_TOO_LOW,
     }
 )
 
@@ -90,6 +96,11 @@ class ScoringContext:
     permission_signals: dict[str, float]
     spread_bps: float = 0.0
     volume_24h: float = 0.0
+    # Hard floors, supplied by the engine from ``universe``. Zero disables the
+    # corresponding check, which is what keeps a context built without them —
+    # every backtest and every test — behaving exactly as before.
+    max_spread_bps: float = 0.0
+    min_volume_24h: float = 0.0
     atr: float = 0.0
     price: float = 0.0
     expected_r: float | None = None
@@ -220,6 +231,19 @@ class ConvictionEngine:
             return NoTradeReason.REGIME_VETO
         if ctx.correlation_conflict:
             return NoTradeReason.CORRELATION_FULL
+        # Execution reality, checked before the maths for the same reason as
+        # everything else here: a book too thin to fill the size the sizer will
+        # compute makes the score academic.
+        #
+        # These two were the last unassigned members of ``NoTradeReason``, and
+        # ``universe.max_spread_bps`` was the last config key nothing read —
+        # both survivors of the era when no microstructure data existed at all
+        # (audit #44). A zero floor disables the check, so the engine only
+        # reaches them once the operator switches microstructure on.
+        if 0 < ctx.max_spread_bps < ctx.spread_bps:
+            return NoTradeReason.SPREAD_TOO_WIDE
+        if 0 < ctx.volume_24h < ctx.min_volume_24h:
+            return NoTradeReason.LIQUIDITY_TOO_LOW
         return None
 
     def _allowed_indicators(self, regime: Regime) -> set[str]:

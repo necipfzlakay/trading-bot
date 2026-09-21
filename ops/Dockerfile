@@ -14,4 +14,4 @@ COPY config ./config
 RUN useradd -m tbot && mkdir -p /app/runtime && chown -R tbot:tbot /app
 USER tbot
 
-CMD ["python", "scripts/run.py", "--config", "config/paper.yaml"]
+CMD ["python", "scripts/run.py", "--config", "config/demo.yaml"]

@@ -231,8 +231,8 @@ class Backtester:
         """Exchange constraints. Uses stored values when available, else config.
 
         Backtesting against optimistic fees produces a strategy that only works
-        on paper, so the fallbacks here are the config's *assumed* costs, which
-        are set pessimistically.
+        in the simulator, so the fallbacks here are the config's *assumed*
+        costs, which are set pessimistically.
         """
         return MarketSpec(
             symbol=symbol,

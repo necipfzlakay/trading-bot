@@ -461,16 +461,6 @@ def test_an_unpriceable_holding_reports_no_value_rather_than_zero(runner):
     assert rows["BTC"]["value"] is None
 
 
-def test_paper_mode_gets_no_between_bar_feed(runner):
-    """Paper exists to walk the same path as the backtest.
-
-    A paper run reacting to prices the backtest cannot see would stop being a
-    comparison, which is the only reason paper mode exists.
-    """
-    runner._start_feed()
-    assert runner.feed is None
-
-
 def test_intrabar_check_is_a_no_op_without_a_feed(runner):
     """The feed is an improvement, never a dependency.
 

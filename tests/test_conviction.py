@@ -279,3 +279,72 @@ def test_components_retain_their_signals_for_later_explanation(engine):
     conv = engine.score(_ctx(setup_signals={"ema_stack": 0.9, "rsi": 0.8}), Side.BUY)
     confluence = next(c for c in conv.components if c.name == "indicator_confluence")
     assert {s.name for s in confluence.signals} == {"ema_stack", "rsi"}
+
+
+# --------------------------------------------------------------------------
+# Audit #78: the last unassigned rejection reasons, and the last dead setting
+# --------------------------------------------------------------------------
+
+
+def test_a_book_too_wide_to_trade_blocks_before_scoring(engine):
+    """``SPREAD_TOO_WIDE`` existed as an enum member and nothing ever set it.
+
+    It survived from the era when no microstructure data was collected at all
+    (audit #44). So did ``universe.max_spread_bps``, which no code read — the
+    exact shape invariant 50 exists to prevent, except one level up: not a
+    setting silently reverting to a default, a setting silently deciding
+    nothing.
+    """
+    blocked = engine.score(
+        _ctx(spread_bps=30.0, max_spread_bps=8.0), side=Side.BUY
+    )
+    assert blocked.no_trade_reason is NoTradeReason.SPREAD_TOO_WIDE
+    assert blocked.total == 0.0  # nothing was computed, invariant 48
+
+    allowed = engine.score(
+        _ctx(spread_bps=2.0, max_spread_bps=8.0), side=Side.BUY
+    )
+    assert allowed.no_trade_reason is not NoTradeReason.SPREAD_TOO_WIDE
+
+
+def test_a_book_too_thin_to_trade_blocks_before_scoring(engine):
+    blocked = engine.score(
+        _ctx(volume_24h=1_000_000, min_volume_24h=5_000_000), side=Side.BUY
+    )
+    assert blocked.no_trade_reason is NoTradeReason.LIQUIDITY_TOO_LOW
+
+    allowed = engine.score(
+        _ctx(volume_24h=40_000_000, min_volume_24h=5_000_000), side=Side.BUY
+    )
+    assert allowed.no_trade_reason is not NoTradeReason.LIQUIDITY_TOO_LOW
+
+
+def test_a_zero_floor_checks_nothing(engine):
+    """Which is what keeps every existing caller behaving exactly as before.
+
+    The engine only supplies the floors when ``microstructure_penalties`` is
+    on. Every backtest, and every context built without them, passes zero — and
+    a zero floor must not reject the whole universe.
+    """
+    result = engine.score(
+        _ctx(spread_bps=500.0, volume_24h=1.0), side=Side.BUY
+    )
+    assert result.no_trade_reason not in (
+        NoTradeReason.SPREAD_TOO_WIDE,
+        NoTradeReason.LIQUIDITY_TOO_LOW,
+    )
+
+
+def test_a_thin_book_is_no_opinion_not_a_dead_thesis():
+    """Both reasons short-circuit before scoring, so they belong in the set.
+
+    The conviction-collapse exit reads a position's current score to ask "has
+    this thesis died?". A ``total`` of 0.0 that was never computed would read
+    as the loudest possible yes. That is invariant 10, and audit #47 is what it
+    costs to get the membership of this set wrong.
+    """
+    from tbot.strategy.conviction import UNSCORED_REASONS
+
+    assert NoTradeReason.SPREAD_TOO_WIDE in UNSCORED_REASONS
+    assert NoTradeReason.LIQUIDITY_TOO_LOW in UNSCORED_REASONS
+    assert NoTradeReason.BELOW_THRESHOLD not in UNSCORED_REASONS

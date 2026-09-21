@@ -72,7 +72,7 @@ def test_all_shipped_configs_are_loadable_by_the_cli():
     sys.path.insert(0, str(ROOT / "scripts"))
     from _bootstrap import setup
 
-    for name in ("base", "paper", "demo", "live", "slow"):
+    for name in ("base", "demo", "live", "slow"):
         cfg = setup(f"config/{name}.yaml")
         assert cfg.timeframes.all
 

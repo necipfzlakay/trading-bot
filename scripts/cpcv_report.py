@@ -8,7 +8,7 @@ Probability of Backtest Overfitting.
     python scripts/cpcv_report.py --blocks 10 --test-blocks 2
 
 The verdict at the end is mechanical. A strategy that fails here does not
-proceed to paper trading, however good the equity curve looks.
+proceed to forward testing, however good the equity curve looks.
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ def main() -> int:
     path = cfg.reports_dir / "cpcv.md"
     _write(path, cfg, stats, cpcv, deflated, pbo, checks, passed, args)
 
-    print("\nGate 1 — proceed to paper trading?\n")
+    print("\nGate 1 — proceed to forward testing?\n")
     for name, (ok, value) in checks.items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {name:<26} {value}")
     print(f"\n  VERDICT: {'PASS' if passed else 'FAIL'}")

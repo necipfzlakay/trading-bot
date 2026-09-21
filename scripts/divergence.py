@@ -7,9 +7,9 @@ it against what actually happened, trade by trade.
     python scripts/divergence.py --since 30d
 
 The comparison matters more than either result on its own. A backtest and a
-paper run over the same bars should produce nearly the same trades — they share
-the strategy code and the fill simulator. Where they differ, one of three things
-is true, and all three are worth knowing:
+live run over the same bars should produce nearly the same trades — they share
+the strategy code. Where they differ, one of three things is true, and all
+three are worth knowing:
 
 * a bug in the live path that the backtest does not exercise
 * data the live engine saw differently (a gap, a late bar, a revision)
@@ -117,7 +117,7 @@ def main() -> int:
     live = live_trades(db, since)
     if live.empty:
         print(f"No live trades in the last {days} days — nothing to compare yet.")
-        print("Gate 2 needs a paper run with trades before it can be evaluated.")
+        print("Gate 2 needs a live run with trades before it can be evaluated.")
         db.close()
         return 0
 
@@ -152,8 +152,8 @@ def main() -> int:
     lines = [
         f"# Kapı 2 — backtest ↔ canlı sapması (son {days} gün)",
         "",
-        "Backtest ile paper aynı barlar üzerinde neredeyse aynı işlemleri üretmeli:",
-        "strateji kodu ve fill simülatörü ortak. Fark varsa üç şeyden biri doğrudur —",
+        "Backtest ile canlı aynı barlar üzerinde neredeyse aynı işlemleri üretmeli:",
+        "strateji kodu ortak. Fark varsa üç şeyden biri doğrudur —",
         "canlı yolda backtest'in uğramadığı bir bug, motorun farklı gördüğü bir veri,",
         "ya da simülatörün modellemediği bir icra gerçeği. Üçü de bilinmeye değer.",
         "",

@@ -1,6 +1,6 @@
-"""Broker interface shared by backtest, paper and live.
+"""Broker interface shared by the backtester and the live venue.
 
-One interface, three implementations, and the strategy cannot tell them apart.
+One interface, several implementations, and the strategy cannot tell them apart.
 That is the property that makes backtest results mean something: if simulated
 and live execution diverge, it is a bug in a broker rather than a difference in
 strategy code.

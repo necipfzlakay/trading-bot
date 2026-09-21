@@ -17,7 +17,7 @@ from tbot.core.models import Mode, Venue
 
 
 def test_all_shipped_profiles_load():
-    for name in ("base", "paper", "demo", "live"):
+    for name in ("base", "demo", "live"):
         cfg = load_config(f"config/{name}.yaml")
         assert cfg.starting_balance > 0
 
@@ -150,10 +150,18 @@ def test_live_without_credentials_is_blocked():
         assert_runnable(cfg, Secrets())
 
 
-def test_paper_mode_needs_no_credentials_and_is_not_live_money():
-    cfg = load_config("config/paper.yaml")
-    assert_runnable(cfg, Secrets())
-    assert cfg.is_live_money() is False
+def test_the_default_mode_cannot_send_an_order():
+    """``base.yaml`` on its own is a backtest profile, and so is the bare model.
+
+    Paper mode used to sit here: the live loop driving a simulated broker. It
+    was removed once demo made it redundant — demo answers the same question
+    against a real book, with real rejections, fees and partial fills, and every
+    failure the simulator could not produce is one this repo has been bitten by.
+    What is left must not be able to reach a venue by omission.
+    """
+    assert Config().mode is Mode.BACKTEST
+    assert load_config("config/base.yaml").mode is Mode.BACKTEST
+    assert_runnable(load_config("config/base.yaml"), Secrets())
 
 
 def test_demo_venue_is_not_live_money():

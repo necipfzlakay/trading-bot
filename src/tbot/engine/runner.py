@@ -45,7 +45,6 @@ from tbot.core.config import Config, Secrets
 from tbot.core.db import Database
 from tbot.core.logging import get_logger
 from tbot.core.models import (
-    Candle,
     ExitReason,
     Fill,
     Mode,
@@ -67,7 +66,6 @@ from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.engine.watchdog import Watchdog
 from tbot.execution.broker import Broker, client_order_id
 from tbot.execution.ccxt_broker import CCXTBroker, PerpBroker
-from tbot.execution.paper_broker import PaperBroker
 from tbot.execution.reconcile import apply as apply_reconcile
 from tbot.execution.reconcile import reconcile
 from tbot.execution.safety import (
@@ -144,13 +142,17 @@ class Runner:
     _rejections: dict = field(default_factory=dict)
     _rejection_limit: int = 3
     slippage: SlippageTracker = field(init=False)
-    # Between-bar price stream. None in paper mode and whenever ccxt.pro is not
-    # importable — every read of it is guarded, because the engine has to work
-    # exactly as before when it is absent.
+    # Between-bar price stream. None whenever ccxt.pro is not importable —
+    # every read of it is guarded, because the engine has to work exactly as
+    # before when it is absent.
     feed: MarketFeed | None = None
     # Live spread and 24h turnover, refreshed once per bar. Empty until the
     # first successful read; zero always means "not measured".
     _microstructure: dict = field(default_factory=dict)
+    # Universe symbols currently under the turnover floor that admitted
+    # them. Remembered so the warning fires on a change rather than every
+    # bar — a channel that repeats hourly is one nobody reads.
+    _thin_symbols: dict = field(default_factory=dict)
     # The one armed entry order, if any: {"symbol", "order_id", "client_id",
     # "trigger", "bar_ts", "stop", "quantity", "setup", "conviction", "regime",
     # "risk_amount"}. At most one — see EntryConfig.armed_max_orders.
@@ -249,34 +251,33 @@ class Runner:
             self._reconcile()
 
         balance = self._equity_now()
-        if self.config.mode is Mode.LIVE:
-            # Invariant: in live mode the balance comes from the venue, never
-            # from config. Seeding here keeps the portfolio, the sizing cash
-            # limit and the equity curve on the same real number.
-            #
-            # ``max_capital`` is the exception, and it exists because the real
-            # number stops being *this engine's* number once two engines share
-            # an account. Measured on the demo account: a perpetual fill is
-            # settled out of the same Unified USDT balance the spot engine
-            # sizes against, so both engines would read the full balance, both
-            # would adopt it as their own starting equity, and between them
-            # they would risk twice what either believes it is risking.
-            #
-            # Capped, this engine's equity is its own profit and loss on its own
-            # allocation — which is also the only equity curve that means
-            # anything when judging its hypothesis.
-            cap = self.config.risk.max_capital
-            if cap > 0 and balance > cap:
-                log.info(
-                    "capital_capped",
-                    venue_balance=round(balance, 2),
-                    cap=cap,
-                    reason="this engine shares the account and sizes against its own allocation",
-                )
-                balance = cap
-            self.portfolio.seed_from_venue(balance)
-            balance = self.portfolio.equity({})
-            self._check_balance_against_last_run(balance)
+        # Invariant 19: the balance comes from the venue, never from config.
+        # Seeding here keeps the portfolio, the sizing cash limit and the equity
+        # curve on the same real number.
+        #
+        # ``max_capital`` is the exception, and it exists because the real
+        # number stops being *this engine's* number once two engines share an
+        # account. Measured on the demo account: a perpetual fill is settled out
+        # of the same Unified USDT balance the spot engine sizes against, so
+        # both engines would read the full balance, both would adopt it as their
+        # own starting equity, and between them they would risk twice what
+        # either believes it is risking.
+        #
+        # Capped, this engine's equity is its own profit and loss on its own
+        # allocation — which is also the only equity curve that means anything
+        # when judging its hypothesis.
+        cap = self.config.risk.max_capital
+        if cap > 0 and balance > cap:
+            log.info(
+                "capital_capped",
+                venue_balance=round(balance, 2),
+                cap=cap,
+                reason="this engine shares the account and sizes against its own allocation",
+            )
+            balance = cap
+        self.portfolio.seed_from_venue(balance)
+        balance = self.portfolio.equity({})
+        self._check_balance_against_last_run(balance)
         self.risk.update_equity(balance)
         self.state.equity = balance
         self.state.cash = self.portfolio.cash
@@ -342,14 +343,7 @@ class Runner:
             )
 
     def _start_feed(self) -> None:
-        """Open the between-bar price stream, if this mode has one.
-
-        Paper mode deliberately gets no feed: paper exists to walk the same path
-        as the backtest, and a paper run that reacted to prices the backtest
-        cannot see would stop being a comparison.
-        """
-        if self.config.mode is not Mode.LIVE:
-            return
+        """Open the between-bar price stream."""
         feed = MarketFeed(list(self.symbols))
         self.feed = feed if feed.start() else None
         if self.feed is None:
@@ -487,17 +481,13 @@ class Runner:
         if self.feed is not None:
             self.feed.reset_extremes()
 
-        # Orders submitted on the previous bar fill against this bar's open.
-        # Without this the paper simulator queues orders and never executes
-        # them: the portfolio would show positions the broker never opened, with
-        # no slippage and no fees — the exact opposite of what paper mode is for.
-        self._drain_paper_fills(frames, bar_ts)
         # Before anything reads the portfolio: an armed order may have filled
         # since the last close, and that fill is a position the rest of this bar
         # has to know about.
         self._resolve_armed(bar_ts)
         self._manage_positions(frames, bar_ts)
         self._refresh_microstructure(list(frames))
+        self._check_universe_liquidity()
         scans = self._scan(frames, bar_ts)
         if self.state.equity < self.config.risk.min_equity:
             if self.state.status != "below_min_equity":
@@ -642,91 +632,6 @@ class Runner:
             frames[symbol] = {"trigger": trigger, "setup": setup, "permission": permission}
 
         return frames
-
-    def _drain_paper_fills(self, frames: dict, bar_ts: int) -> None:
-        """Execute queued simulated orders against the newly opened bar.
-
-        Only meaningful for :class:`PaperBroker`; a live venue fills on its own.
-        """
-        if not isinstance(self.broker, PaperBroker):
-            return
-
-        for symbol, data in frames.items():
-            row = data["trigger"].iloc[-1]
-            candle = Candle(
-                ts=bar_ts,
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=float(row["volume"]),
-            )
-            for fill in self.broker.process_bar(symbol, candle):
-                self.db.record_fill(fill)
-                order = self.broker.orders.get(fill.order_client_id)
-                if order is not None:
-                    self.db.upsert_order(order)
-                self._apply_paper_fill(fill, order, data, bar_ts)
-
-    def _apply_paper_fill(self, fill, order, data: dict, bar_ts: int) -> None:
-        """Turn a simulated fill into portfolio state.
-
-        Entry plans travel on the order's ``meta`` rather than being recomputed,
-        so the position that opens is the one that was scored and sized.
-        """
-        # What makes this an *entry* is the plan on the order, not its side.
-        # The guard used to read ``fill.side is not Side.BUY``, which was an
-        # entry/exit discriminator only while every entry was a buy. Once the
-        # scoring could choose SELL, every paper short was dropped here: the
-        # simulated venue filled it and moved its balances, but no position was
-        # ever recorded, so nothing stopped it, nothing exited it, the symbol
-        # looked free to re-enter, and equity was wrong for the rest of the run.
-        # Exits never reach this path anyway — they fill through
-        # ``force_fill_at``, which takes the order out of ``pending``.
-        if order is None or not order.meta or "stop" not in order.meta:
-            return
-        if self.portfolio.has_position(fill.symbol):
-            return
-
-        planned_entry = float(order.meta.get("planned_entry", fill.price))
-        planned_stop = float(order.meta["stop"])
-        stop = fill.price - (planned_entry - planned_stop)
-
-        position = self.portfolio.open_position(
-            fill=fill,
-            stop_price=stop,
-            setup=str(order.meta.get("setup", "unknown")),
-            risk_amount=float(order.meta.get("risk_amount", 0.0)),
-            conviction=float(order.meta.get("conviction", 0.0)),
-            regime=Regime(order.meta.get("regime", Regime.UNKNOWN.value)),
-        )
-        position.meta["entry_atr"] = self._atr_for(data, self.config.exits.trail_timeframe)
-        # What the symbol had already done before this entry. H17 pre-registers
-        # a counter-hypothesis: if the short side only pays in falling markets,
-        # it is a directional bet rather than an edge, and that cannot be told
-        # apart after the fact without this number.
-        position.meta["entry_drift_7d"] = self._recent_drift(data["trigger"])
-        self.db.upsert_position(position)
-
-        log.info(
-            "position_opened",
-            symbol=fill.symbol,
-            price=fill.price,
-            quantity=fill.quantity,
-            stop=stop,
-            conviction=position.conviction_at_entry,
-            setup=position.setup,
-        )
-        if self.notifier and self.config.telegram.notify_fills:
-            self.notifier.notify_entry(
-                fill.symbol,
-                "buy" if fill.side is Side.BUY else "sell",
-                fill.price,
-                fill.quantity,
-                stop,
-                position.conviction_at_entry,
-                position.setup,
-            )
 
     def _atr_for(self, data: dict, timeframe_role: str) -> float:
         frame = data[timeframe_role]
@@ -949,8 +854,16 @@ class Runner:
             if decision.new_stop is not None:
                 position.current_stop = decision.new_stop
                 self.db.upsert_position(position)
+
+            if position.meta.get("stop_order_id"):
+                # Unconditional, not only when the trail moved. The sync is a
+                # no-op once the venue has confirmed the current level, so the
+                # cost is nothing — and it is the only thing that retries a
+                # *failed* move. Gating it on ``new_stop`` meant a refusal
+                # waited for the next ratchet, which for a position that never
+                # ratchets again is forever.
                 self._sync_protective_stop(position)
-            elif not position.meta.get("stop_order_id"):
+            else:
                 # No venue stop on this position: either the venue refused it at
                 # entry, or the process restarted before one was placed. Retry
                 # every bar — a single refusal used to leave the position
@@ -1190,34 +1103,28 @@ class Runner:
             reduce_only=True,
         )
 
-        if isinstance(self.broker, PaperBroker):
-            fill = self.broker.force_fill_at(order, plan.price, bar_ts)
-        else:
-            submitted = self.watchdog.call("submit_scale_out", lambda: self.broker.submit(order))
-            if submitted is None or submitted.status.value in ("rejected", "expired"):
-                log.warning(
-                    "scale_out_rejected",
-                    symbol=position.symbol,
-                    reason=getattr(submitted, "reject_reason", "no response"),
-                )
-                return
-            fill_price, filled = self._fill_terms(
-                submitted, plan.price, wanted, "scale_out"
-            )
-            # Same side the order was built with. Scaling out of a short is a
-            # buy-to-cover; writing SELL here would put a trade in the fills
-            # table that never happened in that direction.
-            fill = Fill(
-                order_client_id=submitted.client_id,
+        submitted = self.watchdog.call("submit_scale_out", lambda: self.broker.submit(order))
+        if submitted is None or submitted.status.value in ("rejected", "expired"):
+            log.warning(
+                "scale_out_rejected",
                 symbol=position.symbol,
-                side=position.side.opposite,
-                quantity=filled,
-                price=fill_price,
-                fee=submitted.fee_paid,
-                ts=bar_ts,
+                reason=getattr(submitted, "reject_reason", "no response"),
             )
-            self.db.upsert_order(submitted)
-
+            return
+        fill_price, filled = self._fill_terms(submitted, plan.price, wanted, "scale_out")
+        # Same side the order was built with. Scaling out of a short is a
+        # buy-to-cover; writing SELL here would put a trade in the fills table
+        # that never happened in that direction.
+        fill = Fill(
+            order_client_id=submitted.client_id,
+            symbol=position.symbol,
+            side=position.side.opposite,
+            quantity=filled,
+            price=fill_price,
+            fee=submitted.fee_paid,
+            ts=bar_ts,
+        )
+        self.db.upsert_order(submitted)
         self.db.record_fill(fill)
         sold = self.portfolio.scale_out(
             position.symbol, fill.price, fill.quantity / max(original, 1e-12), fill.fee
@@ -1347,6 +1254,57 @@ class Runner:
             return None
         return scored.total
 
+    def _check_universe_liquidity(self) -> None:
+        """Report symbols that no longer clear the bar that let them in.
+
+        The traded universe is whatever ``scripts/backfill.py`` last wrote to
+        ``universe.json``. The engine reads it once at startup and never again:
+        ``select_universe`` has a single caller and it is that script. So a
+        symbol whose 24h turnover collapses keeps being scanned, scored and
+        entered on a book that no longer supports the size the sizer computes.
+
+        Measured on the live spot universe: three symbols have fallen under the
+        5M threshold that admitted them, one of them currently at 4.8M, and
+        nothing anywhere said so.
+
+        This only *reports*. Dropping a symbol mid forward test changes the
+        trade population, which is the thing the run exists to measure — the
+        same reason the fast engine's universe was deliberately left alone. The
+        operator re-runs backfill, or turns on
+        ``execution.microstructure_penalties`` and lets the floor decide.
+        """
+        floor = self.config.universe.min_volume_24h_usd
+        if floor <= 0 or not self._microstructure:
+            return
+
+        thin = {
+            symbol: turnover
+            for symbol in self.symbols
+            if 0 < (turnover := self._microstructure.get(symbol, {}).get("turnover_24h", 0.0))
+            < floor
+        }
+        if thin == self._thin_symbols:
+            # Say it once per change, not once per bar. A warning that repeats
+            # every hour is a warning that gets filtered out.
+            return
+        self._thin_symbols = thin
+        if not thin:
+            log.info("universe_liquidity_recovered")
+            return
+
+        log.warning(
+            "universe_below_liquidity_floor",
+            symbols={s: round(v / 1e6, 2) for s, v in sorted(thin.items(), key=lambda x: x[1])},
+            floor_millions=round(floor / 1e6, 2),
+            consequence="still traded — the universe is only refreshed by scripts/backfill.py",
+        )
+        self.db.record_event(
+            "universe_below_liquidity_floor",
+            ", ".join(f"{s} {v / 1e6:.2f}M" for s, v in sorted(thin.items(), key=lambda x: x[1])),
+            payload={"floor": floor, "symbols": thin},
+            level="warning",
+        )
+
     def _refresh_microstructure(self, symbols: list[str]) -> None:
         """Read live spread and 24h turnover for the whole universe, once.
 
@@ -1405,11 +1363,26 @@ class Runner:
                 # Penalties stay off until the collection phase has been
                 # looked at. Switching them on changes which trades happen, so
                 # it is a decision with evidence behind it, not a side effect of
-                # wiring up the data. Measured on the live universe: spreads run
-                # 0.01-2.7bps against a 10bps penalty floor, so today this would
-                # change nothing — which is itself the finding.
+                # wiring up the data.
+                #
+                # The first reading said the floors were unreachable — "spreads
+                # run 0.01-2.7bps against a 10bps penalty floor, so today this
+                # would change nothing". That was a handful of bars. Over 1302
+                # scan rows of the live spot universe it is no longer true:
+                # 4.5% of rows are above 10bps (BR 44 of them, VVV 10, max
+                # 24.8) and 26.8% are under the 10M turnover floor. On the perp
+                # universe the median spread is 2.5bps and the maximum 12.9.
+                # So switching these on now *would* change the trade
+                # population, which makes it a pre-registered hypothesis rather
+                # than a tidy-up.
                 spread_bps=micro.get("spread_bps", 0.0) if penalties_on else 0.0,
                 volume_24h=micro.get("turnover_24h", 0.0) if penalties_on else 0.0,
+                # One switch covers both the soft penalties above and these
+                # hard floors. Off, they are zero and nothing is checked; on,
+                # a book the strategy cannot actually trade stops being scored
+                # as though it could.
+                max_spread_bps=self.config.universe.max_spread_bps if penalties_on else 0.0,
+                min_volume_24h=self.config.universe.min_volume_24h_usd if penalties_on else 0.0,
                 already_open=self.portfolio.has_position(symbol),
                 portfolio_full=len(self.portfolio.positions) >= self.config.risk.max_positions,
                 correlation_conflict=correlation_conflict(
@@ -1644,18 +1617,6 @@ class Runner:
             return False
         self._rejections.pop(row.symbol, None)
         self.db.upsert_order(submitted)
-
-        if isinstance(self.broker, PaperBroker):
-            # Queued; it executes against the next bar's open in
-            # _drain_paper_fills. Opening the position here would skip slippage
-            # and fees and break parity with the backtest.
-            log.info(
-                "entry_queued",
-                symbol=row.symbol,
-                conviction=row.score,
-                setup=candidate.name,
-            )
-            return True
 
         fill_price, filled = self._fill_terms(submitted, price, sizing.quantity, "entry")
 
@@ -2070,6 +2031,9 @@ class Runner:
             # of reporting it as an orphan on every start — a warning nothing
             # can clear is a warning that gets ignored.
             position.meta["stop_client_id"] = client_id
+            # The level the venue is known to hold. Every later sync compares
+            # against this rather than against what the engine merely intended.
+            position.meta["stop_at_venue"] = position.current_stop
             self._place_venue_target(position)
             self.db.upsert_position(position)
         else:
@@ -2150,16 +2114,58 @@ class Runner:
             position.meta["tp_price"] = target
 
     def _sync_protective_stop(self, position) -> None:
-        """Move the venue stop when the trail ratchets up."""
+        """Make the venue stop agree with the local one, and *verify* that it did.
+
+        The return value is the whole point. This call used to be fire-and-
+        forget: a refused amend logged one warning, nobody read the result, and
+        the venue went on holding the entry stop for the life of the position
+        while every local view showed the trailed one. Measured on the demo
+        account — ETH local 2588.06 / venue 2506.63, VVV local 26.45 / venue
+        23.43 — so the protection invariant 12 exists to provide was, for the
+        positions that had trailed at all, not there.
+
+        ``stop_at_venue`` records the level the venue confirmed. It is what
+        makes the repair self-healing: the trail only ratchets occasionally, so
+        a failure that is not remembered would sit until the *next* ratchet,
+        which may never come. Comparing against the confirmed level instead
+        means every bar retries until the two agree (the rule invariant 24
+        already applies to a refused placement).
+        """
         if not isinstance(self.broker, CCXTBroker):
             return
         order_id = position.meta.get("stop_order_id")
         if not order_id:
             return
-        self.watchdog.call(
+        confirmed = position.meta.get("stop_at_venue")
+        if confirmed is not None and abs(float(confirmed) - position.current_stop) < 1e-9:
+            return
+
+        placed = self.watchdog.call(
             "amend_stop",
             lambda: self.broker.amend_stop(position.symbol, order_id, position.current_stop),
         )
+        if placed:
+            # A replacement carries a new id. Keeping the old one would leave
+            # the engine unable to move, cancel or recognise its own stop.
+            position.meta["stop_order_id"] = placed
+            position.meta["stop_at_venue"] = position.current_stop
+            self.db.upsert_position(position)
+            return
+
+        position.meta["stop_at_venue"] = None
+        self.db.upsert_position(position)
+        self.db.record_event(
+            "stop_not_synced",
+            f"{position.symbol}: venue stop still at its previous level, "
+            f"local stop {position.current_stop:.8f}",
+            level="error",
+        )
+        if self.notifier:
+            self.notifier.notify_error(
+                "Venue stop out of date",
+                f"{position.symbol}: the venue holds an older stop than the engine. "
+                "Protection while the bot is down is weaker than the local book shows.",
+            )
 
     def _cancel_protective_stop(self, symbol: str) -> None:
         """Remove the venue stop before closing, so it cannot fire afterwards.
@@ -2196,35 +2202,23 @@ class Runner:
         # Zero means "the venue never told us", not "it was free" — the
         # assumed rate below stands in only for that case.
         charged = 0.0
-        if isinstance(self.broker, PaperBroker):
-            # A stop is a resting instruction: it executes where it triggers.
-            # Deferring it to the next open understates losses on exactly the
-            # bars that produce them.
-            fill = self.broker.force_fill_at(order, price, bar_ts)
-            self.db.record_fill(fill)
-            self.db.upsert_order(order)
-            price = fill.price
-            charged = fill.fee
-        else:
-            self._cancel_protective_stop(symbol)
-            submitted = self.watchdog.call("submit_exit", lambda: self.broker.submit(order))
-            if submitted is not None:
-                self.db.upsert_order(submitted)
-                price, quantity = self._fill_terms(
-                    submitted, price, position.quantity, "exit"
+        self._cancel_protective_stop(symbol)
+        submitted = self.watchdog.call("submit_exit", lambda: self.broker.submit(order))
+        if submitted is not None:
+            self.db.upsert_order(submitted)
+            price, quantity = self._fill_terms(submitted, price, position.quantity, "exit")
+            charged = submitted.fee_paid
+            self.db.record_fill(
+                Fill(
+                    order_client_id=submitted.client_id,
+                    symbol=symbol,
+                    side=position.side.opposite,
+                    quantity=quantity,
+                    price=price,
+                    fee=charged,
+                    ts=bar_ts,
                 )
-                charged = submitted.fee_paid
-                self.db.record_fill(
-                    Fill(
-                        order_client_id=submitted.client_id,
-                        symbol=symbol,
-                        side=position.side.opposite,
-                        quantity=quantity,
-                        price=price,
-                        fee=charged,
-                        ts=bar_ts,
-                    )
-                )
+            )
 
         spec = self.broker.market_spec(symbol)
         fee = charged if charged > 0.0 else price * position.quantity * spec.taker_fee
@@ -2319,9 +2313,6 @@ class Runner:
                 # had itself placed. Every restart then lost the trail.
                 meta=json.loads(raw["meta"]) if raw.get("meta") else {},
             )
-
-        if self.config.mode is not Mode.LIVE:
-            return
 
         # None means the venue could not be read. Treating that as an empty
         # account here would file every local position as "missing at the
@@ -2420,9 +2411,6 @@ class Runner:
         into sizing against money the account does not have — and, on the next
         bar, into an equity series that jumps between two unrelated figures.
         """
-        if isinstance(self.broker, PaperBroker):
-            return self.broker.equity({})
-
         balance = self.watchdog.call(
             "fetch_balance", lambda: self.broker.fetch_balance(), default=None
         )
@@ -2585,6 +2573,14 @@ class Runner:
                     "bars_held": p.bars_held,
                     "mfe_r": round(p.mfe_r, 2),
                     "mae_r": round(p.mae_r, 2),
+                    # Where the position stands *now*, in units of its own
+                    # risk. ``bot.sh status`` has read ``r_multiple`` since it
+                    # was written and nothing ever wrote it, so every position
+                    # has always printed ``R=+0.00`` — three open trades at
+                    # +2.67R, +0.92R and -0.02R all reported as flat. Unknown
+                    # stays None rather than zero, for the same reason a
+                    # missing price does (invariant 10).
+                    "r_multiple": round(p.unrealized_r(mark), 2) if mark else None,
                     "conviction": p.conviction_at_entry,
                     # None, not zero: an unknown price must not read as a
                     # position that is worth nothing (same rule as holdings).
@@ -2604,8 +2600,6 @@ class Runner:
         position reads as zero free; ``total`` is what is owned. Showing only
         free would report a protected position as no position at all.
 
-        In paper mode the venue is a simulation, so the same three columns are
-        derived from the simulated cash and holdings rather than fetched.
         """
         quote = self.config.quote_currency
         rows: list[dict] = []
@@ -2721,22 +2715,20 @@ def _last_row(frame: pd.DataFrame) -> dict[str, float]:
 
 
 def build_broker(config: Config, secrets: Secrets, symbols: list[str]) -> Broker:
-    """Paper mode gets the simulator; live mode gets the venue."""
-    if config.mode is not Mode.LIVE:
-        fetcher = BybitFetcher(config.data.rest_rate_limit_ms)
-        specs = {}
-        for symbol in symbols:
-            raw = fetcher.market_spec(symbol)
-            from tbot.core.models import MarketSpec
+    """The venue this engine trades against.
 
-            specs[symbol] = MarketSpec(**raw)
-        return PaperBroker(
-            specs=specs,
-            cash=config.starting_balance,
-            quote=config.quote_currency,
-            taker_fee=config.execution.assumed_taker_fee,
-            maker_fee=config.execution.assumed_maker_fee,
-            slippage_bps=config.execution.slippage_bps,
+    Live is the only mode the engine loop has. The simulator used to be reachable
+    from here through ``paper`` mode, and it is still what the backtester fills
+    against — but a second execution path inside the live loop was a place for
+    bugs to hide rather than a safety net (audit #66: every paper short was
+    silently dropped, in code nobody ran). ``backtest`` mode belongs to
+    ``Backtester``, which builds its own simulator; reaching this function with
+    it means a config was pointed at the wrong runner.
+    """
+    if config.mode is not Mode.LIVE:
+        raise RuntimeError(
+            f"the live engine has no {config.mode.value} path — run a backtest with "
+            "scripts/backtest.py, or point --config at a live config"
         )
 
     key, secret = secrets.credentials_for(config.venue)

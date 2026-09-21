@@ -28,7 +28,7 @@ log = get_logger("engine.state")
 class EngineState:
     """Everything an observer needs to judge the bot's health at a glance."""
 
-    mode: str = "paper"
+    mode: str = "live"
     venue: str = "bybit-demo"
     status: str = "starting"  # starting | running | degraded | safe_mode | stopped
     started_ts: int = 0

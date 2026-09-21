@@ -41,7 +41,7 @@ gh auth login          # tarayıcıda açılır, GitHub hesabınla giriş yap
 Script pushlamadan önce `.env` ve `runtime/` klasörünün gerçekten ignore
 edildiğini doğruluyor. API anahtarların ve işlem geçmişin repoya gitmez.
 
-## 3. Bybit demo hesabı (paper'dan sonraki adım için)
+## 3. Bybit demo hesabı (motorun çalıştığı yer)
 
 1. bybit.com → giriş yap → **Demo Trading** moduna geç
 2. Demo arayüzünde **API** → yeni anahtar oluştur (izinler: Spot Trade + Read)
@@ -102,7 +102,7 @@ rolleri `true` yap.
 Elle python çalıştırmana gerek yok:
 
 ```
-./ops/bot.sh start paper       # veya demo / live
+./ops/bot.sh start demo        # veya live / fast
 ./ops/bot.sh status
 ./ops/bot.sh stop
 ```
@@ -116,7 +116,7 @@ bekler. Üç servis: bot, panel, sağlık kontrolü. `KeepAlive=true` — süre�
 30 saniyede bir sonsuza kadar denenir. Script bunu kurmadan önce yakalıyor,
 kalkamazsa da agent'ı geri kaldırıyor.
 
-`./ops/install.sh` eski isim olarak duruyor, `bot.sh start paper`'a yönlendiriyor.
+`./ops/install.sh` eski isim olarak duruyor, `bot.sh start demo`'ya yönlendiriyor.
 
 Ayrıntı: **[docs/USAGE.md](docs/USAGE.md)** §7.
 
@@ -167,7 +167,7 @@ Değiştirirsen yeniden ölç:
 .venv/bin/python scripts/capital_check.py --equity 250
 ```
 
-> `starting_balance` config'te sadece paper ve backtest için. **Canlı modda
+> `starting_balance` config'te sadece backtest için. **Canlı modda
 > bakiye borsadan okunur**, config'teki değer kullanılmaz.
 
 ## 7b. Pozisyon büyüklüğü tavanları

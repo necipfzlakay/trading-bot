@@ -226,7 +226,7 @@ banner "Secrets file (.env)"
 
 if [[ ! -f .env ]]; then
   if [[ $CHECK_ONLY -eq 1 ]]; then
-    warn ".env missing — paper mode still runs without it"
+    warn ".env missing — demo trading needs BYBIT_DEMO_* keys"
   else
     cp .env.example .env
     # Localhost only, but a documented default is still a default.
@@ -443,7 +443,7 @@ else
     if [[ "$GATE1" == "PASS" ]]; then
       ok "Gate 1 PASSED"
     else
-      warn "Gate 1 not passed — paper trading is fine, real money is not"
+      warn "Gate 1 not passed — demo forward testing is fine, real money is not"
     fi
   else
     bad "cpcv_report did not produce a verdict — see runtime/logs/preinstall-cpcv.log"
@@ -484,7 +484,7 @@ from tbot.web.app import create_app
 GOOD, WARN, BAD = "\033[32m✓\033[0m", "\033[33m!\033[0m", "\033[31m✗\033[0m"
 fail = 0
 
-cfg = setup("config/paper.yaml")
+cfg = setup("config/demo.yaml")
 secrets = load_secrets()
 
 try:
@@ -561,7 +561,7 @@ fi
 
 if [[ ${#NOTES[@]} -gt 0 ]]; then
   say ""
-  say "${B}Left for you${N} ${DIM}(none of these block paper trading)${N}"
+  say "${B}Left for you${N} ${DIM}(none of these block demo trading)${N}"
   for n in "${NOTES[@]}"; do say "  · $n"; done
 fi
 
@@ -570,14 +570,14 @@ say "${B}Measured${N}"
 [[ -f runtime/reports/backtest.md ]] && say "  backtest   runtime/reports/backtest.md"
 case "$GATE1" in
   PASS) say "  Gate 1     ${G}PASSED${N} — the gate permits real money" ;;
-  FAIL) say "  Gate 1     ${Y}NOT PASSED${N} — paper only; runtime/reports/cpcv.md names the failing checks" ;;
+  FAIL) say "  Gate 1     ${Y}NOT PASSED${N} — demo only; runtime/reports/cpcv.md names the failing checks" ;;
   *)    say "  Gate 1     not measured in this run" ;;
 esac
 
 say ""
 if [[ ${#FAILED[@]} -eq 0 ]]; then
-  say "${B}Start paper trading${N}"
-  say "  .venv/bin/python scripts/run.py --config config/paper.yaml"
+  say "${B}Start demo trading${N}"
+  say "  .venv/bin/python scripts/run.py --config config/demo.yaml"
   say ""
   say "${B}And in a second terminal${N}"
   say "  .venv/bin/python scripts/dashboard.py        ${DIM}→ http://127.0.0.1:8787${N}"

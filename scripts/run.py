@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Start the trading engine.
 
-    python scripts/run.py --mode paper
     python scripts/run.py --config config/demo.yaml
     TBOT_CONFIRM_LIVE=yes python scripts/run.py --config config/live.yaml
 
@@ -27,7 +26,7 @@ from tbot.risk.capital import diagnose as diagnose_capital
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="config/paper.yaml")
+    parser.add_argument("--config", default="config/demo.yaml")
     parser.add_argument("--mode", choices=[m.value for m in Mode])
     parser.add_argument("--venue", choices=[v.value for v in Venue])
     parser.add_argument("--symbols", default="")

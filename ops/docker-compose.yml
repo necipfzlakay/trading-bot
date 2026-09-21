@@ -17,7 +17,7 @@ services:
       - ../config:/app/config:ro
     env_file:
       - ../.env
-    command: python scripts/run.py --config config/paper.yaml
+    command: python scripts/run.py --config config/demo.yaml
     healthcheck:
       # state.json stops being updated if the loop wedges without crashing —
       # the failure mode a process check would miss.

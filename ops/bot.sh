@@ -4,7 +4,6 @@
 # that this mode can actually start before installing anything, loads it, and
 # then verifies the engine really came up rather than assuming it did.
 #
-#   ./ops/bot.sh start paper     simulated fills on live data, no keys needed
 #   ./ops/bot.sh start demo      real order flow, virtual money
 #   ./ops/bot.sh start live      REAL MONEY
 #   ./ops/bot.sh stop
@@ -116,7 +115,6 @@ Usage: ./ops/bot.sh <command> [engine] [args]
   engines                   every engine this checkout defines
 
 Engines (one config each, in config/):
-  paper   live prices, simulated fills. No API key. Safe default.
   demo    real Bybit order flow against virtual money. Needs BYBIT_DEMO_* keys.
   live    REAL MONEY. Refuses to install unless Gate 1 passed and you type the
           confirmation phrase. Cannot be forced with a flag.
@@ -125,8 +123,8 @@ Engines (one config each, in config/):
           run alongside demo against the same account.
 
 An engine's namespace (engine.namespace in its config) decides its launchd
-labels and therefore whether it is a separate service. paper, demo and live
-share the default namespace and so replace one another; fast does not.
+labels and therefore whether it is a separate service. demo and live share
+the default namespace and so replace one another; fast does not.
 USAGE
 }
 
@@ -341,7 +339,7 @@ confirm_live() {
   into the plist, which makes that barrier permanent for as long as it is
   installed.${N}
 
-  Before typing: Gate 2 (paper vs backtest divergence under 10%) and Gate 3
+  Before typing: Gate 2 (live vs backtest divergence under 10%) and Gate 3
   (four weeks on demo without manual intervention) are separate checks this
   script cannot verify for you.
 
@@ -562,7 +560,7 @@ VERIFY_PY
 }
 
 cmd_start() {
-  local mode="${1:-paper}"
+  local mode="${1:-demo}"
   if [[ ! -f "config/$mode.yaml" ]]; then
     bad "unknown engine: $mode — no config/$mode.yaml"
     say "  available: $(all_engines | tr '\n' ' ')"
@@ -697,8 +695,13 @@ if positions:
     print(f"    positions  {len(positions)} open")
     for pos in positions[:5]:
         sym = pos.get("symbol", "?")
+        # None means the mark price could not be read, which is not the same
+        # as a flat trade — printing +0.00 for it is how this line spent its
+        # whole life showing every position as unchanged.
+        r = pos.get("r_multiple")
+        r_text = f"R={r:+.2f}" if isinstance(r, (int, float)) else "R=?"
         print(f"      {sym:<14} {pos.get('side',''):<5} qty={pos.get('quantity', 0):g} "
-              f"R={pos.get('r_multiple', 0):+.2f}")
+              f"{r_text}")
 else:
     print("    positions  none")
 
@@ -732,7 +735,7 @@ cmd_status() {
     # and the one real problem is lost in the noise.
     if [[ -z "$want" ]]; then
       [[ -f "$AGENTS/$BOT.plist" ]] || continue
-      # paper, demo and live all share the default namespace, so they share one
+      # demo and live share the default namespace, so they share one
       # plist. Only the config that plist actually points at is running; the
       # others would print the same engine again under a different name.
       local actual; actual=$(installed_mode) || actual=""

@@ -1,5 +1,0 @@
-# Paper: canlı veri + kendi fill simülatörümüz. Strateji performansının
-# en dürüst ölçümü burada yapılır (borsa testnet'inin likidite tuhaflıkları yok).
-extends: base.yaml
-mode: paper
-venue: bybit-demo

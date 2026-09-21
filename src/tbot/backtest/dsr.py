@@ -85,19 +85,33 @@ def deflated_sharpe(
     skew = float(stats.skew(returns))
     kurt = float(stats.kurtosis(returns, fisher=False))
 
-    threshold = (
-        benchmark_sharpe
-        if benchmark_sharpe is not None
-        else expected_max_sharpe(trials, sd**2) / sd
-    )
-
     # Variance of the Sharpe estimator, adjusted for skew and fat tails. Crypto
     # returns are strongly non-normal, and ignoring that overstates confidence.
     denom = 1.0 - skew * sharpe + (kurt - 1.0) / 4.0 * sharpe**2
     if denom <= 0 or n <= 1:
-        return DSRResult(annualised, 0.0, 1.0, trials, threshold, skew, kurt, n)
+        return DSRResult(annualised, 0.0, 1.0, trials, 0.0, skew, kurt, n)
 
-    statistic = (sharpe - threshold) * np.sqrt(n - 1) / np.sqrt(denom)
+    # Bailey & López de Prado: the benchmark is
+    #     SR0 = sqrt(V) * [(1-γ)Z⁻¹(1-1/N) + γZ⁻¹(1-1/(N·e))]
+    # where **V is the variance of the Sharpe ratios across the N trials**, not
+    # the variance of the returns. Under the null the trials' Sharpes vary by
+    # the sampling error of the estimator itself, which is exactly
+    # ``denom / (n - 1)``.
+    #
+    # Passing ``sd**2`` and dividing by ``sd`` made V = 1 — a benchmark of 1.8
+    # *per-period* Sharpe at 16 trials, which annualises to 34. Nothing can
+    # clear that, and nothing did: measured, a synthetic strategy with an
+    # annualised Sharpe of **10.0** scored p = 1.0000 at 16 trials, as did one
+    # at 2.0 and one at 0.5. The gate was not strict, it was unpassable, and
+    # "the statistical budget is exhausted" was a conclusion drawn from it.
+    sharpe_se = np.sqrt(denom / (n - 1))
+    threshold = (
+        benchmark_sharpe
+        if benchmark_sharpe is not None
+        else expected_max_sharpe(trials, sharpe_se**2)
+    )
+
+    statistic = (sharpe - threshold) / sharpe_se
     probability = float(stats.norm.cdf(statistic))
 
     return DSRResult(

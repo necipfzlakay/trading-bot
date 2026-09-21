@@ -43,14 +43,14 @@ kaldığı yerden devam eder.
 ./ops/pre-install.sh --force          # biten adımları da tekrar çalıştır
 ```
 
-Sonunda üç şey yazar: ne bitti, **sana ne kaldı** (Bybit anahtarı, Telegram, LLM
-— hiçbiri paper modu engellemiyor) ve Kapı 1 kararı.
+Sonunda üç şey yazar: ne bitti, **sana ne kaldı** (Bybit anahtarı, Telegram, LLM)
+ve Kapı 1 kararı.
 
 Neyi **yapmıyor**: botu başlatmıyor, launchd kurmuyor, git'e pushlamıyor, gerçek
 paraya dokunmuyor. Bunların hepsi ayrı ve kasıtlı kararlar.
 
-API anahtarları ve Telegram için: **[SETUP.md](../SETUP.md)**. Paper modu için
-hiçbir anahtar gerekmiyor.
+API anahtarları ve Telegram için: **[SETUP.md](../SETUP.md)**. Demo modu
+`BYBIT_DEMO_*` anahtarlarını istiyor — sanal para, gerçek emir akışı.
 
 ---
 
@@ -163,16 +163,18 @@ Bu kapı geçilmeden gerçek para koyma. Şu an geçilmiş **değil**.
 
 ---
 
-## 5. Paper modda çalıştır
+## 5. Demo modda çalıştır
 
 ```bash
-.venv/bin/python scripts/run.py --config config/paper.yaml
+.venv/bin/python scripts/run.py --config config/demo.yaml
 ```
 
-Canlı veri, simüle emirler, gerçek komisyon ve kayma. Açılışta gördüklerin:
+Gerçek Bybit emir akışı, sanal para. Paper modu yok: simülatör artık yalnız
+backtest'in dolum motoru. Demo aynı soruyu gerçek emir defteriyle cevaplıyor —
+gerçek red, gerçek komisyon, gerçek kısmi dolum. Açılışta gördüklerin:
 
 ```
-  mode    paper
+  mode    live
   venue   bybit-demo  [DEMO (virtual funds)]
   symbols 21
   equity  1000.0 USDT
@@ -229,7 +231,7 @@ panelle bot çelişemez.
 ## 7. 7/24 çalıştır — elle python yok
 
 ```bash
-./ops/bot.sh start paper      # veya demo, veya live
+./ops/bot.sh start demo       # veya live, veya fast
 ```
 
 Tek komut: moda göre launchd agent'larını **üretir**, kurar, yükler ve gerçekten
@@ -244,13 +246,13 @@ kalktığını doğrular. Üç servis: bot, panel, sağlık kontrolü.
 | `./ops/bot.sh logs -f` | canlı olay akışı |
 | `./ops/bot.sh mode` | şu an hangi mod kurulu |
 
-### Üç mod
+### Motorlar
 
 | mod | ne | anahtar |
 |---|---|---|
-| `paper` | canlı fiyat, simüle dolum | gerekmiyor |
 | `demo` | gerçek emir akışı, sanal para | `BYBIT_DEMO_*` |
 | `live` | **gerçek para** | `BYBIT_LIVE_*` + Kapı 1 + elle onay |
+| `fast` | kısa ufuk, iki yönlü, linear perpetual | `BYBIT_DEMO_*` |
 
 ### Kurmadan önceki ön kontrol
 
@@ -554,7 +556,7 @@ engelliyor, ama elle yüklendiyse:
 ```bash
 ./ops/bot.sh status
 tail -20 runtime/logs/launchd.err.log
-./ops/bot.sh stop && ./ops/bot.sh start paper
+./ops/bot.sh stop && ./ops/bot.sh start demo
 ```
 
 **`pre-install.sh` bir adımda patladı** → her adımın tam çıktısı duruyor:

@@ -1,6 +1,6 @@
 """Live execution against Bybit through ccxt.
 
-Same interface as the paper broker, so the engine cannot tell them apart. Demo
+Same interface as the simulated broker, so the engine cannot tell them apart. Demo
 and real trading differ only in credentials and one flag — ``enable_demo_trading``
 points ccxt at ``api-demo.bybit.com`` while market data still comes from
 mainnet, which is what makes demo results comparable to live ones.
@@ -78,6 +78,15 @@ def _order_state(raw: dict) -> dict[str, float | str]:
         in ("Filled", "Cancelled", "Deactivated", "Rejected", "PartiallyFilledCanceled"),
         "filled_terminal": status in ("Filled", "PartiallyFilledCanceled"),
     }
+
+
+def _amend_was_a_no_op(exc: Exception) -> bool:
+    """Did the venue refuse the amend because it had nothing to change?
+
+    Bybit files this under the generic ``10001`` alongside genuine parameter
+    errors, so the message is the only thing that separates them.
+    """
+    return "remains unchanged" in str(exc)
 
 
 class CCXTBroker(Broker):
@@ -249,8 +258,16 @@ class CCXTBroker(Broker):
 
     # A market order fills at once, but the reply that acknowledges it does not
     # say so. These bound how long the truth is worth waiting for.
-    _SETTLE_ATTEMPTS = 5
-    _SETTLE_PAUSE_S = 0.25
+    # A just-filled market order is not immediately queryable. Measured on the
+    # perpetual venue: four seconds after a fill, both the realtime list and the
+    # history came back empty, and the engine recorded H17's first trade at the
+    # price it asked for (112.09) rather than the 112.58 it paid — 43.7bps of
+    # slippage booked as zero, and a 1R understated by a quarter. Spot settles
+    # faster, which is why audit #59 looked complete.
+    #
+    # The pause grows so the common case still costs one quick lookup.
+    _SETTLE_ATTEMPTS = 6
+    _SETTLE_PAUSES_S = (0.25, 0.5, 1.0, 1.5, 2.0)
 
     def _settle(self, order: Order) -> Order:
         """Replace an accepted market order's blanks with what the venue did.
@@ -283,8 +300,8 @@ class CCXTBroker(Broker):
                 break
             if state and state.get("terminal"):
                 break
-            if attempt + 1 < self._SETTLE_ATTEMPTS:
-                time.sleep(self._SETTLE_PAUSE_S)
+            if attempt < len(self._SETTLE_PAUSES_S):
+                time.sleep(self._SETTLE_PAUSES_S[attempt])
 
         if state is None:
             # Unknown is not zero. Leaving the order as the venue accepted it
@@ -695,27 +712,105 @@ class CCXTBroker(Broker):
         log.info("protective_stop_placed", symbol=symbol, stop=stop_price, order_id=order_id)
         return order_id
 
-    def amend_stop(self, symbol: str, order_id: str, stop_price: float) -> bool:
-        """Move an existing venue stop. Falls back to cancel-and-replace.
+    def amend_stop(self, symbol: str, order_id: str, stop_price: float) -> str | None:
+        """Move an existing venue stop to a new trigger price.
 
-        Amending rather than replacing matters: between a cancel and a new
-        placement the position has no stop at all, and that gap is exactly when
-        a fast move would hurt.
+        Returns **the order id now protecting the position** — the same one when
+        the amend succeeded, a new one when the stop had to be replaced, and
+        ``None`` when the venue is holding something other than what was asked
+        for. A bool could not say "still protected, under a different id", and
+        the caller has to store that id or it loses the handle to its own stop
+        (audit #37).
+
+        Amending rather than cancel-and-replace matters: between a cancel and a
+        new placement the position has no stop at all, and on spot the two
+        cannot overlap — a resting stop locks the base asset, so the
+        replacement is refused ``170131`` until the old one is gone. That gap is
+        exactly when a fast move would hurt.
+
+        The v5 endpoint is called directly rather than through ``edit_order``.
+        ccxt builds an amend for the derivatives contract and adds ``triggerBy``
+        to it, which Bybit **spot** refuses with ``10001 Request parameter
+        error`` — measured, on every single trail. The docstring here used to
+        promise a cancel-and-replace fallback that was never written, so a
+        failed amend logged one warning and returned ``False``, and nobody read
+        the return: the venue kept the *entry* stop for the life of the
+        position while the local book showed the trailed one. Measured on the
+        demo account: ETH local 2588.06 / venue 2506.63, VVV local 26.45 /
+        venue 23.43, ``updatedTime == createdTime`` on both. The gap only
+        matters while the process is down, which is the one case a venue-side
+        stop exists for (invariant 12).
+
+        The fallback is written now, and it is the second choice on purpose.
         """
         self.load_markets()
+        trigger = float(self.exchange.price_to_precision(symbol, stop_price))
         try:
-            trigger = float(self.exchange.price_to_precision(symbol, stop_price))
-            self.exchange.edit_order(
-                id=order_id,
-                symbol=symbol,
-                type="market",
-                side="sell",
-                params={"triggerPrice": trigger, "stopLossPrice": trigger},
+            self.exchange.privatePostV5OrderAmend(
+                {
+                    "category": self.category,
+                    "symbol": self._venue_symbol(symbol),
+                    "orderId": order_id,
+                    "triggerPrice": str(trigger),
+                }
             )
-            return True
+            log.info("stop_amended", symbol=symbol, stop=trigger, order_id=order_id)
+            return order_id
         except ccxt.BaseError as exc:
+            if _amend_was_a_no_op(exc):
+                # "The order remains unchanged as the parameters entered match
+                # the existing ones" — the venue already holds this level, so
+                # the caller got what it asked for. Bybit reports it under the
+                # generic 10001, which is why the message and not the code is
+                # what distinguishes it. Reading it as a failure sends the
+                # cancel-and-replace path down a route that briefly leaves the
+                # position with no stop at all, every single bar, to arrive
+                # back where it started. Observed on the first restart after
+                # the fix, on all three open positions.
+                log.info("stop_already_at_level", symbol=symbol, stop=trigger)
+                return order_id
             log.warning("stop_amend_failed", symbol=symbol, error=str(exc)[:160])
-            return False
+
+        # Cancel-and-replace. The position is unprotected between these two
+        # calls, which is why it is not the first choice — but a stop resting
+        # at a level the strategy abandoned protects less than a brief gap.
+        quantity = self._resting_stop_quantity(symbol, order_id)
+        if not self.cancel_stop(symbol, order_id):
+            log.error(
+                "stop_replace_impossible",
+                symbol=symbol,
+                order_id=order_id,
+                consequence="venue still holds the old stop level",
+            )
+            return None
+        replacement = f"{order_id[-12:]}-{int(time.time()) % 100000}"
+        placed = self.place_stop(symbol, quantity, stop_price, f"tb-amend-{replacement}")
+        if placed is None:
+            log.error(
+                "stop_replace_failed",
+                symbol=symbol,
+                consequence="position has no stop at the venue",
+            )
+            return None
+        log.info("stop_replaced", symbol=symbol, stop=stop_price, order_id=placed)
+        return placed
+
+    def _resting_stop_quantity(self, symbol: str, order_id: str) -> float:
+        """How much the stop being replaced covers, read from the venue.
+
+        Asking rather than passing the position's quantity keeps the
+        replacement the same size as what it replaces: a spot buy pays its fee
+        in the base asset, so the resting stop is already slightly smaller than
+        the position (invariant 23), and re-deriving it from the local book
+        would re-introduce the rejection that clamp exists to avoid.
+        """
+        for order in self._resting_stops(symbol):
+            if str(order.get("orderId") or "") == order_id:
+                try:
+                    return float(order.get("qty") or 0.0)
+                except (TypeError, ValueError):
+                    break
+        return 0.0
 
     def cancel_stop(self, symbol: str, order_id: str) -> bool:
         try:
@@ -788,20 +883,28 @@ class CCXTBroker(Broker):
     def fetch_microstructure(self, symbols: list[str]) -> dict[str, dict[str, float]]:
         """Spread and 24h turnover for each symbol, in a single request.
 
-        Bybit returns every spot ticker in one call, so this costs the same
-        whether the universe is one symbol or fifty. That matters: the reason
-        ``ScanRow.spread_bps`` sat at zero since the beginning was never that
-        the data was unavailable, only that nobody wired it up — and a config
-        key (``universe.max_spread_bps``) has been quietly deciding nothing
-        ever since.
+        Bybit returns every ticker in a category in one call, so this costs the
+        same whether the universe is one symbol or a hundred. That matters: the
+        reason ``ScanRow.spread_bps`` sat at zero since the beginning was never
+        that the data was unavailable, only that nobody wired it up — and a
+        config key (``universe.max_spread_bps``) has been quietly deciding
+        nothing ever since.
+
+        Both the category and the symbol form are the class's, not literals.
+        Hardcoded ``"spot"`` and a plain ``replace("/", "")`` made this method
+        fail twice over on the perpetual engine — the wrong ticker list, and
+        ``SOLUSDT:USDT`` as the key to look it up by — so all 1213 scan rows of
+        a ten-hour run carried a spread of zero. No error, no exception: the
+        same silent-zero failure as audit #56 and #62, in the one method those
+        fixes did not reach.
         """
         try:
-            response = self.exchange.publicGetV5MarketTickers({"category": "spot"})
+            response = self.exchange.publicGetV5MarketTickers({"category": self.category})
         except ccxt.BaseError as exc:
             log.warning("microstructure_fetch_failed", error=str(exc)[:160])
             return {}
 
-        wanted = {sym.replace("/", ""): sym for sym in symbols}
+        wanted = {self._venue_symbol(sym): sym for sym in symbols}
         out: dict[str, dict[str, float]] = {}
         for row in (response.get("result") or {}).get("list") or []:
             symbol = wanted.get(str(row.get("symbol") or ""))
@@ -836,14 +939,22 @@ class CCXTBroker(Broker):
         its position.
         """
         market = self._venue_symbol(symbol)
-        queries: list[dict[str, str]] = [{"category": self.category, "symbol": market}]
+        # ``orderId`` on the realtime query, because an unfiltered one answers
+        # with the *open* orders only — and a market order that just filled is
+        # by definition not among them. Asked for by id, the venue returns it
+        # (measured), and that is the fastest place a settled fill appears.
+        queries: list[dict[str, str]] = [
+            {"category": self.category, "symbol": market, "orderId": order_id}
+        ]
         if self.category == "spot":
             # Conditional orders are invisible to an unfiltered spot query, and
             # a triggered stop is exactly the order a caller most needs to find.
-            queries[:0] = [
+            # Kept after the lookup by id, which is both cheaper and exact.
+            queries += [
                 {"category": "spot", "symbol": market, "orderFilter": "tpslOrder"},
                 {"category": "spot", "symbol": market, "orderFilter": "StopOrder"},
             ]
+        queries.append({"category": self.category, "symbol": market})
         for query in queries:
             try:
                 response = self.exchange.privateGetV5OrderRealtime(query)
@@ -993,6 +1104,11 @@ class CCXTBroker(Broker):
             fee_paid=float((raw.get("fee") or {}).get("cost") or 0.0),
             created_ts=int(raw.get("timestamp") or now_ms()),
             updated_ts=int(raw.get("lastUpdateTimestamp") or raw.get("timestamp") or now_ms()),
+            # Carried so a caller can tell the position's own protection from an
+            # order the engine placed. On a perpetual the venue reports the stop
+            # and the take-profit with no client id at all, which is otherwise
+            # indistinguishable from an order nobody recorded.
+            meta={"stop_order_type": str(info.get("stopOrderType") or "")},
         )
 
     def _merge(self, order: Order, response: dict) -> Order:
@@ -1065,6 +1181,35 @@ class PerpBroker(CCXTBroker):
     # lookup — duplicate resolution, order settlement, venue-exit detection —
     # runs through it. Left at "spot" these all answer "no such order".
     category = "linear"
+
+
+    def fetch_open_orders(self, symbol: str | None = None) -> list[Order]:
+        """Open orders, minus the position's own stop and take-profit.
+
+        On a perpetual those two are properties of the position, not orders the
+        engine placed: the venue reports them with an empty ``orderLinkId``
+        because no client id was ever sent. Reconciliation matches on client id,
+        so both came back as orphans on every start — two warnings per position,
+        for something working exactly as designed, that no action could ever
+        clear. Audit #32 is the same lesson: a channel that cries wolf gets
+        muted, and then the real wolf goes unheard.
+        """
+        return [
+            order
+            for order in super().fetch_open_orders(symbol)
+            if not self._is_position_protection(order)
+        ]
+
+    @staticmethod
+    def _is_position_protection(order: Order) -> bool:
+        kind = str((order.meta or {}).get("stop_order_type") or "")
+        return not order.client_id and kind in (
+            "StopLoss",
+            "TakeProfit",
+            "TrailingStop",
+            "PartialStopLoss",
+            "PartialTakeProfit",
+        )
 
     def __init__(
         self,
@@ -1307,15 +1452,15 @@ class PerpBroker(CCXTBroker):
         log.info("take_profit_set", symbol=symbol, target=round(target_price, 8))
         return True
 
-    def amend_stop(self, symbol: str, order_id: str, stop_price: float) -> bool:
+    def amend_stop(self, symbol: str, order_id: str, stop_price: float) -> str | None:
         """Move the position's stop. Overwrite, not edit.
 
-        The base implementation calls ``edit_order`` against a real order id.
-        There is no such id here: ``place_stop`` returns ``position:<symbol>``
-        because the venue tracks a perpetual's stop as a property of the
-        position. Inherited, that call raised on every trail, got caught, and
-        returned ``False`` — so the venue kept the *first* stop for the life of
-        the position while the local book showed the trailed one. The gap only
+        The base implementation amends a real conditional order. There is no
+        such order here: ``place_stop`` returns ``position:<symbol>`` because
+        the venue tracks a perpetual's stop as a property of the position.
+        Inherited, that call raised on every trail, got caught, and reported
+        failure — so the venue kept the *first* stop for the life of the
+        position while the local book showed the trailed one. The gap only
         appears when the engine is down, which is the one case a venue-side
         stop exists for (invariant 12).
 
@@ -1323,7 +1468,7 @@ class PerpBroker(CCXTBroker):
         the position identifies itself.
         """
         del order_id
-        return self.place_stop(symbol, 0.0, stop_price, "") is not None
+        return self.place_stop(symbol, 0.0, stop_price, "")
 
     def cancel_stop(self, symbol: str, order_id: str) -> bool:
         """Clear the position's stop by setting it to zero."""
