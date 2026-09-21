@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 449 test
+.venv/bin/python -m pytest -q             # 514 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -233,6 +233,28 @@ testi oku — hepsinin kendini koruyan bir testi var.
     evrende kalır; motor bunu her bar kontrol edip **raporlar**, düşürmez.
     İleri testin ortasında evreni değiştirmek, testin ölçtüğü şeyi değiştirir.
     → `_check_universe_liquidity`
+70. **Aynı hesaptaki perp motorları sembolü kiralar.** Linear one-way modda sembol
+    başına tek pozisyon var; iki motor aynı sembolde açarsa borsa netler ve
+    sahibinin defteri bozulur. İlk açan sahiplenir: kira **emirden önce** alınır,
+    **borsada düz olduğu doğrulandıktan sonra** bırakılır, diğer motor
+    `claimed_by_other_engine` ile atlar. Kira bir satırdır, kilit değil — süreç
+    ölümünü atlatır, çünkü pozisyon da atlatır. Kiralamasız bir perp kardeşi varsa
+    açılış reddedilir. → `engine/claims.py`, `engine/siblings.assert_claims_consistent`
+71. **Paylaşılan cüzdanda her motor yalnız kendi parasını tohumlar.** Tavan motorun
+    ilk tahsisidir; sonra motor kendi son equity'sinden devam eder — kâr da zarar
+    da onundur, açık pozisyonlar bunun *içinde* (#88). Tavansız bir motor (bugün yalnız
+    `live.yaml`; demo/fast/scalp $1000'er tavanlı) kardeşlerin payını düşer (çalışan kardeşin
+    `state.json` nakdi, duranınki `max_capital`). Aksi halde kayıp restart'ta
+    havuzdan geri dolar ve equity'ye bağlı öldürme eşiği hiç tetiklenemez.
+    → `engine/siblings.own_starting_cash`
+72. **Reddedilen çıkış pozisyonu kapatmaz.** Borsa pozisyonu zaten kapattıysa
+    borsanın dolumu kaydedilir; kapatmadıysa pozisyon tutulur ve çıkış için iptal
+    edilen koruyucu stop geri kurulur. Reddedilmiş emir için dolum yazmak ya
+    hayalet satış (perp) ya da stop'u iptal edilmiş, unutulmuş pozisyon (spot)
+    üretir. → `Runner._exit_not_executed`
+73. **Borsanın tuttuğu seviyeyle yarışılmaz.** Perp'te TP ve (borsanın onayladığı)
+    stop borsada durur; motor o seviyeye fiyat değince kendi kapanışını göndermez,
+    borsanın kapanış dolumunu okur. → `Runner._venue_holds_level`, `PerpBroker.recent_reduce_fill`
 68. **v5 çağrısının kategorisi ve sembolü sınıfın, literal değil.** ccxt'nin
     yardımcıları türev sözleşme varsayıyor; `category: "spot"` ve
     `replace("/","")` perp'te ya boş liste ya `10001` döndürüyor — ikisi de
@@ -452,6 +474,55 @@ kodun yanında duruyordu, kod öyle yapmıyordu, ve dönüş değerini kimse oku
 için borsa ile defter arasındaki fark hiçbir yerde görünmüyordu. Bir yorumun
 doğru olduğunu gösteren tek şey, yanlış olduğunda kırılan bir testtir.
 
+### Onuncu tur (2026-09-21, üçüncü motor kurulurken, iki motor canlıyken)
+
+Üçü canlı borsada, biri kendi yeni kodumun incelemesinde bulundu.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 81 | **Reddedilen çıkış emri dolum olarak kaydediliyordu — ve spot'ta stop'u iptal edilmiş pozisyonu unutturuyordu.** `_close` önce koruyucu stop'u iptal ediyor (spot'ta varlığı serbest bırakmak için şart), sonra çıkışı gönderiyor, sonra **sonuç ne olursa olsun** dolum ve trade yazıp pozisyonu yerelde kapatıyordu. H17'nin ilk işleminde canlı yakalandı: borsa TP'den 114.34'te kapattı, motorun 57 sn sonraki çıkışı `110017 current position is zero` ile reddedildi, ret **114.33'ten, sıfır komisyonlu bir satış** olarak yazıldı. Spot'ta aynı yol daha kötü: reddedilen çıkış = borsada stop'suz duran, defterde olmayan varlık | kritik | `_exit_not_executed`: borsa düzse borsanın kapanış dolumu kaydedilir, değilse pozisyon tutulur ve stop geri kurulur. Geri alınınca kırılan testle korunuyor |
+| 82 | **Motor, perp'te borsanın tuttuğu TP ile yarışıyordu.** `_check_intrabar_exits` hedefe fiyat değince kendi reduce-only kapanışını gönderiyordu, oysa aynı seviyede borsada TP duruyordu (değişmez 56). Yarışı yapısal olarak borsa kazanır; motorun emri düz pozisyona çarpar (#81'i tetikleyen tam buydu) | yüksek | `_venue_holds_level`: borsa tutuyorsa motor emir göndermez, borsanın dolumunu okur. Stop yalnız borsa **onayladıysa** "tutuluyor" sayılır (değişmez 67) |
+| 83 | **`_detect_venue_exits` perp'te borsa çıkışını hiç tanıyamıyordu.** Perp stop'unun id'si `position:SOLUSDT` — gerçek bir emir değil — yani `order_state` hiçbir şey bulamıyor; en iyi ihtimalle `position_inventory_missing`. Ayrıca TP dolumu her zaman stop sanılıyordu | yüksek | `PerpBroker.recent_reduce_fill`: pozisyonun açıldığı andan (`meta.opened_ms`) beri kapanış yönündeki reduce-only dolum, türüyle (`take_profit`/`stop`) ve gerçek komisyonuyla |
+| 84 | **Paylaşılan cüzdanda sermaye muhasebesi restart'ta dağılıyordu.** (a) Ana motor serbest USDT'nin **tamamını** kendi sanıyordu; fast'in $300'ü hiç fonlanmamıştı, ondan ödünçtü — sabahki restart'ta fast'in SOL marjı ana motorun nakdinden yenmiş, ana motor gün boyu ~$100 eksik sermayeyle (919.24) çalışmıştı. (b) Tavanlı motor tavanı yalnız nakde uyguluyordu, açık pozisyon üstüne ekleniyordu (fast 300 tavanla 313.94 tohumladı). (c) Tavanlı motorun kaybı restart'ta havuzdan geri doluyordu — scalp'in $500 öldürme eşiği hiç tetiklenemezdi | yüksek | değişmez 71; demo hesaba +$1300 eklendi (scalp $1000 + fast'in fonlanmamış $300'ü). Ölçüm: ana motor `cash 316.12` ile açıldı, kardeşler `{fast: 300, sc: 1000}` ayrıldı, alarmsız |
+| 85 | **Scalp'in öldürme kontrolü "açık pozisyon yok" erken dönüşünün arkasındaydı** — yani kayıplar realize olup her pozisyon kapandığında, eşiğe tam ulaşıldığı anda, hiç çalışmıyordu. Canlıya çıkmadan kendi kodumun incelemesinde bulundu; ilk yazdığım test hatanın **etrafından dolaşıyordu** | (canlı değil) | koşulsuz, her yoklamada ve her kapanıştan sonra. Test artık tam o durumu (hiç açık pozisyon yok) kuruyor |
+
+| 86 | **İşlem yapılamayan tek bir kontrat tüm scalp motorunu soğumaya sokuyordu.** Bybit'in TradFi perp'leri (XAU, …) arayüzde sözleşme onaylanana kadar her girişe `110123 You must agree to the Trading Terms` veriyor. Her ret motor çapındaki ret sayacına yazılıyordu: 5'te 10 dakika hiçbir sembolde giriş yok. Canlıda ilk 10 dakikada 3/5'e ulaştı | orta | ret önce sembole sayılıyor: sözleşme reddi (`110123` XAU, `110125` CL, `110126` SOXL — ürün ailesi başına ayrı kod, canlıda ölçüldü; ilk düzeltme yalnız ilkini tanıyordu) → sembol bu koşu için düşer, genel sayaca yazılmaz; diğer retler 3'te sembolü düşürür. Genel sayaç yalnız "borsa her şeyi reddediyor" için |
+| 87 | **Dolmayan maker giriş defterde sonsuza dek `open` kalıyordu, sebebi de kaydedilmiyordu** — oysa "TTL doldu" ile "PostOnly kitabı kesecekti" (`EC_PostOnlyWillTakeLiquidity`) ayrı bulgular: ikincisi 1m barda backtest'in göremediği bir dolum-oranı gerçeği | düşük | `_record_unfilled`: durum `canceled`, borsanın sebebiyle |
+
+| 88 | **Tavanlı motor kârını her restart'ta tavanda kesiyordu.** #84'ün düzeltmesi `min(tavan, son equity)` idi; yalnız fast/scalp tavanlıyken zararsız görünüyordu. Sıfırlamayla ana motor da tavanlı oldu — ve ana motorun bütün edge'i restart'ları aşan uzun kazananlarda (değişmez 51) | yüksek | tavan **ilk tahsis**; sonrası motorun kendi equity'si, kâr da zarar da. %50 üstü taşınan equity uyarı üretir, kesilmez |
+| 89 | **Demo bakiye eklemesi kuruşlu tutarı sessizce yok sayıyordu.** `amountStr: "656.46"` → `retCode 0`, `orderStatus SUCCESS`, bakiye değişmedi; `"656"` hemen işlendi. Sıfırlama "başarılı" raporlayıp 2343.54'te kalıyordu; yakalayan şey betiğin sonucu geri okuması | düşük | tam birime yuvarlanıyor (eklerken yukarı). Başarı dönen ama bir şey yapmayan çağrı: #59–#61 sınıfı, bu kez fonlama tarafında |
+
+### Sıfırlama (2026-09-21 15:53 UTC, operatör kararı)
+
+Borsa düzleştirildi (perp SOL kapandı, spot stop'lar iptal, AAVE/ETH/VVV satıldı),
+**USDT 3000.54**, üç motorun `tbot.db`/state/log'u yedeklenip silindi, kira tablosu
+temizlendi. Piyasa verisi, indikatör ölçümleri, evrenler ve raporlar korundu.
+**Her motor $1000** (`risk.max_capital`), üçü de tavanlı. `ops/reset.sh` artık üç
+motoru + perp tarafını + kiraları kapsıyor (önceden yalnız spot ve `runtime/`).
+H17 ve H18 bu andan itibaren sayılır (`research/hypotheses.md`, protokol notları).
+
+#81–#83 aynı kökten: **perp'te çıkışı borsa yapar, motor yalnız öğrenir.** Spot
+dünyasından miras kalan "motor kapatır, sonra kaydeder" akışı, TP'nin de borsada
+durduğu bir piyasada iki kez çalışan bir kapanış demek. #85 ise #47'nin dersinin
+kendi yeni koduma uygulanması: ilk testim yeşildi çünkü testi hataya göre yazmıştım.
+
+### Ölçülmüş borsa gerçekleri — 1 dakikalık maker scalper (2026-09-21, demo'da emirle)
+
+`scripts/scalp_probe.py` ile tekrar üretilebilir. Tam çıktı: `research/scalp_venue_facts.md`.
+
+| deneme | sonuç |
+|---|---|
+| PostOnly limit + ekli SL (market) + TP (limit), tek çağrı | ✅ kabul; borsa ikisini dolumda kuruyor (`tpslMode=Partial`) |
+| Dinlenen PostOnly'nin iptali, geçmişten doğrulama | ✅ `Cancelled / CancelByUser` — ama geçmiş **6 sn+ gecikebiliyor** |
+| Kitabı kesecek PostOnly | kabul, sonra borsa iptal: `EC_PostOnlyWillTakeLiquidity`, dolum 0 |
+| Dolumda bacaklar | `PartialStopLoss` + `PartialTakeProfit`, `orderLinkId` boş (#80) |
+| Pozisyon kapanınca bacaklar | ✅ borsa kaldırıyor, artık emir kalmıyor |
+| Linear WS kline topic / abonelik | 10 / 11 / **20** hepsi ~2 sn — spot'taki 11'de askıda kalma (değişmez 43) linear'da yok |
+| Saat sapması (yerel − borsa) | **−80 ms**; gidiş-dönüş ~190 ms. Tek seferlik `10002` = ağda 15.7 sn takılan istek, saat değil |
+| TradFi perp (XAU, …) | ❌ `110123 You must agree to the Trading Terms` — arayüzde onay gerekiyor |
+| Canlı maker dolum oranı (ilk 30 dk) | ~%33: sert hareketten hemen sonra en iyi seviyeye katılan PostOnly'lerin çoğu `EC_PostOnlyWillTakeLiquidity` ile anında iptal. **Backtest ~%92 varsaymıştı** |
+| Market stop kayması (ilk 2 işlem) | ARB: −4.6 bps ve +5.8 bps — backtest'in 5 bps varsayımıyla uyumlu |
+
 ### Ölçülmüş borsa gerçekleri — linear perpetual (2026-09-20, demo'da emirle)
 
 `scripts/perp_probe.py` ile tekrar üretilebilir. Tam çıktı: `research/perp_venue_facts.md`.
@@ -543,13 +614,15 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 | `backtest/cpcv.py` `dsr.py` `montecarlo.py` `excursion.py` | Kapı 1 aletleri |
 | `llm/provider.py` `roles.py` `redact.py` | 5 rol, bütçe, whitelist redaksiyon |
 | `web/app.py` | Yerel panel (localhost), motor başına sekme |
-| `execution/ccxt_broker.py::PerpBroker` | Linear perpetual: short, borsa tarafı hedef, kaldıraç kapısı |
+| `execution/ccxt_broker.py::PerpBroker` | Linear perpetual: short, borsa tarafı hedef, kaldıraç kapısı, PostOnly+ekli TP/SL |
+| `engine/claims.py` `siblings.py` | Perp sembol kiralama; kardeş motorları bulma, sermaye tohumlama |
+| `scalp/signal.py` `stream.py` `engine.py` `backtest.py` | 1m scalper: tek saf sinyal, WS kapanmış barlar, maker döngüsü, aynı sinyalle replay |
 
 ## Komutlar
 
 ```bash
 ./ops/pre-install.sh                                      # tüm kurulum + ölçüm
-./ops/bot.sh start demo|live|fast                         # 7/24 (launchd üretir)
+./ops/bot.sh start demo|live|fast|scalp                   # 7/24 (launchd üretir)
 ./ops/bot.sh status | stop | restart | logs -f            # motor adı opsiyonel
 ./ops/bot.sh engines                                      # tanımlı motorlar
 
@@ -561,6 +634,9 @@ python scripts/exit_optimizer.py                          # MAE/MFE kalibrasyon
 python scripts/run.py --config config/demo.yaml           # canlı motor
 python scripts/dashboard.py --config config/fast.yaml     # panel :8788 (sekmeli, iki motor)
 python scripts/perp_probe.py                              # perp borsa gerçekleri
+python scripts/scalp_probe.py                             # 1m maker scalper borsa gerçekleri
+python scripts/scalp_backtest.py --to <ISO>               # H18 backtest (bir kez, ayarsız)
+python scripts/claims.py [--release SYM]                  # perp sembol kiraları
 python scripts/report.py --since 30d                      # durum raporu
 python scripts/llm_impact.py                              # LLM karşı-olgusal
 ```
@@ -708,9 +784,10 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 17** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 17` geçirin — DSR her denemeyi fiyatlıyor. 17'nci H17:
-perp + short, ön-kayıtlı, ileri testte.
+**Kümülatif deneme: 19** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 19` geçirin — DSR her denemeyi fiyatlıyor. 17'nci H17:
+perp + short; 18–19'uncu H18a/H18b: 1m scalper'ın iki kolu. Üçü de ön-kayıtlı,
+ileri testte.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir
@@ -733,7 +810,26 @@ barını yükseltiyor.
 - [ ] Faz 9 — Bybit demo, 4 hafta (Kapı 1 geçilmeden anlamsız)
 - [ ] Faz 10 — canlı $100 (Kapı 3'e bağlı)
 
-### İkinci motor ("fast") — kurulu, başlatılmadı
+### Üçüncü motor ("scalp") — 1 dakikalık maker scalper (H18)
+
+`config/scalp.yaml`, `engine.kind: scalp`: Runner değil, `tbot.scalp` döngüsü —
+Runner bir barı 79 sembolde ~3.5 dk'da işliyor, 1m'yi taşıyamaz. Ops tesisatı aynı
+(`scripts/run.py`, launchd, healthcheck, panel sekmesi :8789, DB şeması).
+
+- Kapanmış 1m barlar WS'ten, bellekte; tek saf `signal.evaluate` canlı ve backtest'te
+- Tetik: 5 barlık hareket > 2.5·σ₆₀·√5; kol `blake2b(sembol|bar) % 2` → momentum / dönüş
+- Giriş: sembol kiralanır → PostOnly en iyi bid/ask'te, **ekli** SL (market) + TP (limit);
+  20 sn'de dolmazsa iptal **doğrulanır**, kira bırakılır
+- Çıkış: borsa yapar; motor 3 sn'de bir yoklayıp borsanın dolumunu kaydeder; tek kendi
+  gönderdiği çıkış 15 dk zaman stop'u
+- Valfler: dakikada ≤20 emir / ≤10 giriş, eşzamanlı ≤8, ardışık 5 red → 10 dk soğuma,
+  **$1000 → $500'da yeni giriş yok** (ön-kayıtlı öldürme)
+- Tahsis $1000, 1x. **Beklenti ön-kayıtlı ve negatif**: 1m'de maliyet hareketin %100–270'i
+- **Backtest (30 gün, 40 sembol, tek koşu):** iki kol da −%0.13/işlem, PF 0.41, 19.6 işlem/saat.
+  Her dolum kötümserliği kaldırılınca bile −%0.068 — model değil edge yokluğu. Canlı koşu
+  gerçek dolumu ölçmek için ön-kayıt gereği yine de başladı; beklenen yanma ≈ $3.3/saat
+
+### İkinci motor ("fast") — çalışıyor (H17 ileri testi, 2026-09-20'den beri)
 
 Ana motor (`config/demo.yaml`) hiç değişmeden çalışmaya devam ediyor. Yanında
 `config/fast.yaml`: linear perpetual, iki yönlü, $300 sert tavan, 1x kaldıraç.
@@ -744,7 +840,8 @@ Ana motor (`config/demo.yaml`) hiç değişmeden çalışmaya devam ediyor. Yan�
 - [x] Short tarafı: rejim izni, 3 aynalanmış kurulum, portföy marj muhasebesi, backtest kolu
 - [x] Veri: 30 perp sembol × 3 TF × 2 yıl, 90/90 temiz, türevler dahil
 - [x] H17 ön-kaydı + kill kriterleri (`research/hypotheses.md`)
-- [ ] **Başlatma — operatör onayı bekliyor** (`./ops/bot.sh start fast`)
+- [x] Başlatıldı; ilk işlem 2026-09-21 (kaydı yanlış — `hypotheses.md` protokol notu)
+- [x] Sembol kiralama (scalp ile aynı perp'leri paylaşıyor)
 
 **Beklenen sonuç ön-kayıtlı: negatif, işlem başına ≈ −%0.05.** İleri testin
 amacı bunu doğrulamak ya da çürütmek; taze veri DSR bütçesinden belgelenen tek

@@ -32,8 +32,124 @@ bir sonrakinin barını yükseltiyor.
 | 15 | Taker akış dengesizliği (CVD) kısa vadede edge taşır | fiyattan bağımsız tek kaynak | **taranıp REDDEDİLDİ** — üst desil lift +0.8 puan, gereken +13. Strateji koşulmadı | 0 (indikatör taraması) |
 | 16 | Perp ücret katmanı ve short tarafı kısa vadeli aritmetiği değiştirir | operatör sorusu | **tarandı** — maliyet %0.30→%0.07, short tabanı long'dan +2.1 puan iyi. Açık %8.8 puandan **%1.8 puana** indi, ama kapanmadı | 0 (bariyer taraması, strateji koşulmadı) |
 | 17 | **Kesitsel conviction skoru perp'te SHORT tarafında %0.07 maliyeti karşılar** | H16'nın bıraktığı açık | **ÖN-KAYITLI, ileri test koşuyor** — aşağıya bakın | 1 |
+| 18a | **1m sert hareketi takip (momentum), maker giriş, perp** | operatör: "dakikada 10 işlem açabilen bot" | **ÖN-KAYITLI, beklenti NEGATİF** — aşağıya bakın | 1 |
+| 18b | **1m sert hareketi sönümleme (dönüş), aynı tetik, aynı motor** | 18a ile rastgele bölüşülmüş A/B kolu | **ÖN-KAYITLI, beklenti NEGATİF** | 1 |
 
-**Kümülatif deneme: 17.** Bir sonraki CPCV koşusunda `--trials 17` geçirin.
+**Kümülatif deneme: 19.** Bir sonraki CPCV koşusunda `--trials 19` geçirin.
+
+## 18. ve 19. deneme: H18a / H18b — ÖN-KAYIT (backtest ve canlı koşudan önce yazıldı)
+
+**Tarih:** 2026-09-21 · **Motor:** `config/scalp.yaml` (`engine.kind: scalp`) · **Tahsis:** $1000
+
+### Neden soruluyor
+
+Operatör, dakikada ~10 işlem açabilecek kapasitede, 1 dakikalık barlarla çalışan
+yüksek riskli üçüncü bir motor istedi. Değişmez 53 ve 58 kısa ufku üç ölçümle
+kapatmıştı; 1m hiç ölçülmemişti. Kurmadan önce ölçüldü (Bybit perp public 1m,
+BTC/ETH/SOL/XRP/DOGE/SUI × 7 gün × 10.080 bar):
+
+| | değer |
+|---|---|
+| medyan \|1m getiri\| | %0.026 (BTC) – %0.070 (SUI) |
+| gidiş-dönüş maliyet | maker giriş + taker çıkış %0.07 → hareketin **%100–270'i** |
+| koşulsuz bariyerler (+0.1/−0.1 … +1.0/−0.5) | isabet yazı-turaya yapışık, **hepsi ≈ −%0.07/işlem** |
+| tetik sonrası takip, +0.3/−0.3 | isabet **%57.8**, başabaş %61.7 (taker çıkışla), n=218 |
+| tetik sonrası sönümleme, +0.3/−0.3 | isabet %41.7–52.1, n=117–218 |
+
+### Hipotez
+
+> Kapanmış 1m barlarda 5 barlık getiri 2.5·σ₆₀·√5'i aştığında, **(a)** hareket yönünde
+> **(b)** tersine PostOnly maker girişle açılan, %0.3 limit TP / %0.3 market SL /
+> 15 dakika zaman stop'lu pozisyon, Bybit linear perp'te gidiş-dönüş maliyetini karşılar.
+
+Kol ataması `blake2b(symbol|bar_ts) % 2` — sonuçtan bağımsız, aynı olay popülasyonu
+iki kola bölünür. Temiz A/B; iki kol aynı olayda zıt yön istediği için sembol
+paylaşmaları zaten imkânsız.
+
+### Beklenen sonuç (ön-kayıt)
+
+Maker TP ile başabaş isabet ≈ **%56.9** (kazanç 0.3−0.02, kayıp 0.3+0.07). Takip kolunun
+7 günlük nokta tahmini (%57.8) başabaşın üstünde ama **gürültü içinde** (n=218, SE≈3.3
+puan) ve maker girişin **ters seçimi** (limit, fiyat girişin aleyhine gittiğinde dolar)
+bu tahminde yok. Beklenti:
+
+| kol | işlem başına net |
+|---|---|
+| H18a momentum | **−%0.02 ile −%0.05** |
+| H18b dönüş | **−%0.05 ile −%0.10** |
+
+İkisi de negatif. Bir kolun pozitif çıkması **şüpheyle** karşılanır (denetim #47/#49):
+önce dolum modeli, sonra rejim (trendli hafta?), sonra şans.
+
+### Tam şartname (serbest parametre araması YOK)
+
+`trigger_bars 5 · sigma_window 60 · trigger_sigma 2.5 · take_profit_pct 0.003 ·
+stop_loss_pct 0.003 · time_stop_bars 15 · entry_ttl_seconds 20 · max_positions 8 ·
+notional = tahsis/8 · 1x`. Evren: en likit 40 linear perp, ≥$20M hacim, ≤3bps spread,
+≥90 gün geçmiş, açılışta bir kez sabitlenir (değişmez 69).
+
+### Canlı koşu notları
+
+**2026-09-21 12:15–12:40 UTC (sıfırlama öncesi, sayılmaz).** 9 kapanmış işlem:
+4 TP, 5 stop, ≈ −$1.1. Ölçülenler: maker giriş dolum oranı **~%33** (sert hareketten
+hemen sonra en iyi seviyeye katılan PostOnly'lerin çoğu `EC_PostOnlyWillTakeLiquidity`
+ile anında iptal; backtest ~%92 varsaymıştı), market stop kayması −4.6 / +5.8 bps,
+TradFi perp'ler `110123` (sözleşme onayı) ile işlem yapılamaz. Kayıtlar protokol
+yeniden başlatmasında silindi; yedek `runtime-scalp/backups/pre-reset-20260921-155301.db`.
+**H18 sayımı 2026-09-21 15:53 UTC sıfırlamasından başlar**; parametreler aynı.
+
+### Kill kriterleri (koşmadan önce yazıldı)
+
+| durum | aksiyon |
+|---|---|
+| equity ≤ $500 | **motor yeni giriş açmaz** (kodda: `scalp.kill_equity`) |
+| bir kolda < 100 kapanmış işlem | hiçbir yargı yok |
+| 300 işlemde beklentinin bootstrap %95 CI'si tamamen sıfırın altında | o kolu **kapat**, buraya yaz |
+| CI sıfırı içeriyor | 600 işleme uzat |
+| CI tamamen sıfırın üstünde | Kapı 1'e taşı (`--trials 19`), dolum modelini canlıyla karşılaştır |
+
+### Protokol
+
+1. `scripts/scalp_backtest.py` son 30 gün 1m üzerinde **bir kez**, bu parametrelerle,
+   ayar yapılmadan koşar. Sonuç buraya yazılır; beklentiyle çelişirse parametre
+   değil **dolum modeli** sorgulanır.
+2. Canlı koşu backtest'ten bağımsız olarak başlar — backtest bir kapı değil, bir
+   karşılaştırma noktası (değişmez 59: aynı `signal.evaluate`).
+3. fast ile sembol paylaşımı kiralamayla (ilk açan sahiplenir). Kiralı sembolde
+   kaçan tetikler `scans`'e `claimed_by_other_engine` ile yazılır; analiz bu
+   satırlar dahil ve hariç iki kez yapılır.
+
+### Backtest sonucu (2026-09-21, tek koşu, ayarsız, `--to 2026-09-21T10:15:00`)
+
+40 sembol × 30 gün × 43.234 bar. `runtime-scalp/reports/scalp_backtest.md`.
+
+| kol | tetik | işlem | isabet | işlem başına net | %95 CI | PF |
+|---|---|---|---|---|---|---|
+| H18a momentum | 18.219 | 7.231 | %36.6 | **−%0.132** | [−0.140, −0.125] | 0.42 |
+| H18b dönüş | 17.963 | 6.847 | %36.2 | **−%0.136** | [−0.144, −0.129] | 0.41 |
+
+19.6 işlem/saat. $1000 tahsiste 30 günde −$2.365 (öldürme eşiği ~6. günde devreye
+girerdi). **Yön ön-kayıtla aynı, büyüklük ~2 kat kötü.**
+
+Protokol gereği parametre değil **dolum modeli** sorgulandı — yalnız duyarlılık,
+strateji sabit:
+
+| dolum varsayımı | net | PF |
+|---|---|---|
+| ön-kayıtlı | −%0.134 | 0.41 |
+| + market çıkışta kayma yok | −%0.101 | 0.49 |
+| + dolum barında stop yok | −%0.089 | 0.53 |
+| + ters seçim yok (her tetik kapanıştan dolar) | **−%0.068** | 0.62 |
+
+Her kötümserlik kaldırılınca bile kalan −%0.068 bir işlemin maliyetine eşit — 1m
+REST ölçümünün koşulsuz bariyerlerde bulduğu sayı. **Kaybı model değil edge
+yokluğu üretiyor.** Takip kolunun 7 günlük %57.8'i 30 günde tutmadı (koşulsuz
+isabet %43.2, gereken ~%57). İki kol arasında fark yok: aynı tetiğin iki yönü de
+maliyet kadar kaybediyor — yani tetik yönle ilgili bir bilgi taşımıyor.
+
+Canlı koşu ön-kayıt gereği yine de başlıyor: backtest bir kapı değil, canlıdaki
+gerçek dolum, gerçek kayma ve gerçek ters seçimle karşılaştırılacak nokta. Beklenen
+yanma ≈ $3.3/saat; $500 öldürme eşiği bunu sınırlıyor.
 
 ## 17. deneme: H17 — ÖN-KAYIT (sonuç görülmeden yazıldı)
 
@@ -119,6 +235,32 @@ getirisi** kaydediliyor. Ayrım yapılamazsa sonuç yorumlanamaz.
 | CI tamamen sıfırın üstünde | Kapı 1'e taşı (CPCV + DSR, `--trials 17`) |
 | kâr yalnızca düşen rejimden | **yön bahsi**, edge değil — kapat |
 | $300 tahsisinde −%15 | dondur: yeni giriş yok, mevcutlar yönetilir |
+
+### Protokol notları (ileri test sırasında, sonuca bakılmadan yazıldı)
+
+**2026-09-21 — ilk işlemin kaydı yanlış, veri düzeltmesi operatörde.** SOL/USDT:USDT
+long, borsada TP'den kapandı. Defter iki hatayla yazdı: giriş istenen fiyattan
+(112.09, gerçek **112.58** — denetim #79) ve çıkış, borsa zaten kapattıktan 57 sn
+sonra motorun gönderdiği ve `110017` ile **reddedilen** kendi emrinden (denetim
+#81/#82). Kayıtlı +1.135R / +$2.18; borsanın söylediği **+0.71R / +$1.63**. Kill
+kriterleri işlem sayısı ve CI üstünden işlediği için bu işlem ya düzeltilerek ya
+da dışlanarak sayılacak — yanlış haliyle değil.
+
+**2026-09-21 15:53 UTC — PROTOKOL YENİDEN BAŞLATMA.** Operatör kararıyla hesap ve üç
+motorun kayıtları sıfırlandı (borsa düzleştirildi, USDT 3000, her motora $1000).
+Sebep: ilk işlemin kaydı yanlıştı (yukarıda), sermaye muhasebesi paylaşılan
+cüzdanda bozuktu (denetim #84) ve fast'in $300'ü hiç fonlanmamıştı. Değişen:
+**tahsis $300 → $1000**; kill kriterindeki "−%15" artık $1000 tahsise göre. Sıfırlama
+öncesi 2 işlem (SOL TP, açık SOL — sıfırlamada piyasadan kapatıldı) **analize
+girmez**; yedek `runtime-fast/backups/pre-reset-20260921-155301.db`. Strateji
+parametreleri değişmedi; H17 bu andan itibaren sayılır.
+
+**2026-09-21 — altyapı değişikliği: sembol kiralama.** Aynı hesapta ikinci bir perp
+motoru (scalp) başlıyor ve one-way mod sembol başına tek pozisyon tutuyor. fast
+artık başka motorun tuttuğu sembolü atlıyor (`claimed_by_other_engine`). Bu,
+stratejinin kuralını değil hangi olayların ona *ulaşabildiğini* değiştirir. Etkisi
+ölçülebilir kalsın diye her atlama `scans`'e sebebiyle yazılıyor; analiz, bu
+satırlar hariç tutularak ve dahil edilerek iki kez yapılacak.
 
 ### Neden bu bir deneme sayılıyor ama veri madenlenmiş değil
 
