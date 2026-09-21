@@ -156,3 +156,79 @@ def test_a_control_command_reaches_only_the_engine_it_names(tmp_path):
     assert (fast.runtime_dir / "command.json").exists()
     assert not (main.runtime_dir / "command.json").exists()
     assert json.loads((fast.runtime_dir / "command.json").read_text())["action"] == "pause"
+
+
+def test_realised_money_is_reported_per_symbol_and_totalled(tmp_path):
+    """"How much did each of these actually make me?"
+
+    R says how a trade did against its own risk and deliberately says nothing
+    about size, so a page that only speaks R cannot answer the question the
+    money is in. This groups every closed trade — not a recent window, because
+    a symbol's contribution is the sum of its life and a rolling cut would let
+    a loser drop out of the table by simply not trading lately.
+    """
+    from tbot.core.models import ExitReason, Side, Trade
+
+    cfg = load_config("config/base.yaml")
+    cfg.runtime_dir = tmp_path
+    db = web_app.Database(cfg.db_path)
+
+    def trade(symbol: str, pnl: float, fees: float, exit_ts: int) -> Trade:
+        return Trade(
+            symbol=symbol,
+            side=Side.BUY,
+            setup="momentum_continuation",
+            entry_ts=exit_ts - 3_600_000,
+            exit_ts=exit_ts,
+            entry_price=100.0,
+            exit_price=100.0 + pnl,
+            quantity=1.0,
+            pnl=pnl,
+            fees=fees,
+            r_multiple=pnl / 10.0,
+            mfe_r=1.0,
+            mae_r=-0.2,
+            bars_held=4,
+            exit_reason=ExitReason.TAKE_PROFIT,
+        )
+
+    for t in (
+        trade("ETH/USDT", 12.0, 0.4, 1_000),
+        trade("ETH/USDT", -4.0, 0.4, 2_000),
+        trade("VVV/USDT", 3.0, 0.1, 3_000),
+    ):
+        db.record_trade(t)
+    db.close()
+
+    with TestClient(web_app.create_app(cfg)) as client:
+        body = client.get("/api/pnl").json()
+
+    rows = {r["symbol"]: r for r in body["symbols"]}
+    assert rows["ETH/USDT"]["trades"] == 2
+    assert rows["ETH/USDT"]["wins"] == 1
+    assert rows["ETH/USDT"]["pnl"] == pytest.approx(8.0)
+    assert rows["ETH/USDT"]["fees"] == pytest.approx(0.8)
+    assert rows["VVV/USDT"]["pnl"] == pytest.approx(3.0)
+
+    # The total the operator reads, not one they have to add up by eye.
+    assert body["realised_total"] == pytest.approx(11.0)
+    assert body["fees_total"] == pytest.approx(0.9)
+    # Best first: the question is which symbol paid, so the answer leads.
+    assert [r["symbol"] for r in body["symbols"]] == ["ETH/USDT", "VVV/USDT"]
+
+
+def test_percentages_are_served_the_run_s_own_starting_equity(tmp_path):
+    """Invariant 33. The panel divided by a hardcoded 100 for a long time and
+    showed a 1014 USDT account as +914.8%. Serving the base beside the money
+    keeps the page from reaching for a number the engine never agreed to.
+    """
+    import json
+
+    cfg = load_config("config/base.yaml")
+    cfg.runtime_dir = tmp_path
+    cfg.state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with TestClient(web_app.create_app(cfg)) as client:
+        assert client.get("/api/pnl").json()["starting_equity"] is None  # no run yet
+        cfg.state_path.write_text(json.dumps({"starting_equity": 300.0}), encoding="utf-8")
+        assert client.get("/api/pnl").json()["starting_equity"] == 300.0

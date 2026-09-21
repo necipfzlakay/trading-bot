@@ -189,6 +189,31 @@ def create_app(config: Config | None = None, engines: dict[str, Config] | None =
     def trades(limit: int = Query(200, le=5000), engine: str | None = Query(None)) -> JSONResponse:
         return JSONResponse(db(engine).recent_trades(limit))
 
+    @app.get("/api/pnl")
+    def pnl(engine: str | None = Query(None)) -> JSONResponse:
+        """Realised money per symbol, plus the run's starting equity.
+
+        Only the *closed* half lives here. Open positions are marked with the
+        same venue price the positions table uses, so computing them here would
+        put a second, slightly different unrealised number on the page — and
+        two numbers for one quantity is worse than one.
+
+        ``starting_equity`` rides along because every percentage on the page is
+        measured against it (invariant 33). Serving it beside the money keeps
+        the panel from reaching for a base the engine never agreed to.
+        """
+        rows = db(engine).realised_by_symbol()
+        path = engine_config(engine).state_path
+        snapshot = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        return JSONResponse(
+            {
+                "symbols": rows,
+                "starting_equity": snapshot.get("starting_equity"),
+                "realised_total": sum(float(r["pnl"] or 0.0) for r in rows),
+                "fees_total": sum(float(r["fees"] or 0.0) for r in rows),
+            }
+        )
+
     @app.get("/api/meta")
     def meta() -> JSONResponse:
         """Constants the panel must agree with the engine about.

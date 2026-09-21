@@ -89,6 +89,10 @@ tbody tr.muted td{color:var(--faint)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 th.num{text-align:right}
 .sym{font-weight:600}
+/* The total is a different kind of row, so it reads as one: ruled off above,
+   never striped on hover, and never confusable with a symbol. */
+tfoot td{padding:6px 8px;border-top:1px solid var(--border-2);font-weight:600}
+tfoot tr:hover td{background:none}
 /* One column soaks up the leftover width; without it the browser shares it
    out evenly and the numbers drift into separate postcodes on a wide screen. */
 .fill{width:100%}
@@ -205,6 +209,25 @@ code{font:11px var(--mono);color:var(--dim)}
   </div>
 
   <div class="card wide">
+    <h2>Sembol bazında kâr/zarar <small id="pnlmeta">hangi sembol ne kazandırdı</small></h2>
+    <div class="scroll"><table id="pnl"></table></div>
+    <div class="gloss">
+      <div><b>gerçekleşen</b> — kapanmış işlemlerden kalan para, komisyon düşülmüş.
+        Bu sayı artık değişmez.</div>
+      <div><b>açık</b> — hâlâ elde tutulan pozisyonun şu anki kâr/zararı. Piyasa
+        ile birlikte oynar ve pozisyon kapanana kadar <i>gerçekleşmez</i>.</div>
+      <div><b>toplam</b> — ikisinin toplamı: bu sembolün hesaba bugüne kadarki
+        net katkısı.</div>
+      <div><b>hesaba etkisi</b> — toplamın, bu koşunun <i>başlangıç equity</i>'sine
+        oranı. Sembolün kendi maliyetine değil, hesabın tamamına göre — "bu
+        sembol hesabımı yüzde kaç oynattı" sorusunun cevabı.</div>
+      <div><b>komisyon</b> — o sembole bugüne kadar ödenen toplam alım-satım
+        ücreti. Gerçekleşen kârdan zaten düşülmüştür; ayrı gösteriliyor çünkü
+        "edge var ama komisyon yiyor" ile "edge yok" farklı teşhisler.</div>
+    </div>
+  </div>
+
+  <div class="card wide">
     <h2>Varlıklar <small>hesapta gerçekten ne var</small></h2>
     <div class="scroll"><table id="balances"></table></div>
     <div class="note">
@@ -309,7 +332,10 @@ function withEngine(url){
 
 async function get(url){ try{ const r = await fetch(withEngine(url)); return r.ok ? await r.json() : null; }catch{ return null; } }
 
-function table(el, cols, rows, render){
+// `foot` is one pre-rendered <tr>. A per-symbol table without a total makes the
+// reader add the column up by eye, and the one number they actually asked for
+// ("so how much did I make?") is the one the page would not say.
+function table(el, cols, rows, render, foot){
   if(!rows || !rows.length){
     el.innerHTML = `<tr><td class="empty">henüz veri yok</td></tr>`; return;
   }
@@ -318,7 +344,27 @@ function table(el, cols, rows, render){
   el.innerHTML = `<thead><tr>${cols.map(c=>
       `<th class="${c.num?'num':''} ${c.cl||''}" ${c.w?`style="width:${c.w}"`:''}`
       + `${c.h?` title="${esc(c.h)}"`:''}>${esc(c.t??c)}</th>`).join('')}</tr></thead>`
-    + `<tbody>${rows.map(render).join('')}</tbody>`;
+    + `<tbody>${rows.map(render).join('')}</tbody>`
+    + (foot ? `<tfoot>${foot}</tfoot>` : '');
+}
+
+/* Money, from one place only.
+
+   R answers "how did this trade do against its own risk"; it deliberately says
+   nothing about size. The operator's question is the other one — what did it
+   cost and what is it worth now — so the two live side by side rather than one
+   replacing the other.
+
+   Fees are subtracted here because they are already paid. The exit fee is not,
+   and is not guessed: an unrealised number that quietly prices a sale nobody
+   has made is the same mistake as `average_price or price` (invariant 60). */
+function money(p, px){
+  const qty = Math.abs(Number(p.quantity)||0);
+  const cost = nz(p.entry) && qty ? p.entry*qty : null;
+  if(!nz(px) || !cost) return {qty, cost, pnl:null, pct:null, value:null};
+  const dir = p.side==='sell' ? -1 : 1;
+  const pnl = dir*(px-p.entry)*qty - (Number(p.fees_paid)||0);
+  return {qty, cost, pnl, pct:pnl/cost, value:px*qty};
 }
 
 /* ---- vocabulary --------------------------------------------------------
@@ -513,6 +559,7 @@ function alerts(s){
   if(s.feed && s.feed.stale)
     out.push(['warn','fiyat akışı bayat','bar-arası kontroller duruyor; motor bar kapanışına düştü — borsadaki stop yerinde']);
   const sl = s.slippage||{};
+
   if(sl.worse_than_assumed)
     out.push(['warn','kayma varsayılandan kötü',
       `medyan ${fmt(sl.median_bps,1)}bps · p90 ${fmt(sl.p90_bps,1)}bps, varsayılan ${fmt(sl.assumed_bps,1)}bps · ${sl.samples} dolum`]);
@@ -558,9 +605,10 @@ async function refresh(){
 
   // One round trip for all of it — sequential awaits made the page update in
   // visible stages, with the tables lagging the header by a second.
-  const [s0, scan0, reasons, trades, eq, ex] = await Promise.all([
+  const [s0, scan0, reasons, trades, eq, ex, pnl0] = await Promise.all([
     get('/api/state'), get('/api/scan'), get('/api/no-trade-reasons'),
     get('/api/trades?limit=25'), get('/api/equity?limit=1500'), get('/api/excursion'),
+    get('/api/pnl'),
   ]);
   const s = s0 || {status:'not_started'};
 
@@ -594,6 +642,24 @@ async function refresh(){
   const delta = base ? s.equity-base : null;
   const pos = s.open_positions||[];
   const sl = s.slippage||{};
+
+  // The engine ships each position's own mark. Holdings are the fallback and
+  // only ever worked on spot, where a long *is* a base balance — a perpetual
+  // holds no base at all, so pricing positions from holdings showed every perp
+  // position, and its profit, as unknown.
+  const price = {};
+  (s.balances||[]).forEach(b=>{ if(nz(b.price)) price[b.coin] = b.price; });
+  const markOf = p => nz(p.price) ? p.price : price[(p.symbol||'').split('/')[0]];
+
+  let openCost = 0, openPnl = 0, openKnown = true;
+  pos.forEach(p=>{
+    const m = money(p, markOf(p));
+    openCost += m.cost||0;
+    if(m.pnl==null) openKnown = false; else openPnl += m.pnl;
+  });
+
+  const pnlTrades = (pnl0&&pnl0.symbols||[]).reduce((t,r)=>t+(r.trades||0), 0);
+  const pnlDone = pnl0 ? Number(pnl0.realised_total)||0 : null;
   $('kpis').innerHTML = [
     ['Equity',   fmt(s.equity), cls(delta), base?`başlangıç ${fmt(base)}`:'',
       'Hesabın toplam değeri: nakit + açık pozisyonların güncel piyasa değeri. Canlıda borsadan okunur.'],
@@ -603,6 +669,15 @@ async function refresh(){
       'Gördüğü en yüksek equity\'den şu ana kadarki geri çekilme. Acının ölçüsü budur, getiri değil.'],
     ['Nakit',    fmt(s.cash), '', base?`equity\'nin ${pct(s.cash/s.equity)}\'i`:'',
       'Pozisyona bağlanmamış, yeni giriş için harcanabilir USDT.'],
+    // Banked and marked, never blended: a run that has given everything back
+    // still shows a healthy realised number, and the open column is where that
+    // shows up. One "profit" figure would hide exactly that case.
+    ['Gerçekleşen', nz(pnlDone)?sign(pnlDone):'—', cls(pnlDone),
+      pnlTrades?`${pnlTrades} kapanmış işlem`:'henüz kapanmış işlem yok',
+      'Kapanmış işlemlerden kalan net para, komisyon düşülmüş. Bu sayı artık değişmez.'],
+    ['Açık K/Z', pos.length?(openKnown?sign(openPnl):'—'):'—', cls(pos.length&&openKnown?openPnl:null),
+      pos.length?`maliyet ${fmt(openCost)}`:'açık pozisyon yok',
+      'Elde tutulan pozisyonların şu anki kâr/zararı. Piyasayla oynar ve pozisyon kapanana kadar gerçekleşmez.'],
     ['Risk çarpanı', fmt(s.risk_multiplier)+'×', s.risk_multiplier<1?'warn':'pos',
       s.risk_multiplier<1?'kısılmış':'tam boyut',
       'Pozisyon boyutu bu çarpanla ölçekleniyor. Zararda bot durmaz, küçülür: çarpan düşer ama asla sıfır olmaz.'],
@@ -620,16 +695,16 @@ async function refresh(){
   ].map(([l,v,k,sub,tip])=>`<div class="kpi"><div class="label"${tip?` title="${esc(tip)}"`:''}>${l}</div>
       <div class="value ${k}">${v}</div><div class="sub">${esc(sub||'')}</div></div>`).join('');
 
-  // Price comes from the holdings read, so open R is the venue's number rather
-  // than the last bar close — the same figure the stop will be judged against.
-  const price = {};
-  (s.balances||[]).forEach(b=>{ if(nz(b.price)) price[b.coin] = b.price; });
-
   table($('positions'),
     [{t:'sembol', h:'Hangi enstrümanda pozisyon açık'},
      {t:'kurulum', h:'Girişi tetikleyen kurulum. Üzerine gelince ne olduğunu anlatır'},
+     {t:'adet', num:1, h:'Elde tutulan miktar'},
      {t:'giriş', num:1, h:'Pozisyona girilen fiyat'},
      {t:'fiyat', num:1, h:'Borsadan okunan anlık fiyat — son bar kapanışı değil'},
+     {t:'maliyet', num:1, h:'Bu pozisyona giren para: giriş fiyatı × adet (USDT)'},
+     {t:'değer', num:1, h:'Şu anki piyasa değeri: anlık fiyat × adet (USDT)'},
+     {t:'K/Z', num:1, h:'Açık kâr/zarar, USDT. Ödenmiş giriş komisyonu düşülmüştür; çıkış komisyonu daha ödenmedi, o yüzden tahmin edilmez'},
+     {t:'K/Z %', num:1, h:'Açık kâr/zararın bu pozisyonun maliyetine oranı'},
      {t:'stop', num:1, h:'Koruyucu stop seviyesi. Borsada duruyor, yani bot kapalıyken de korur'},
      {t:'R şimdi', num:1, h:'Şu anki kâr/zarar, risk birimi cinsinden. 1R = giriş ile ilk stop arası mesafe. +1.05 = risk ettiğinin 1.05 katı kârda'},
      {t:'en iyi', num:1, h:'MFE — pozisyon açıkken görülen en iyi nokta (R). Masada ne kadar kâr durmuştu'},
@@ -639,14 +714,20 @@ async function refresh(){
      {t:'puan', num:1, h:'Girişteki conviction skoru (0-100)'},
      {t:'',cl:'fill'}],
     pos, p=>{
-      const px = price[(p.symbol||'').split('/')[0]];
+      const px = markOf(p);
+      const m = money(p, px);
       const risk = Math.abs(p.entry - p.stop) || null;
       const dir = p.side==='sell' ? -1 : 1;
       const r = nz(px) && risk ? dir*(px-p.entry)/risk : null;
       const toStop = nz(px) && px ? dir*(px-p.stop)/px : null;
       return `<tr><td class="sym">${esc(p.symbol)}</td><td class="dim">${term(SETUP, p.setup)}</td>
+        <td class="num dim">${fmt(m.qty,6)}</td>
         <td class="num">${fmt(p.entry,4)}</td>
         <td class="num">${nz(px)?fmt(px,4):'—'}</td>
+        <td class="num dim">${fmt(m.cost)}</td>
+        <td class="num">${fmt(m.value)}</td>
+        <td class="num ${cls(m.pnl)}">${sign(m.pnl)}</td>
+        <td class="num ${cls(m.pnl)}">${pct(m.pct)}</td>
         <td class="num warn">${fmt(p.stop,4)}</td>
         <td class="num ${cls(r)}">${sign(r)}</td>
         <td class="num pos">${fmt(p.mfe_r)}</td>
@@ -654,7 +735,84 @@ async function refresh(){
         <td class="num dim">${pct(toStop)}</td>
         <td class="num dim">${p.bars_held}</td>
         <td class="num">${fmt(p.conviction,0)}</td><td class="fill"></td></tr>`;
-    });
+    },
+    // One position at a time answers "how is this trade doing". The total
+    // answers "how is the book doing", which is a different question and the
+    // one nobody should have to add up by eye.
+    pos.length ? `<tr><td class="sym">toplam</td><td></td><td></td><td></td><td></td>
+        <td class="num">${fmt(openCost)}</td>
+        <td class="num">${openKnown?fmt(openCost+openPnl):'—'}</td>
+        <td class="num ${cls(openKnown?openPnl:null)}">${openKnown?sign(openPnl):'—'}</td>
+        <td class="num ${cls(openKnown?openPnl:null)}">${openKnown&&openCost?pct(openPnl/openCost):'—'}</td>
+        <td colspan="8"></td></tr>` : '');
+
+  /* Realised and unrealised are kept apart all the way to the total, because
+     they are not the same kind of money: one is banked and will not move
+     again, the other is a mark that the next tick can take back. A single
+     blended "profit" column is how a run that has given everything back still
+     reads as a winner. */
+  const realised = new Map((pnl0&&pnl0.symbols||[]).map(r=>[r.symbol, r]));
+  const openBy = new Map();
+  pos.forEach(p=>{
+    const m = money(p, markOf(p));
+    const cur = openBy.get(p.symbol) || {pnl:0, known:true, cost:0};
+    if(m.pnl==null) cur.known = false; else cur.pnl += m.pnl;
+    cur.cost += m.cost||0;
+    openBy.set(p.symbol, cur);
+  });
+
+  const pnlRows = [...new Set([...realised.keys(), ...openBy.keys()])].map(sym=>{
+    const r = realised.get(sym), o = openBy.get(sym);
+    const rp = r ? Number(r.pnl)||0 : null;
+    const op = o && o.known ? o.pnl : (o ? null : 0);
+    return {
+      symbol: sym,
+      trades: r ? r.trades : 0,
+      wins: r ? r.wins : 0,
+      fees: r ? Number(r.fees)||0 : 0,
+      realised: rp,
+      open: op,
+      // Unknown is not zero. A position whose price could not be read must not
+      // contribute a confident 0 to a total the operator reads as complete.
+      total: (rp==null&&op==null) ? null : (op==null ? null : (rp||0)+op),
+      openCost: o ? o.cost : 0,
+    };
+  }).sort((a,b)=>(b.total??-Infinity)-(a.total??-Infinity));
+
+  const sum = k => pnlRows.reduce((t,r)=>t+(r[k]==null?0:r[k]), 0);
+  const allKnown = pnlRows.every(r=>r.total!=null);
+  const realisedTotal = pnl0 ? Number(pnl0.realised_total)||0 : 0;
+  const grandTotal = realisedTotal + (openKnown?openPnl:0);
+  $('pnlmeta').textContent = pnlRows.length
+    ? `${pnlRows.length} sembol · ${sum('trades')} kapanmış işlem`
+    : 'hangi sembol ne kazandırdı';
+
+  table($('pnl'),
+    [{t:'sembol', h:'Enstrüman'},
+     {t:'işlem', num:1, h:'Bu sembolde kapanmış işlem sayısı. Açık pozisyon buraya sayılmaz'},
+     {t:'isabet', num:1, h:'Kapanmış işlemlerin yüzde kaçı kârda kapandı'},
+     {t:'gerçekleşen', num:1, h:'Kapanmış işlemlerden kalan net para (USDT). Artık değişmez'},
+     {t:'açık', num:1, h:'Hâlâ açık pozisyonun şu anki kâr/zararı (USDT). Kapanana kadar gerçekleşmez'},
+     {t:'toplam', num:1, h:'Gerçekleşen + açık: bu sembolün hesaba net katkısı (USDT)'},
+     {t:'hesaba etkisi', num:1, h:'Toplamın bu koşunun başlangıç equity\'sine oranı — sembolün kendi maliyetine değil'},
+     {t:'komisyon', num:1, h:'Bu sembole ödenen toplam ücret. Gerçekleşenden zaten düşülmüştür'},
+     {t:'',cl:'fill'}],
+    pnlRows, r=>`<tr><td class="sym">${esc(r.symbol)}</td>
+      <td class="num dim">${r.trades||'—'}</td>
+      <td class="num dim">${r.trades?pct(r.wins/r.trades):'—'}</td>
+      <td class="num ${cls(r.realised)}">${r.trades?sign(r.realised):'—'}</td>
+      <td class="num ${cls(r.open)}">${r.openCost?sign(r.open):'—'}</td>
+      <td class="num ${cls(r.total)}">${sign(r.total)}</td>
+      <td class="num ${cls(r.total)}">${base&&r.total!=null?pct(r.total/base):'—'}</td>
+      <td class="num faint">${r.fees?fmt(r.fees):'—'}</td><td class="fill"></td></tr>`,
+    pnlRows.length ? `<tr><td class="sym">toplam</td>
+      <td class="num">${sum('trades')||'—'}</td>
+      <td class="num dim">${sum('trades')?pct(sum('wins')/sum('trades')):'—'}</td>
+      <td class="num ${cls(realisedTotal)}">${sum('trades')?sign(realisedTotal):'—'}</td>
+      <td class="num ${cls(openKnown?openPnl:null)}">${pos.length?(openKnown?sign(openPnl):'—'):'—'}</td>
+      <td class="num ${cls(allKnown&&openKnown?grandTotal:null)}">${allKnown&&openKnown?sign(grandTotal):'—'}</td>
+      <td class="num ${cls(allKnown&&openKnown?grandTotal:null)}">${base&&allKnown&&openKnown?pct(grandTotal/base):'—'}</td>
+      <td class="num faint">${sum('fees')?fmt(sum('fees')):'—'}</td><td class="fill"></td></tr>` : '');
 
   // Three columns, not one. Showing only "free" would report a position that
   // is correctly protected — its stop reserves the base asset — as no position.

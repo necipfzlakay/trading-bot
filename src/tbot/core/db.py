@@ -450,6 +450,34 @@ class Database:
             )
         ]
 
+    def realised_by_symbol(self) -> list[dict[str, Any]]:
+        """Closed-trade money, per symbol. "Which of these actually paid?"
+
+        ``pnl`` is already net of fees where the engine recorded them, so
+        ``fees`` comes back alongside rather than subtracted twice — it answers
+        a different question ("what did the round trip cost?") and the panel
+        shows both.
+
+        Deliberately every trade, not a recent window: a symbol's contribution
+        is the sum of its life, and a rolling cut would let a loser drop out of
+        the table by simply not trading lately.
+        """
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                """SELECT symbol,
+                          COUNT(*)                                   AS trades,
+                          SUM(pnl)                                   AS pnl,
+                          SUM(fees)                                  AS fees,
+                          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
+                          SUM(r_multiple)                            AS r_total,
+                          MAX(exit_ts)                               AS last_exit_ts
+                     FROM trades
+                    GROUP BY symbol
+                    ORDER BY SUM(pnl) DESC"""
+            )
+        ]
+
     # -- equity, convictions, scans ---------------------------------------
 
     def record_equity(self, point: EquityPoint) -> None:

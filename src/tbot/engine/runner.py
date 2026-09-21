@@ -2557,22 +2557,42 @@ class Runner:
         )
 
     def _positions_view(self) -> list[dict]:
-        """What the dashboard and ``bot.sh status`` read as "open positions"."""
-        return [
-            {
-                "symbol": p.symbol,
-                "side": p.side.value,
-                "quantity": p.quantity,
-                "entry": p.entry_price,
-                "stop": p.current_stop,
-                "setup": p.setup,
-                "bars_held": p.bars_held,
-                "mfe_r": round(p.mfe_r, 2),
-                "mae_r": round(p.mae_r, 2),
-                "conviction": p.conviction_at_entry,
-            }
-            for p in self.portfolio.positions.values()
-        ]
+        """What the dashboard and ``bot.sh status`` read as "open positions".
+
+        ``price`` travels with the row rather than being looked up from the
+        holdings table. On spot the two agree, because a long *is* a base
+        balance; on a perpetual there is no base balance at all — the account
+        holds only quote — so a panel that priced positions from holdings
+        showed every perp position at an unknown price and, with it, an unknown
+        profit. ``_mark_for`` answers for both, and prefers the feed it already
+        has over a network call.
+
+        ``quantity`` and ``fees_paid`` are what turn R into money: cost is
+        ``entry × quantity``, and a round trip that ignores the fee reports a
+        profit nobody received.
+        """
+        rows = []
+        for p in self.portfolio.positions.values():
+            mark = self._mark_for(p.symbol)
+            rows.append(
+                {
+                    "symbol": p.symbol,
+                    "side": p.side.value,
+                    "quantity": p.quantity,
+                    "entry": p.entry_price,
+                    "stop": p.current_stop,
+                    "setup": p.setup,
+                    "bars_held": p.bars_held,
+                    "mfe_r": round(p.mfe_r, 2),
+                    "mae_r": round(p.mae_r, 2),
+                    "conviction": p.conviction_at_entry,
+                    # None, not zero: an unknown price must not read as a
+                    # position that is worth nothing (same rule as holdings).
+                    "price": round(mark, 8) if mark else None,
+                    "fees_paid": round(p.fees_paid, 6),
+                }
+            )
+        return rows
 
     def _balances_view(self) -> list[dict]:
         """Every currency the account holds, valued in the quote currency.
