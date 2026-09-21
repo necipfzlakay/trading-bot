@@ -255,6 +255,20 @@ except Exception as exc:
     print(f"  {BAD} {exc}")
     raise SystemExit(1)
 
+# Several perp engines on one account must share a claim table, or one-way
+# mode nets their positions per symbol. Checked here so a misconfigured engine
+# fails once, before launchd starts retrying it every 30 seconds.
+from tbot.engine.siblings import assert_claims_consistent, sibling_configs
+try:
+    assert_claims_consistent(cfg)
+    peers = [s for s in sibling_configs(cfg) if s.execution.market_type == "linear"]
+    if cfg.execution.market_type == "linear" and peers:
+        names = ", ".join(s.engine.namespace for s in peers)
+        print(f"  {GOOD} symbol claims shared with: {names}")
+except Exception as exc:
+    print(f"  {BAD} {exc}")
+    raise SystemExit(1)
+
 symbols = universe(cfg)
 if symbols:
     print(f"  {GOOD} universe: {len(symbols)} symbols")
@@ -262,11 +276,19 @@ else:
     print(f"  {BAD} universe is empty — run scripts/backfill.py --refresh-universe")
     fail = 1
 
-blocks, _sel, _decay = indicator_selection(cfg)
-if blocks:
-    print(f"  {GOOD} indicator selection: {len(set(blocks.values()))} voting blocks")
+if cfg.engine.kind == "scalp":
+    # The one-minute loop decides from price alone (tbot.scalp.signal); the
+    # indicator study is the bar engine's, and a warning about it here would be
+    # one no action could clear.
+    s = cfg.scalp
+    print(f"  {GOOD} scalp: {', '.join(s.arms)} · TP {s.take_profit_pct:.2%} / "
+          f"SL {s.stop_loss_pct:.2%} · kill at {s.kill_equity:.0f}")
 else:
-    print(f"  {WARN} no indicator selection — every indicator votes separately")
+    blocks, _sel, _decay = indicator_selection(cfg)
+    if blocks:
+        print(f"  {GOOD} indicator selection: {len(set(blocks.values()))} voting blocks")
+    else:
+        print(f"  {WARN} no indicator selection — every indicator votes separately")
 
 # Building the broker is the real connectivity test: for demo and live it
 # authenticates, loads markets and reads fees. A withdrawal-capable key is

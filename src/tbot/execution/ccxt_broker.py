@@ -72,6 +72,11 @@ def _order_state(raw: dict) -> dict[str, float | str]:
         # Raw, in whatever currency the venue charged it — see ``_fee_in_quote``.
         "fee": _number(raw, "cumExecFee"),
         "side": str(raw.get("side") or ""),
+        # Why it ended, in the venue's words. "EC_PostOnlyWillTakeLiquidity" and
+        # a TTL cancel are both "no fill", and they are different findings: the
+        # first says the book moved away before the order could rest.
+        "reason": str(raw.get("rejectReason") or "").replace("EC_NoError", "")
+        or str(raw.get("cancelType") or "").replace("UNKNOWN", ""),
         # Bybit spells a cancelled conditional order "Deactivated"; treating
         # that as a fill would invent an exit that never happened.
         "terminal": status
@@ -1199,6 +1204,157 @@ class PerpBroker(CCXTBroker):
             for order in super().fetch_open_orders(symbol)
             if not self._is_position_protection(order)
         ]
+
+    # -- maker entries (scalp engine) --------------------------------------
+
+    def best_bid_ask(self, symbol: str) -> tuple[float, float] | None:
+        """Top of book, read at the moment of placing — never from a cache."""
+        try:
+            rows = self.exchange.publicGetV5MarketTickers(
+                {"category": self.category, "symbol": self._venue_symbol(symbol)}
+            )["result"]["list"]
+            bid, ask = float(rows[0]["bid1Price"]), float(rows[0]["ask1Price"])
+        except (ccxt.BaseError, KeyError, IndexError, TypeError, ValueError) as exc:
+            log.warning("book_read_failed", symbol=symbol, error=str(exc)[:120])
+            return None
+        return (bid, ask) if 0 < bid < ask else None
+
+    def place_maker_entry(
+        self,
+        order: Order,
+        take_profit: float,
+        stop_loss: float,
+    ) -> Order:
+        """A PostOnly limit entry carrying its own stop and target.
+
+        One call, measured on the demo account (research/scalp_venue_facts.md):
+        the venue accepts the entry with a market stop and a limit target
+        attached, arms both only on fill, and removes both when the position
+        closes. So the position is protected by the venue from the instant it
+        exists, whether or not this process is alive (invariant 12), and there
+        is no window between a fill and a stop placement.
+
+        Direct v5, not ``create_order``: audit #72 is what ccxt's parameter
+        translation cost the last time an order shape mattered this much.
+
+        A PostOnly that would cross the book is accepted and then cancelled by
+        the venue (``EC_PostOnlyWillTakeLiquidity``); that arrives here as an
+        accepted order and is discovered as "no fill" when its state is read.
+        """
+        self.load_markets()
+        symbol = order.symbol
+        spec = self.market_spec(symbol)
+        amount = float(self.exchange.amount_to_precision(symbol, order.quantity))
+        if amount < spec.min_amount:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = f"amount {amount} below minimum {spec.min_amount}"
+            return order
+        price = self.exchange.price_to_precision(symbol, order.price)
+        target = self.exchange.price_to_precision(symbol, take_profit)
+        try:
+            response = self.exchange.privatePostV5OrderCreate(
+                {
+                    "category": self.category,
+                    "symbol": self._venue_symbol(symbol),
+                    "side": "Buy" if order.side is Side.BUY else "Sell",
+                    "orderType": "Limit",
+                    "qty": self.exchange.amount_to_precision(symbol, amount),
+                    "price": price,
+                    "timeInForce": "PostOnly",
+                    "orderLinkId": order.client_id,
+                    "positionIdx": 0,
+                    "tpslMode": "Partial",
+                    "takeProfit": target,
+                    "tpOrderType": "Limit",
+                    "tpLimitPrice": target,
+                    "stopLoss": self.exchange.price_to_precision(symbol, stop_loss),
+                    "slOrderType": "Market",
+                    "tpTriggerBy": "LastPrice",
+                    "slTriggerBy": "LastPrice",
+                }
+            )
+        except ccxt.BaseError as exc:
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = str(exc)[:200]
+            log.warning("maker_entry_rejected", symbol=symbol, error=str(exc)[:160])
+            return order
+        order.exchange_id = str((response.get("result") or {}).get("orderId") or "")
+        order.quantity = amount
+        order.price = float(price)
+        order.status = OrderStatus.OPEN
+        return order
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Ask the venue to cancel. The answer is *not* confirmation (invariant 41)."""
+        try:
+            self.exchange.privatePostV5OrderCancel(
+                {
+                    "category": self.category,
+                    "symbol": self._venue_symbol(symbol),
+                    "orderId": order_id,
+                }
+            )
+            return True
+        except ccxt.BaseError as exc:
+            # "order not exists or too late to cancel" means it already filled
+            # or was already cancelled — the caller reads the state to find out.
+            log.info("cancel_refused", symbol=symbol, order_id=order_id, error=str(exc)[:120])
+            return False
+
+    # What the venue reports for the legs it owns. Partial* are the attached
+    # legs of an order placed with ``tpslMode=Partial`` (measured: scalp probe).
+    _TAKE_PROFIT_KINDS = ("TakeProfit", "PartialTakeProfit")
+    _STOP_KINDS = ("StopLoss", "PartialStopLoss", "TrailingStop")
+
+    def recent_reduce_fill(
+        self, symbol: str, since_ms: int, closing_side: Side
+    ) -> dict[str, float | str] | None:
+        """The fill with which the venue closed this position on its own.
+
+        On spot the protective stop is a real order and ``order_state`` finds it
+        by id. On a perpetual the stop and the target are properties of the
+        position — ``place_stop`` returns ``position:<symbol>``, which is not an
+        order id — so that lookup found nothing, and ``_detect_venue_exits``
+        could never recognise a perp exit as one. It reported
+        ``position_inventory_missing`` at best; at worst the engine's own
+        between-bar check got there first, sent a reduce-only close into a
+        position that was already flat, was refused ``110017``, and the refusal
+        was then booked as a fill. Measured on H17's first trade: the venue took
+        profit at 114.34, the engine recorded a sale that never happened.
+
+        Newest reduce-only fill on the closing side since ``since_ms``. The
+        result carries ``kind`` so the caller can tell a target from a stop.
+        """
+        try:
+            response = self.exchange.privateGetV5OrderHistory(
+                {"category": self.category, "symbol": self._venue_symbol(symbol), "limit": 20}
+            )
+        except ccxt.BaseError as exc:
+            log.warning("exit_fill_lookup_failed", symbol=symbol, error=str(exc)[:120])
+            return None
+
+        wanted = "Buy" if closing_side is Side.BUY else "Sell"
+        for raw in (response.get("result") or {}).get("list") or []:
+            if str(raw.get("side") or "") != wanted:
+                continue
+            if not raw.get("reduceOnly") and not raw.get("stopOrderType"):
+                continue
+            if int(raw.get("updatedTime") or 0) < since_ms:
+                continue
+            state = _order_state(raw)
+            if not state["filled_terminal"] or float(state["filled"]) <= 0.0:
+                continue
+            kind = str(raw.get("stopOrderType") or "")
+            state["kind"] = (
+                "take_profit"
+                if kind in self._TAKE_PROFIT_KINDS
+                else "stop"
+                if kind in self._STOP_KINDS
+                else "order"
+            )
+            state["ts"] = int(raw.get("updatedTime") or 0)
+            return state
+        return None
 
     @staticmethod
     def _is_position_protection(order: Order) -> bool:

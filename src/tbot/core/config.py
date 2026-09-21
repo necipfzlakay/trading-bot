@@ -597,17 +597,71 @@ class EngineConfig(StrictModel):
     # two characters of it ride in every client order id under a 36-character
     # ceiling.
     namespace: str = Field(default="", max_length=8, pattern=r"^[a-z0-9]*$")
+    # Which loop runs this engine. ``bar`` is the Runner: closed bars on the
+    # configured timeframes, the conviction engine, one decision per symbol per
+    # bar. ``scalp`` is the one-minute maker loop in ``tbot.scalp`` — measured,
+    # the Runner needs ~3.5 minutes to process one bar over 79 symbols, so it
+    # cannot carry a one-minute strategy at all.
+    kind: Literal["bar", "scalp"] = "bar"
     loop_interval_seconds: float = Field(default=5.0, gt=0, le=300)
     # Restart storm detection: beyond this, drop to safe mode instead of thrashing.
     max_restarts_per_hour: int = Field(default=10, ge=1)
     stale_data_tolerance_bars: float = Field(default=2.0, ge=0.5)
     reconcile_on_start: bool = True
     state_snapshot_seconds: int = Field(default=30, ge=1)
+    # Perpetual engines sharing one account must agree on who owns each symbol:
+    # one-way mode holds a single position per symbol, and two engines opening
+    # the same one are netted by the venue into a position neither ordered.
+    # The first to open a symbol claims it until it is flat; the others skip it
+    # meanwhile (``engine.claims``). Refused at startup if any perp engine on
+    # the account leaves it off (``engine.siblings.assert_claims_consistent``).
+    symbol_claims: bool = False
+    claims_path: Path = Path("runtime-shared/claims.sqlite")
 
 
 # --------------------------------------------------------------------------
 # Root config
 # --------------------------------------------------------------------------
+
+
+class ScalpConfig(StrictModel):
+    """The one-minute maker scalper (H18). Every number here is pre-registered.
+
+    Measured before it was built (Bybit perp, 6 symbols x 7 days of 1m bars):
+    the median one-minute move is 0.026-0.070% against a 0.07% maker/taker round
+    trip, and every barrier configuration tested lost about the cost of a trade.
+    The expected result is therefore negative, and these levels are the
+    hypothesis under test — not settings to be tuned against the result.
+    """
+
+    # Trigger: the move over ``trigger_bars`` closed bars exceeds
+    # ``trigger_sigma`` standard deviations of the last ``sigma_window`` one-bar
+    # returns, scaled by sqrt(trigger_bars).
+    trigger_bars: int = Field(default=5, ge=2, le=60)
+    sigma_window: int = Field(default=60, ge=20, le=1440)
+    trigger_sigma: float = Field(default=2.5, gt=0, le=10)
+    # Each trigger goes to exactly one arm, by hash(symbol, bar): the same event
+    # population split independently of its outcome. Momentum enters with the
+    # move, reversion against it; on the same trigger they want opposite sides,
+    # so they could never share a symbol anyway.
+    arms: list[Literal["momentum", "reversion"]] = Field(
+        default_factory=lambda: ["momentum", "reversion"], min_length=1
+    )
+    take_profit_pct: float = Field(default=0.003, gt=0, le=0.05)
+    stop_loss_pct: float = Field(default=0.003, gt=0, le=0.05)
+    time_stop_bars: int = Field(default=15, ge=1, le=240)
+    # A PostOnly entry that has not filled in this long is cancelled, the cancel
+    # confirmed (invariant 41), and the symbol's claim released.
+    entry_ttl_seconds: float = Field(default=20.0, ge=2, le=300)
+    # How often open positions and resting orders are read from the venue.
+    poll_seconds: float = Field(default=3.0, ge=1, le=60)
+    # Safety valves. Capacity, not a target: the trigger decides the real rate.
+    max_orders_per_minute: int = Field(default=20, ge=1, le=120)
+    max_entries_per_minute: int = Field(default=10, ge=1, le=60)
+    reject_streak_limit: int = Field(default=5, ge=1, le=50)
+    cooldown_seconds: int = Field(default=600, ge=0, le=86_400)
+    # Pre-registered kill: at or below this equity no new entry is opened.
+    kill_equity: float = Field(default=500.0, ge=0)
 
 
 class Config(BaseModel):
@@ -641,6 +695,7 @@ class Config(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
+    scalp: ScalpConfig = Field(default_factory=ScalpConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     runtime_dir: Path = Path("runtime")
@@ -654,6 +709,26 @@ class Config(BaseModel):
             # Allowed, but only meaningful once the gate passes — recorded here
             # so the engine can log the distinction clearly.
             pass
+        if self.engine.kind == "scalp":
+            # The scalper only makes sense on the venue it was measured on, and
+            # it shares that venue with another perp engine.
+            if self.execution.market_type != "linear":
+                raise ValueError("engine.kind: scalp trades linear perpetuals only")
+            if not self.engine.symbol_claims:
+                raise ValueError("engine.kind: scalp requires engine.symbol_claims: true")
+            if self.risk.max_capital <= 0:
+                raise ValueError("engine.kind: scalp requires risk.max_capital (its allocation)")
+            if self.scalp.kill_equity >= self.risk.max_capital:
+                raise ValueError("scalp.kill_equity must sit below risk.max_capital")
+        if self.engine.symbol_claims and self.entries.armed_breakout:
+            # An armed entry rests at the venue and fills on its own, without
+            # passing through the path that claims a symbol first — so it could
+            # open into a symbol another engine holds, and one-way mode would
+            # net the two. Refused rather than half-supported.
+            raise ValueError(
+                "entries.armed_breakout cannot be combined with engine.symbol_claims: "
+                "armed entries fill without claiming their symbol"
+            )
         if self.conviction.collapse_threshold >= self.conviction.absolute_floor:
             raise ValueError(
                 "conviction.collapse_threshold must sit below absolute_floor, "
@@ -733,6 +808,8 @@ def load_config(
         cfg.runtime_dir = PROJECT_ROOT / cfg.runtime_dir
     if not cfg.data.parquet_dir.is_absolute():
         cfg.data.parquet_dir = PROJECT_ROOT / cfg.data.parquet_dir
+    if not cfg.engine.claims_path.is_absolute():
+        cfg.engine.claims_path = PROJECT_ROOT / cfg.engine.claims_path
     return cfg
 
 

@@ -1515,3 +1515,161 @@ def test_an_unreadable_turnover_is_not_a_thin_book():
     runner._microstructure = {"BTC/USDT": {"turnover_24h": 0.0}}
 
     runner._check_universe_liquidity()
+
+
+# --------------------------------------------------------------------------
+# Audit #81/#82: a refused exit, and an engine racing the venue's own legs
+# --------------------------------------------------------------------------
+
+
+def _exit_fixture(*, venue_holds: float, venue_fill: dict | None, submit_status: str):
+    """A perp runner holding one long, whose exit order the venue answers with
+    ``submit_status``, and whose position list reports ``venue_holds``."""
+    from tbot.core.config import Config
+    from tbot.core.models import Order, OrderStatus, OrderType, Position, Venue
+    from tbot.engine.runner import Runner
+    from tbot.execution.ccxt_broker import PerpBroker
+    from tbot.risk.budget import RiskBudget
+
+    events: list[str] = []
+    fills: list = []
+    trades: list = []
+    placed_stops: list = []
+
+    broker = PerpBroker.__new__(PerpBroker)
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker._markets_loaded = True
+    broker._specs = {"SOL/USDT:USDT": SPEC}
+    broker.market_spec = lambda _s: SPEC
+
+    def build_order(**kw):
+        return Order(
+            client_id="tbfa-sol-exit-x", symbol=kw["symbol"], side=kw["side"],
+            type=OrderType.MARKET, quantity=kw["quantity"], price=None,
+            created_ts=0, updated_ts=0, reduce_only=True,
+        )
+
+    def submit(order):
+        order.status = OrderStatus(submit_status)
+        if submit_status == "rejected":
+            order.reject_reason = "110017 current position is zero"
+        else:
+            order.average_price, order.filled_quantity, order.fee_paid = 114.0, 1.0, 0.07
+        return order
+
+    broker.build_order = build_order
+    broker.submit = submit
+    broker.fetch_positions = lambda: {"SOL/USDT:USDT": venue_holds} if venue_holds else {}
+    broker.recent_reduce_fill = lambda _s, _since, _side: venue_fill
+    broker.cancel_stop = lambda _s, _o: True
+    broker.place_stop = lambda *a: placed_stops.append(a) or "position:SOLUSDT"
+    broker.place_take_profit = lambda *_a: True
+
+    class Database:
+        def upsert_order(self, _o): pass
+        def record_fill(self, f): fills.append(f)
+        def record_trade(self, t): trades.append(t)
+        def record_event(self, name, *_a, **_k): events.append(name)
+        def delete_position(self, _s): pass
+        def upsert_position(self, _p): pass
+
+    config = Config()
+    runner = Runner.__new__(Runner)
+    runner.config = config
+    runner.broker = broker
+    runner.db = Database()
+    runner.notifier = None
+    runner.portfolio = Portfolio(starting_cash=300.0)
+    runner.risk = RiskBudget(config.risk)
+    runner.watchdog = type("W", (), {"call": lambda self, _n, fn, default=None: fn()})()
+    from tbot.engine.state import EngineState
+
+    runner.state = EngineState()
+    runner.writer = type("S", (), {"write": lambda self, _s: None})()
+    runner._marks = {}
+    runner.feed = None
+    runner.claims = None
+    from tbot.strategy.exits import ExitManager
+
+    runner.exits = ExitManager(config.exits)
+    runner.portfolio.positions["SOL/USDT:USDT"] = Position(
+        symbol="SOL/USDT:USDT", side=Side.BUY, quantity=1.0, entry_price=112.58,
+        entry_ts=0, initial_stop=110.11, current_stop=110.11,
+        setup="momentum_continuation", risk_amount=2.47,
+    )
+    pos = runner.portfolio.positions["SOL/USDT:USDT"]
+    pos.meta.update({"stop_order_id": "position:SOLUSDT", "tp_price": 114.33, "opened_ms": 1})
+    return runner, events, fills, trades, placed_stops
+
+
+def test_a_refused_exit_on_a_live_position_keeps_it_and_restores_the_stop():
+    """The exit path cancelled the stop, sent the close, and booked it — refused or not.
+
+    On spot the stop has to be cancelled first, because it locks the asset the
+    exit sells. So a refused exit used to leave a real holding with no stop at
+    the venue and no entry in the book: unprotected, and forgotten.
+    """
+    from tbot.core.models import ExitReason
+
+    runner, events, fills, trades, placed = _exit_fixture(
+        venue_holds=1.0, venue_fill=None, submit_status="rejected"
+    )
+    runner._close("SOL/USDT:USDT", 114.0, 1_000, ExitReason.TIME_STOP)
+
+    assert "SOL/USDT:USDT" in runner.portfolio.positions  # still held, still ours
+    assert fills == [] and trades == []  # nothing that did not happen was booked
+    assert events == ["exit_not_executed"]
+    assert len(placed) == 1  # the stop cancelled for this exit is back
+
+
+def test_a_refused_exit_the_venue_already_performed_books_the_venues_fill():
+    """H17's first trade: the venue took profit at 114.34, the engine's close
+    was refused ``110017`` a minute later, and the refusal became a fill at
+    114.33 with no fee. The trade must carry the venue's terms, not ours."""
+    from tbot.core.models import ExitReason
+
+    venue_fill = {
+        "filled_terminal": True, "filled": 1.0, "average_price": 114.34,
+        "fee": 0.0686, "kind": "take_profit",
+    }
+    runner, _events, fills, trades, _placed = _exit_fixture(
+        venue_holds=0.0, venue_fill=venue_fill, submit_status="rejected"
+    )
+    runner._close("SOL/USDT:USDT", 114.33, 1_000, ExitReason.TAKE_PROFIT)
+
+    assert "SOL/USDT:USDT" not in runner.portfolio.positions
+    assert fills == []  # the refused order produced no fill
+    (trade,) = trades
+    assert trade.exit_price == pytest.approx(114.34)
+    assert trade.exit_reason is ExitReason.TAKE_PROFIT
+    assert trade.fees == pytest.approx(trade.fees)  # recorded, not assumed
+    assert trade.pnl == pytest.approx((114.34 - 112.58) - 0.0686 - 0.0, abs=0.1)
+
+
+def test_a_perp_level_the_venue_holds_is_left_to_the_venue():
+    """Reaching the target between bars must not send a second close.
+
+    The venue owns that exit (invariant 56). Asking it — rather than racing it
+    — is what books the real fill instead of a refusal.
+    """
+    from tbot.core.models import ExitReason
+
+    runner, _e, _f, trades, _p = _exit_fixture(
+        venue_holds=1.0, venue_fill=None, submit_status="filled"
+    )
+    position = runner.portfolio.positions["SOL/USDT:USDT"]
+    sent: list = []
+    runner.broker.submit = lambda order: sent.append(order) or order
+
+    assert runner._venue_holds_level(position, ExitReason.TAKE_PROFIT) is True
+    runner._confirm_venue_exit("SOL/USDT:USDT")  # venue still holds: nothing to book
+    assert sent == [] and trades == []
+
+    # A stop the engine trailed but could not sync is *not* held by the venue,
+    # and acting ourselves is then exactly right (invariant 67).
+    position.current_stop = 111.5
+    position.meta["stop_at_venue"] = 110.11
+    assert runner._venue_holds_level(position, ExitReason.TRAILING_STOP) is False
+    position.meta["stop_at_venue"] = 111.5
+    assert runner._venue_holds_level(position, ExitReason.TRAILING_STOP) is True

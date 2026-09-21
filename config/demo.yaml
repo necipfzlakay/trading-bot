@@ -3,3 +3,10 @@
 extends: base.yaml
 mode: live
 venue: bybit-demo
+
+risk:
+  # Aynı demo hesapta üç motor var ve her birinin kendi $1000'i var (operatör,
+  # 2026-09-21 sıfırlaması). Tavan motorun ilk tahsisi; sonrasında kendi
+  # equity'sinden devam eder, kârı da zararı da kendisinindir
+  # (engine/siblings.own_starting_cash).
+  max_capital: 1000.0

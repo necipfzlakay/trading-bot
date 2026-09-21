@@ -61,7 +61,9 @@ from tbot.data.backfill import Backfiller, BybitFetcher
 from tbot.data.feed import MarketFeed
 from tbot.data.integrity import MIN_BARS_BY_TIMEFRAME
 from tbot.data.store import ParquetStore
-from tbot.engine.portfolio import Portfolio
+from tbot.engine.claims import SymbolClaims
+from tbot.engine.portfolio import Portfolio, restore_position
+from tbot.engine.siblings import own_starting_cash, sibling_reservation
 from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.engine.watchdog import Watchdog
 from tbot.execution.broker import Broker, client_order_id
@@ -153,6 +155,9 @@ class Runner:
     # them. Remembered so the warning fires on a change rather than every
     # bar — a channel that repeats hourly is one nobody reads.
     _thin_symbols: dict = field(default_factory=dict)
+    # Which perpetual symbols this engine owns on a shared account. None when
+    # the engine does not take part (spot, or a perp engine trading alone).
+    claims: SymbolClaims | None = None
     # The one armed entry order, if any: {"symbol", "order_id", "client_id",
     # "trigger", "bar_ts", "stop", "quantity", "setup", "conviction", "regime",
     # "risk_amount"}. At most one — see EntryConfig.armed_max_orders.
@@ -182,6 +187,10 @@ class Runner:
         self.writer = StateWriter(self.config.state_path)
         self.fetcher = BybitFetcher(self.config.data.rest_rate_limit_ms)
         self.slippage = SlippageTracker(assumed_bps=self.config.execution.slippage_bps)
+        if self.config.engine.symbol_claims:
+            self.claims = SymbolClaims(
+                self.config.engine.claims_path, self.config.engine.namespace
+            )
 
         gate = LeverageGate(self.config.promotion_path)
         allowed = gate.allowed_leverage(self.config.risk.max_leverage)
@@ -249,6 +258,7 @@ class Runner:
 
         if self.config.engine.reconcile_on_start:
             self._reconcile()
+        self._sync_claims()
 
         balance = self._equity_now()
         # Invariant 19: the balance comes from the venue, never from config.
@@ -267,15 +277,25 @@ class Runner:
         # allocation — which is also the only equity curve that means anything
         # when judging its hypothesis.
         cap = self.config.risk.max_capital
-        if cap > 0 and balance > cap:
-            log.info(
-                "capital_capped",
-                venue_balance=round(balance, 2),
-                cap=cap,
-                reason="this engine shares the account and sizes against its own allocation",
-            )
-            balance = cap
-        self.portfolio.seed_from_venue(balance)
+        reserved, breakdown = (0.0, {}) if cap > 0 else sibling_reservation(self.config)
+        last_equity = (self.writer.read() or {}).get("equity")
+        cash = own_starting_cash(
+            venue_free=balance,
+            positions_value=self.portfolio.equity({}) - self.portfolio.cash,
+            cap=cap,
+            last_equity=float(last_equity) if last_equity else None,
+            reserved_for_siblings=reserved,
+        )
+        log.info(
+            "capital_seeded",
+            basis="capped allocation" if cap > 0 else "residual after siblings",
+            venue_free=round(balance, 2),
+            cash=round(cash, 2),
+            cap=cap or None,
+            last_equity=round(float(last_equity), 2) if last_equity else None,
+            reserved_for_siblings=breakdown or None,
+        )
+        self.portfolio.seed_from_venue(cash)
         balance = self.portfolio.equity({})
         self._check_balance_against_last_run(balance)
         self.risk.update_equity(balance)
@@ -486,6 +506,7 @@ class Runner:
         # has to know about.
         self._resolve_armed(bar_ts)
         self._manage_positions(frames, bar_ts)
+        self._sweep_claims()
         self._refresh_microstructure(list(frames))
         self._check_universe_liquidity()
         scans = self._scan(frames, bar_ts)
@@ -909,6 +930,16 @@ class Runner:
                 self._maybe_scale_out(position, quote.high, quote.low, forming_bar)
                 continue
 
+            if self._venue_holds_level(position, decision.reason):
+                # The venue owns this exit and will execute it itself. Sending
+                # our own close as well is a race the engine loses by
+                # construction: measured on H17's first trade, the venue took
+                # profit at 114.34, the engine's reduce-only close arrived 57s
+                # later into a flat position and was refused ``110017`` — and
+                # the refusal was then booked as a fill. Ask the venue instead.
+                self._confirm_venue_exit(symbol)
+                continue
+
             log.info(
                 "intrabar_exit",
                 symbol=symbol,
@@ -919,6 +950,42 @@ class Runner:
                 "reached the same decision up to one bar later",
             )
             self._close(symbol, decision.exit_price or quote.last, forming_bar, decision.reason)
+            self.state.open_positions = self._positions_view()
+            self.writer.write(self.state)
+
+    def _venue_holds_level(self, position, reason: ExitReason | None) -> bool:
+        """Whether the level just reached is one the venue will act on itself.
+
+        Only perpetuals hold a target at the venue (invariant 56). The stop
+        counts as held only when the venue has *confirmed* the current level —
+        a stop the engine trailed but could not sync is exactly the case where
+        acting ourselves is the right thing to do (invariant 67).
+        """
+        if not isinstance(self.broker, PerpBroker):
+            return False
+        if reason is ExitReason.TAKE_PROFIT:
+            return bool(position.meta.get("tp_price"))
+        if reason in (ExitReason.INITIAL_STOP, ExitReason.TRAILING_STOP):
+            confirmed = position.meta.get("stop_at_venue")
+            return confirmed is not None and abs(float(confirmed) - position.current_stop) < 1e-9
+        return False
+
+    def _confirm_venue_exit(self, symbol: str) -> None:
+        """A venue-held level was reached: book the venue's fill once it exists.
+
+        One reading suffices here, unlike ``_detect_venue_exits``: price has
+        independently crossed the level, and the booking needs the venue's own
+        closing fill, so a lagging balance alone can never invent an exit.
+        """
+        position = self.portfolio.positions.get(symbol)
+        if position is None:
+            return
+        held = self.watchdog.call("fetch_positions", self.broker.fetch_positions)
+        if held is None or float(held.get(symbol, 0.0)) >= position.quantity * 0.05:
+            return  # still open, or unreadable: the venue has not acted yet
+        state = self._venue_exit_state(symbol, position)
+        if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
+            self._close_from_venue_state(symbol, position, state)
             self.state.open_positions = self._positions_view()
             self.writer.write(self.state)
 
@@ -958,23 +1025,10 @@ class Runner:
                 continue
 
             order_id = position.meta.get("stop_order_id")
-            state = (
-                self.broker.order_state(symbol, str(order_id))
-                if order_id and isinstance(self.broker, CCXTBroker)
-                else None
-            )
+            state = self._venue_exit_state(symbol, position)
 
             if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
-                fill_price = float(state.get("average_price") or 0.0) or position.current_stop
-                log.info(
-                    "venue_stop_filled",
-                    symbol=symbol,
-                    price=fill_price,
-                    quantity=state.get("filled"),
-                    note="detected between bars; the position is closed locally "
-                    "at the price the venue actually got",
-                )
-                self._close_from_venue_fill(symbol, fill_price)
+                self._close_from_venue_state(symbol, position, state)
                 self._missing_inventory.pop(symbol, None)
                 continue
 
@@ -1003,7 +1057,63 @@ class Runner:
                         f"venue shows {remaining:g}, and no stop of ours accounts for it.",
                     )
 
-    def _close_from_venue_fill(self, symbol: str, price: float) -> None:
+    def _venue_exit_state(self, symbol: str, position) -> dict | None:
+        """The venue's own closing fill for this position, if there is one.
+
+        Spot's protective stop is a real order, found by its id. A perpetual's
+        stop and target belong to the position and have no id of their own, so
+        the closing fill is looked up in the order history instead — which is
+        the only way a perp exit the venue performed can be recognised at all.
+        """
+        if isinstance(self.broker, PerpBroker):
+            since = int(position.meta.get("opened_ms") or position.entry_ts or 0)
+            return self.broker.recent_reduce_fill(symbol, since, position.side.opposite)
+        order_id = position.meta.get("stop_order_id")
+        if order_id and isinstance(self.broker, CCXTBroker):
+            return self.broker.order_state(symbol, str(order_id))
+        return None
+
+    def _close_from_venue_state(self, symbol: str, position, state: dict) -> None:
+        """Book a venue-performed exit on the terms the venue reports."""
+        fill_price = float(state.get("average_price") or 0.0) or position.current_stop
+        reason = ExitReason.TAKE_PROFIT if state.get("kind") == "take_profit" else None
+        log.info(
+            "venue_exit_filled",
+            symbol=symbol,
+            price=fill_price,
+            quantity=state.get("filled"),
+            kind=state.get("kind") or "stop",
+            note="the venue closed this on its own; booked at the price it got",
+        )
+        self._close_from_venue_fill(
+            symbol,
+            fill_price,
+            fee=self._venue_fee(symbol, state, fill_price),
+            reason=reason,
+        )
+
+    def _venue_fee(self, symbol: str, state: dict, price: float) -> float | None:
+        """The fee the venue charged on a closing fill, in quote.
+
+        A closing fill is a sale on spot and settles in quote on a perpetual, so
+        the raw figure is already dollars — only a spot *buy* pays in the base
+        asset (invariant 61), and no venue exit is one. ``None`` when the venue
+        did not say, or said something implausible: over 1% of notional means
+        the unit was misread, and a wrong fee is worse than the assumed one.
+        """
+        raw = float(state.get("fee") or 0.0)
+        notional = price * float(state.get("filled") or 0.0)
+        if raw <= 0.0 or (notional > 0.0 and raw > notional * 0.01):
+            return None
+        return raw
+
+    def _close_from_venue_fill(
+        self,
+        symbol: str,
+        price: float,
+        fee: float | None = None,
+        reason: ExitReason | None = None,
+    ) -> None:
         """Record an exit the venue performed on its own.
 
         No order is sent: the sale already happened. Sending one would try to
@@ -1014,13 +1124,14 @@ class Runner:
         if position is None:
             return
 
-        spec = self.broker.market_spec(symbol)
-        fee = price * position.quantity * spec.taker_fee
-        reason = (
-            ExitReason.INITIAL_STOP
-            if position.current_stop <= position.initial_stop
-            else ExitReason.TRAILING_STOP
-        )
+        if fee is None:
+            fee = price * position.quantity * self.broker.market_spec(symbol).taker_fee
+        if reason is None:
+            reason = (
+                ExitReason.INITIAL_STOP
+                if position.current_stop <= position.initial_stop
+                else ExitReason.TRAILING_STOP
+            )
         closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
         trade = self.portfolio.close_position(symbol, price, now_ms(), reason, fee)
         if trade is None:
@@ -1029,6 +1140,7 @@ class Runner:
         self.db.record_trade(trade)
         self._record_trade_context(closing_meta, trade)
         self.db.delete_position(symbol)
+        self._release_claim(symbol)
         self.risk.record_trade(trade)
         self.state.open_positions = self._positions_view()
         self.writer.write(self.state)
@@ -1610,10 +1722,21 @@ class Runner:
             "risk_amount": sizing.risk_amount,
         }
         order.meta["planned_entry"] = price
+        # Claimed *before* the order leaves, so a racing engine cannot send its
+        # own into the same symbol: one-way mode would net the two.
+        if self.claims is not None and not self.claims.claim(row.symbol, reason=candidate.name):
+            row.no_trade_reason = NoTradeReason.CLAIMED_BY_OTHER_ENGINE
+            return False
         submitted = self.watchdog.call("submit_order", lambda: self.broker.submit(order))
         if submitted is None or submitted.status.value in ("rejected", "expired"):
             self._record_rejection(row.symbol, submitted)
             row.no_trade_reason = NoTradeReason.INSUFFICIENT_BALANCE
+            # An explicit refusal means nothing reached the book: hand the
+            # symbol back. No answer at all is different — the order may well
+            # have filled — so that claim stays until a sweep sees the symbol
+            # flat at the venue.
+            if submitted is not None:
+                self._release_claim(row.symbol)
             return False
         self._rejections.pop(row.symbol, None)
         self.db.upsert_order(submitted)
@@ -1681,6 +1804,11 @@ class Runner:
             regime=row.regime,
         )
         position.meta["entry_atr"] = self._atr_for(data, self.config.exits.trail_timeframe)
+        # When the position began, to the millisecond. ``entry_ts`` is the bar
+        # the signal came from, which can precede an earlier exit on the same
+        # symbol — and looking up "the venue's closing fill since entry" from
+        # there could book that older exit against this position.
+        position.meta["opened_ms"] = now_ms()
         self.db.upsert_position(position)
 
         # A stop that exists only in this process protects nothing while the
@@ -1923,6 +2051,7 @@ class Runner:
             regime=Regime(armed["regime"]),
         )
         position.meta["entry_atr"] = float(armed.get("entry_atr") or 0.0)
+        position.meta["opened_ms"] = now_ms()
         self.db.upsert_position(position)
         self._place_protective_stop(position, bar_ts)
 
@@ -2206,19 +2335,31 @@ class Runner:
         submitted = self.watchdog.call("submit_exit", lambda: self.broker.submit(order))
         if submitted is not None:
             self.db.upsert_order(submitted)
-            price, quantity = self._fill_terms(submitted, price, position.quantity, "exit")
-            charged = submitted.fee_paid
-            self.db.record_fill(
-                Fill(
-                    order_client_id=submitted.client_id,
-                    symbol=symbol,
-                    side=position.side.opposite,
-                    quantity=quantity,
-                    price=price,
-                    fee=charged,
-                    ts=bar_ts,
-                )
+        if submitted is None or submitted.status in (OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            # The close did not happen. This path used to carry on regardless:
+            # it booked a fill at the requested price, closed the position
+            # locally and wrote a trade — for an order the venue had refused.
+            # On a perpetual that produced a phantom sale (H17's first trade:
+            # ``110017 current position is zero``, booked at 114.33). On spot it
+            # was worse, because the protective stop had just been cancelled to
+            # free the asset: a refused exit left a real holding with no stop
+            # at the venue and no entry in the book — unprotected and forgotten.
+            self._exit_not_executed(symbol, position, submitted, bar_ts, price, reason)
+            return
+
+        price, quantity = self._fill_terms(submitted, price, position.quantity, "exit")
+        charged = submitted.fee_paid
+        self.db.record_fill(
+            Fill(
+                order_client_id=submitted.client_id,
+                symbol=symbol,
+                side=position.side.opposite,
+                quantity=quantity,
+                price=price,
+                fee=charged,
+                ts=bar_ts,
             )
+        )
 
         spec = self.broker.market_spec(symbol)
         fee = charged if charged > 0.0 else price * position.quantity * spec.taker_fee
@@ -2232,6 +2373,7 @@ class Runner:
         self.db.record_trade(trade)
         self._record_trade_context(closing_meta, trade)
         self.db.delete_position(symbol)
+        self._release_claim(symbol)
         self.risk.record_trade(trade)
 
         log.info(
@@ -2244,6 +2386,80 @@ class Runner:
         )
         if self.notifier and self.config.telegram.notify_fills:
             self.notifier.notify_exit(trade)
+
+    def _exit_not_executed(
+        self,
+        symbol: str,
+        position,
+        submitted,
+        bar_ts: int,
+        price: float,
+        exit_reason: ExitReason | None,
+    ) -> None:
+        """An exit was refused or never answered. Find out what is true.
+
+        Two very different situations produce a refusal. Either the venue had
+        already closed the position itself — a stop or target it holds fired
+        first — and the refusal is simply "nothing left to close"; or the
+        position is still there and the exit genuinely failed. The first is
+        booked from the venue's own fill. The second keeps the position and
+        puts the protective stop back, because it was cancelled a moment ago to
+        let this exit through (invariant 12).
+        """
+        reason = getattr(submitted, "reject_reason", None) or "no response from the venue"
+        held = self.watchdog.call("fetch_positions", self.broker.fetch_positions)
+        flat = held is not None and float(held.get(symbol, 0.0)) < position.quantity * 0.05
+
+        if flat:
+            state = self._venue_exit_state(symbol, position)
+            if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
+                log.info(
+                    "exit_already_done_by_venue",
+                    symbol=symbol,
+                    refused_with=str(reason)[:120],
+                    note="the venue closed it first; booking the venue's fill, not ours",
+                )
+                self._close_from_venue_state(symbol, position, state)
+                return
+            # Flat, yet no closing fill of ours is on record. The holding is
+            # gone either way; keeping a position the venue does not have would
+            # size, manage and report against nothing. Close at the last known
+            # level and say so loudly, the same way an unknown fill is flagged.
+            log.error(
+                "exit_refused_position_gone",
+                symbol=symbol,
+                refused_with=str(reason)[:120],
+                consequence="closed locally at the requested price; the venue's terms are unknown",
+            )
+            self.db.record_event(
+                "exit_refused_position_gone",
+                f"{symbol}: exit refused ({str(reason)[:80]}), venue shows no position",
+                level="error",
+            )
+            self._close_from_venue_fill(symbol, price, reason=exit_reason)
+            return
+
+        log.error(
+            "exit_not_executed",
+            symbol=symbol,
+            reason=str(reason)[:160],
+            venue_readable=held is not None,
+            consequence="position kept; protective stop restored; exit re-evaluated next bar",
+        )
+        self.db.record_event(
+            "exit_not_executed",
+            f"{symbol}: exit refused ({str(reason)[:80]}); position kept, stop restored",
+            level="error",
+        )
+        position.meta.pop("stop_order_id", None)
+        position.meta.pop("stop_at_venue", None)
+        self._place_protective_stop(position, bar_ts)
+        if self.notifier:
+            self.notifier.notify_error(
+                "Exit refused",
+                f"{symbol}: the close was refused ({str(reason)[:80]}). "
+                "The position is still open; its stop has been put back.",
+            )
 
     # -- support -----------------------------------------------------------
 
@@ -2288,31 +2504,8 @@ class Runner:
                 )
 
     def _reconcile(self) -> None:
-        stored = {p["symbol"]: p for p in self.db.load_positions()}
-        for symbol, raw in stored.items():
-            from tbot.core.models import Position
-
-            self.portfolio.positions[symbol] = Position(
-                symbol=symbol,
-                side=Side(raw["side"]),
-                quantity=raw["quantity"],
-                entry_price=raw["entry_price"],
-                entry_ts=raw["entry_ts"],
-                initial_stop=raw["initial_stop"],
-                current_stop=raw["current_stop"],
-                setup=raw["setup"],
-                risk_amount=raw["risk_amount"],
-                leverage=raw["leverage"],
-                fees_paid=raw["fees_paid"],
-                max_favorable_price=raw["max_favorable_price"],
-                max_adverse_price=raw["max_adverse_price"],
-                bars_held=raw["bars_held"],
-                conviction_at_entry=raw["conviction_at_entry"],
-                # Restoring meta is not cosmetic: it carries stop_order_id, so
-                # dropping it left the engine unable to move the venue stop it
-                # had itself placed. Every restart then lost the trail.
-                meta=json.loads(raw["meta"]) if raw.get("meta") else {},
-            )
+        for raw in self.db.load_positions():
+            self.portfolio.positions[raw["symbol"]] = restore_position(raw)
 
         # None means the venue could not be read. Treating that as an empty
         # account here would file every local position as "missing at the
@@ -2329,6 +2522,12 @@ class Runner:
                 consequence="local positions are kept as-is until the next successful read",
             )
             return
+        if self.claims is not None:
+            # A position another engine claimed is theirs, working as designed.
+            # Reporting it as ``unexpected_venue_position`` on every start is a
+            # warning no action can clear (audit #32's lesson).
+            others = self.claims.held_by_others()
+            venue_positions = {s: q for s, q in venue_positions.items() if s not in others}
         open_orders = (
             self.watchdog.call(
                 "fetch_open_orders", lambda: self.broker.fetch_open_orders(), default=[]
@@ -2363,6 +2562,7 @@ class Runner:
         # opened there.
         for symbol in report.missing_remotely:
             self.db.delete_position(symbol)
+            self._release_claim(symbol)
 
         self.db.record_event(
             "reconcile",
@@ -2375,6 +2575,58 @@ class Runner:
         )
         if not report.clean and self.notifier:
             self.notifier.notify_error("Reconciliation mismatch", report.summary())
+
+    def _release_claim(self, symbol: str) -> None:
+        if self.claims is not None and self.claims.release(symbol):
+            log.info("symbol_released", symbol=symbol)
+
+    def _sync_claims(self) -> None:
+        """Make the claim table agree with what this engine actually holds.
+
+        Every open position is claimed — covering positions opened before claims
+        existed, and a restart after a crash between claiming and recording. A
+        claim with no position behind it is released, but only once the venue
+        confirms the symbol is flat: an entry whose answer was lost may have
+        filled, and handing that symbol on would let another engine net into it.
+        """
+        if self.claims is None:
+            return
+        for symbol in list(self.portfolio.positions):
+            if not self.claims.claim(symbol, reason="held at start"):
+                owner = self.claims.owner_of(symbol)
+                log.error(
+                    "claim_conflict",
+                    symbol=symbol,
+                    owner=owner,
+                    consequence="two engines believe they hold this symbol; the venue "
+                    "has netted them into one position",
+                )
+                self.db.record_event(
+                    "claim_conflict", f"{symbol}: held here, claimed by {owner}", level="error"
+                )
+        self._sweep_claims()
+
+    def _sweep_claims(self) -> None:
+        """Release claims whose symbol this engine no longer holds anywhere."""
+        if self.claims is None:
+            return
+        stale = self.claims.mine() - set(self.portfolio.positions)
+        if not stale:
+            return
+        held = self.watchdog.call("fetch_positions", self.broker.fetch_positions)
+        if held is None:
+            return  # unreadable is not flat
+        for symbol in stale:
+            if float(held.get(symbol, 0.0)) <= 0.0:
+                self._release_claim(symbol)
+            else:
+                log.error(
+                    "claimed_position_not_in_book",
+                    symbol=symbol,
+                    venue_quantity=held.get(symbol),
+                    consequence="kept claimed so no other engine nets into it; "
+                    "reconcile by hand",
+                )
 
     def _check_balance_against_last_run(self, balance: float) -> None:
         """Say something when the account is not the size we last left it.

@@ -351,16 +351,23 @@ def test_the_fast_engine_is_isolated_from_the_main_one():
 
 def test_the_fast_engine_sizes_against_its_own_allocation():
     fast = load_config("config/fast.yaml")
-    assert fast.risk.max_capital == 300.0
+    # $300 until the 2026-09-21 reset, and never separately funded (audit #84);
+    # every engine now owns $1000 of the account.
+    assert fast.risk.max_capital == 1000.0
     assert fast.risk.max_leverage == 1.0
     assert fast.execution.market_type == "linear"
     assert fast.entries.allow_short is True
 
 
 def test_the_main_engine_keeps_every_default_it_had():
-    """This work must not change the running engine as a side effect."""
+    """This work must not change the running engine as a side effect.
+
+    One deliberate exception, the operator's: since the 2026-09-21 reset each
+    engine owns $1000 of the shared account, the main engine included — as a
+    residual owner it had been sizing against its siblings' money (audit #84).
+    """
     main = load_config("config/demo.yaml")
-    assert main.risk.max_capital == 0.0
+    assert main.risk.max_capital == 1000.0
     assert main.entries.allow_short is False
     assert main.exits.time_stop_bars == 0
     assert main.execution.market_type == "spot"
@@ -592,6 +599,7 @@ def _live_runner(config, cash: float = 5_000.0):
         },
     )()
     runner.watchdog = type("W", (), {"call": lambda self, _n, fn: fn()})()
+    runner.claims = None
     return runner
 
 

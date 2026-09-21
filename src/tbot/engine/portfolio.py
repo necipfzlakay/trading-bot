@@ -7,6 +7,7 @@ backtest — no second implementation to drift.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from tbot.core.logging import get_logger
@@ -273,3 +274,31 @@ class Portfolio:
             "open_positions": len(self.positions),
             "cash": self.cash,
         }
+
+
+def restore_position(raw: dict) -> Position:
+    """Rebuild a position from its database row.
+
+    Restoring ``meta`` is not cosmetic: it carries ``stop_order_id``, and
+    dropping it left the engine unable to move the venue stop it had itself
+    placed — every restart lost the trail (audit #37). Both engine loops load
+    positions through here so neither can quietly drop a field the other keeps.
+    """
+    return Position(
+        symbol=raw["symbol"],
+        side=Side(raw["side"]),
+        quantity=raw["quantity"],
+        entry_price=raw["entry_price"],
+        entry_ts=raw["entry_ts"],
+        initial_stop=raw["initial_stop"],
+        current_stop=raw["current_stop"],
+        setup=raw["setup"],
+        risk_amount=raw["risk_amount"],
+        leverage=raw["leverage"],
+        fees_paid=raw["fees_paid"],
+        max_favorable_price=raw["max_favorable_price"],
+        max_adverse_price=raw["max_adverse_price"],
+        bars_held=raw["bars_held"],
+        conviction_at_entry=raw["conviction_at_entry"],
+        meta=json.loads(raw["meta"]) if raw.get("meta") else {},
+    )

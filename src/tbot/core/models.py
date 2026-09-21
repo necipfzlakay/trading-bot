@@ -151,6 +151,16 @@ class NoTradeReason(StrEnum):
     STALE_DATA = "stale_data"
     RISK_BUDGET_EXHAUSTED = "risk_budget_exhausted"
     COOLDOWN_SAME_BAR = "cooldown_same_bar"
+    # Another engine on this account holds a position in the symbol. One-way
+    # mode nets positions per symbol, so the first engine to open it owns it
+    # until it is flat (``engine.claims``). Assigned after scoring, so it is a
+    # real score, not "no opinion".
+    CLAIMED_BY_OTHER_ENGINE = "claimed_by_other_engine"
+    # A safety valve held the entry back: the per-minute order or entry ceiling,
+    # or the cool-down after a run of venue refusals (scalp engine). Capacity is
+    # capped on purpose — a loop that can send ten orders a minute can also send
+    # them into a venue that is refusing every one.
+    THROTTLED = "throttled"
     ENTERED = "entered"  # not a rejection — the row that did become a trade
 
 

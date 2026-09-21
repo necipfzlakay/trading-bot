@@ -21,6 +21,11 @@ engine:
   # kendi emri sanıp benimser — cross_sectional modda her ikisi de
   # strategy="ranked_entry" ürettiği için çakışma kesin.
   namespace: fast
+  # Bu hesaptaki her perp motoru her sembole açık; bir sembolü ilk açan, pozisyon
+  # borsada düz olana kadar sahibidir, diğerleri o sırada atlar. One-way modda
+  # sembol başına tek pozisyon var — bu olmadan iki motor, ikisinin de vermediği
+  # tek bir pozisyonda netlenirdi (engine/claims.py).
+  symbol_claims: true
 
 web:
   port: 8788 # ana panel 8787'de
@@ -61,11 +66,12 @@ execution:
   assumed_maker_fee: 0.0001
 
 risk:
-  # SERT sermaye tavanı. Borsadaki bakiye ne derse desin bu motor $300 üstünden
-  # boyutlandırır. UTA cüzdanı paylaşıldığı için (ölçüldü: perp komisyonu spot
-  # motorun boyutlandırdığı USDT'den düşüyor) bu tavan olmadan iki motor da
-  # aynı $1000'i kendi sermayesi sayardı.
-  max_capital: 300.0
+  # Motorun tahsisi. UTA cüzdanı paylaşıldığı için (ölçüldü: perp komisyonu spot
+  # motorun boyutlandırdığı USDT'den düşüyor) bu olmadan motorlar aynı parayı
+  # kendi sermayesi sayardı. $300'dü ve hiç ayrıca fonlanmamıştı (denetim #84);
+  # 2026-09-21 sıfırlamasıyla her motora $1000 (operatör kararı). İlk tahsis
+  # budur, sonrasında motor kendi equity'sinden devam eder.
+  max_capital: 1000.0
   risk_per_trade: 0.012
   max_positions: 3
   # Operatör 3.0'a kadar yetki verdi ve tavan öyle kayıtlı (core/config.py).
