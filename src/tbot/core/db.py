@@ -478,6 +478,28 @@ class Database:
             )
         ]
 
+    def realised_by_setup(self) -> list[dict[str, Any]]:
+        """Closed-trade money per setup — for the scalper, per arm.
+
+        H18 runs two arms in one engine on one randomly split event population,
+        and the whole point is to compare them. A total across both would hide
+        exactly the answer the experiment exists to give.
+        """
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                """SELECT setup,
+                          COUNT(*)                                   AS trades,
+                          SUM(pnl)                                   AS pnl,
+                          SUM(fees)                                  AS fees,
+                          SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
+                          AVG(r_multiple)                            AS avg_r
+                     FROM trades
+                    GROUP BY setup
+                    ORDER BY setup"""
+            )
+        ]
+
     # -- equity, convictions, scans ---------------------------------------
 
     def record_equity(self, point: EquityPoint) -> None:

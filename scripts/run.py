@@ -21,6 +21,7 @@ from tbot.core.models import Mode, Venue
 from tbot.data.store import ParquetStore
 from tbot.engine.lock import AlreadyRunning, SingleInstanceLock
 from tbot.engine.runner import Runner, build_broker, venue_label
+from tbot.engine.siblings import assert_claims_consistent
 from tbot.risk.capital import diagnose as diagnose_capital
 
 
@@ -40,6 +41,7 @@ def main() -> int:
 
     secrets = load_secrets()
     assert_runnable(cfg, secrets)  # refuses live money without an explicit opt-in
+    assert_claims_consistent(cfg)  # perp engines sharing an account must share claims
 
     log = get_logger("run")
     symbols = (
@@ -48,6 +50,9 @@ def main() -> int:
     if not symbols:
         log.error("empty_universe", hint="run scripts/backfill.py first")
         return 1
+
+    if cfg.engine.kind == "scalp":
+        return run_scalp(cfg, secrets, symbols)
 
     blocks, selected, decay = indicator_selection(cfg)
     if not blocks:
@@ -104,6 +109,41 @@ def main() -> int:
     )
     try:
         runner.start()
+    finally:
+        db.close()
+    return 0
+
+
+def run_scalp(cfg, secrets, symbols: list[str]) -> int:
+    """The one-minute maker loop (``engine.kind: scalp``).
+
+    Same entry point, lock, preflight and launchd agent as the bar engine, so
+    ``bot.sh``, the health check (invariant 63) and the panel need nothing new.
+    What differs is the loop: the Runner cannot carry one-minute bars.
+    """
+    from tbot.scalp.engine import ScalpEngine
+
+    lock = SingleInstanceLock(cfg.runtime_dir / "engine.lock")
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        print(f"\n{exc}\n")
+        return 1
+
+    scalp = cfg.scalp
+    print(f"\n  engine  scalp (namespace {cfg.engine.namespace})")
+    print(f"  venue   {cfg.venue.value}  [{venue_label(cfg.venue)}]")
+    print(f"  symbols {len(symbols)} before the spread filter")
+    print(f"  capital {cfg.risk.max_capital:.0f} {cfg.quote_currency} · kill at {scalp.kill_equity:.0f}")
+    print(
+        f"  arms    {', '.join(scalp.arms)} · TP {scalp.take_profit_pct:.2%} / "
+        f"SL {scalp.stop_loss_pct:.2%} · time stop {scalp.time_stop_bars}m\n"
+    )
+
+    db = Database(cfg.db_path)
+    broker = build_broker(cfg, secrets, symbols)
+    try:
+        ScalpEngine(config=cfg, secrets=secrets, db=db, broker=broker, symbols=symbols).start()
     finally:
         db.close()
     return 0

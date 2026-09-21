@@ -1,0 +1,83 @@
+# Bot #3 — "scalp": 1 dakikalık, maker-önce, iki kollu perp scalper (H18).
+#
+# Ölçüm deneyi olarak kuruldu, para kazanma motoru olarak değil. Kurulmadan önce
+# ölçüldü (Bybit perp, 6 sembol × 7 gün × 10.080 bar): medyan 1m hareket
+# %0.026–0.070, gidiş-dönüş maliyet en iyi %0.07 — maliyet hareketin %100–270'i.
+# Denenen her bariyer ≈ −%0.07/işlem kaybetti. Beklenti ön-kayıtlı ve NEGATİF
+# (research/hypotheses.md, H18a/H18b); aşağıdaki seviyeler test edilen hipotez,
+# sonuca göre ayarlanacak düğmeler değil.
+#
+# extends TEK SEVİYE takip edilir, o yüzden mode/venue burada yeniden yazılıyor.
+extends: base.yaml
+
+mode: live
+venue: bybit-demo
+
+runtime_dir: runtime-scalp
+
+engine:
+  # İki karakteri her client order id'ye giriyor (değişmez 54). fast "fa".
+  namespace: sc
+  # Runner değil, tbot.scalp döngüsü. Runner 79 sembolde bir barı ~3.5 dk'da
+  # işliyor; 1 dakikalık bir stratejiyi taşıyamaz.
+  kind: scalp
+  # fast ile aynı hesabı ve aynı sembolleri paylaşıyor. One-way modda sembol
+  # başına tek pozisyon var: ilk açan sahibidir, diğeri o sırada dokunmaz.
+  symbol_claims: true
+
+web:
+  port: 8789 # demo 8787, fast 8788
+
+telegram:
+  enabled: false # token başına tek getUpdates offset'i; fast ile aynı sebep
+
+universe:
+  symbols: [] # runtime-scalp/universe.json — açılışta bir kez okunur (değişmez 69)
+  # Scalp'in maliyeti spread'le başlıyor: en likit 40 perp, 20M+ hacim, ≤3bps.
+  auto_top_n: 40
+  min_volume_24h_usd: 20000000
+  max_spread_bps: 3.0
+  # 1 dakikalık ufukta 540 günlük rejim geçmişi anlamsız; ama yeni listelenen
+  # kontratın ilk haftaları düzensiz — 90 gün taban.
+  min_history_days: 90
+
+data:
+  parquet_dir: runtime-scalp/data
+  # Sinyal yalnız 1m fiyattan; funding/OI/long-short çekmek backfill'i uzatır,
+  # hiçbir şeye karar vermez (değişmez 50'nin ruhu).
+  fetch_derivatives: false
+
+execution:
+  market_type: linear
+  margin_mode: isolated
+  # Ölçüldü (research/scalp_venue_facts.md): maker %0.01, taker %0.06.
+  assumed_taker_fee: 0.0006
+  assumed_maker_fee: 0.0001
+
+risk:
+  # Operatörün ayırdığı tahsis: demo hesaba +$1300 eklendi, $1000'i bu motorun.
+  # Yeniden başlatmada kendi son equity'sinden devam eder, havuzdan dolmaz —
+  # yoksa öldürme eşiği hiç tetiklenemezdi (engine/siblings.own_starting_cash).
+  max_capital: 1000.0
+  # Eşzamanlı en fazla 8 pozisyon; pozisyon başına notional = tahsis / 8.
+  max_positions: 8
+  # Kaldıraç kapısı değişmez (8/57/66): 1x. "Yüksek risk" frekans ve tahsisin
+  # tamamının kullanılmasıyla ifade ediliyor; kaldıraç negatif beklentiyi çarpar.
+  max_leverage: 1.0
+
+scalp:
+  trigger_bars: 5
+  sigma_window: 60
+  trigger_sigma: 2.5
+  arms: [momentum, reversion]
+  take_profit_pct: 0.003
+  stop_loss_pct: 0.003
+  time_stop_bars: 15
+  entry_ttl_seconds: 20
+  poll_seconds: 3
+  max_orders_per_minute: 20
+  max_entries_per_minute: 10
+  reject_streak_limit: 5
+  cooldown_seconds: 600
+  # Ön-kayıtlı öldürme: $1000 → $500'da yeni giriş yok.
+  kill_equity: 500.0

@@ -232,3 +232,30 @@ def test_percentages_are_served_the_run_s_own_starting_equity(tmp_path):
         assert client.get("/api/pnl").json()["starting_equity"] is None  # no run yet
         cfg.state_path.write_text(json.dumps({"starting_equity": 300.0}), encoding="utf-8")
         assert client.get("/api/pnl").json()["starting_equity"] == 300.0
+
+
+def test_the_scalper_s_arms_are_reported_apart_never_summed(tmp_path):
+    """H18 is an A/B test inside one engine. A single line across both arms
+    would hide the one answer the experiment exists to give."""
+    from tbot.core.models import ExitReason, Side, Trade
+
+    cfg = load_config("config/base.yaml")
+    cfg.runtime_dir = tmp_path
+    db = web_app.Database(cfg.db_path)
+    for setup, pnl in (("scalp_momentum", 0.5), ("scalp_momentum", -0.3), ("scalp_reversion", -0.4)):
+        db.record_trade(
+            Trade(
+                symbol="SOL/USDT:USDT", side=Side.BUY, setup=setup, entry_ts=0, exit_ts=60_000,
+                entry_price=100.0, exit_price=100.0 + pnl, quantity=1.0, pnl=pnl, fees=0.02,
+                r_multiple=pnl / 0.3, mfe_r=1.0, mae_r=-0.5, bars_held=3,
+                exit_reason=ExitReason.TAKE_PROFIT,
+            )
+        )
+    db.close()
+
+    with TestClient(web_app.create_app(cfg)) as client:
+        setups = {r["setup"]: r for r in client.get("/api/pnl").json()["setups"]}
+
+    assert setups["scalp_momentum"]["trades"] == 2
+    assert setups["scalp_momentum"]["pnl"] == pytest.approx(0.2)
+    assert setups["scalp_reversion"]["pnl"] == pytest.approx(-0.4)

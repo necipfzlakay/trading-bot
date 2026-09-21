@@ -209,6 +209,11 @@ code{font:11px var(--mono);color:var(--dim)}
   </div>
 
   <div class="card wide">
+    <h2>Kurulum bazında kâr/zarar <small>scalp motorunda: momentum ve dönüş kolları ayrı</small></h2>
+    <div class="scroll"><table id="setups"></table></div>
+  </div>
+
+  <div class="card wide">
     <h2>Sembol bazında kâr/zarar <small id="pnlmeta">hangi sembol ne kazandırdı</small></h2>
     <div class="scroll"><table id="pnl"></table></div>
     <div class="gloss">
@@ -786,6 +791,23 @@ async function refresh(){
   $('pnlmeta').textContent = pnlRows.length
     ? `${pnlRows.length} sembol · ${sum('trades')} kapanmış işlem`
     : 'hangi sembol ne kazandırdı';
+
+  // Per setup, never summed across: the scalper's two arms are an A/B test,
+  // and a combined line would hide the one answer it exists to give.
+  table($('setups'),
+    [{t:'kurulum', h:'Stratejinin kurulum etiketi. Scalp motorunda iki kol: scalp_momentum ve scalp_reversion'},
+     {t:'işlem', num:1, h:'Kapanmış işlem sayısı'},
+     {t:'isabet', num:1, h:'Kârla kapanan işlemlerin oranı'},
+     {t:'ort. R', num:1, h:'İşlem başına ortalama R'},
+     {t:'gerçekleşen', num:1, h:'Kapanmış işlemlerin net kâr/zararı (USDT), komisyon düşülmüş'},
+     {t:'komisyon', num:1, h:'Bu kuruluma ödenen toplam ücret'},
+     {t:'',cl:'fill'}],
+    (pnl0&&pnl0.setups)||[], r=>`<tr><td class="sym">${esc(r.setup)}</td>
+      <td class="num dim">${r.trades}</td>
+      <td class="num dim">${r.trades?pct(r.wins/r.trades):'—'}</td>
+      <td class="num ${cls(r.avg_r)}">${fmt(r.avg_r,3)}</td>
+      <td class="num ${cls(r.pnl)}">${sign(Number(r.pnl)||0)}</td>
+      <td class="num faint">${r.fees?fmt(r.fees):'—'}</td><td class="fill"></td></tr>`);
 
   table($('pnl'),
     [{t:'sembol', h:'Enstrüman'},

@@ -208,6 +208,7 @@ def create_app(config: Config | None = None, engines: dict[str, Config] | None =
         return JSONResponse(
             {
                 "symbols": rows,
+                "setups": db(engine).realised_by_setup(),
                 "starting_equity": snapshot.get("starting_equity"),
                 "realised_total": sum(float(r["pnl"] or 0.0) for r in rows),
                 "fees_total": sum(float(r["fees"] or 0.0) for r in rows),
