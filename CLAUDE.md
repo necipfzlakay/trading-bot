@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 529 test
+.venv/bin/python -m pytest -q             # 538 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -255,6 +255,16 @@ testi oku — hepsinin kendini koruyan bir testi var.
 73. **Borsanın tuttuğu seviyeyle yarışılmaz.** Perp'te TP ve (borsanın onayladığı)
     stop borsada durur; motor o seviyeye fiyat değince kendi kapanışını göndermez,
     borsanın kapanış dolumunu okur. → `Runner._venue_holds_level`, `PerpBroker.recent_reduce_fill`
+74. **Restart, pozisyonları equity'nin içindeki fiyatla çıkarır.** Son equity her
+    pozisyonu bir fiyattan değerledi; tohumlama pozisyonları o equity'den *aynı*
+    fiyatla geri çıkarmalı. Giriş fiyatıyla çıkarmak kapanıştaki gerçekleşmemiş
+    kârı/zararı nakde gömer, pozisyon fiyatlanınca ikinci kez sayar. Bu yüzden
+    equity ile birlikte `equity_marks` yazılır. → `carried_book`, `_record_bar_equity`
+75. **Tavanlı motorun zirvesi restart'ı aşar.** Defter kesintisizse (değişmez 71)
+    zirve de kesintisizdir; sıfırlanan zirve drawdown merdivenini (değişmez 4) ve
+    %50 dondurmayı her restart'ta unutturur. Tavansız motor taşımaz: onun
+    cüzdanını yatırım/çekim oynatır, eski zirve olmamış bir düşüş olur.
+    → `Portfolio.carry_over`
 68. **v5 çağrısının kategorisi ve sembolü sınıfın, literal değil.** ccxt'nin
     yardımcıları türev sözleşme varsayıyor; `category: "spot"` ve
     `replace("/","")` perp'te ya boş liste ya `10001` döndürüyor — ikisi de
@@ -495,7 +505,7 @@ doğru olduğunu gösteren tek şey, yanlış olduğunda kırılan bir testtir.
 | 90 | **İşlenirken kapanan bar sessizce atlanıyordu.** `_loop` bir barı işledikten sonra doğrudan *sonraki* kapanışı bekliyordu. fast 12:58'de açıldı, 79 sembolü 13:02'ye kadar işledi, 13:00'te kapanan bar hiç işlenmedi — bir saatlik karar, logda tek satır olmadan. "fast neden işlem açmıyor" sorusu üzerine bulundu | orta | işlemden sonra kapanış yeniden okunuyor; yeni bar kapandıysa beklemeden işleniyor ve `bar_closed_during_processing` yazılıyor |
 | 91 | **Veri yenileme kendi rate limit'ini üretiyordu.** Bekleme (`_pace`) yalnız *bir serinin sayfaları arasında* vardı; runner'ın her barda 79 sembol × 3 TF'lik yenilemesi ccxt'nin 20 ms aralığıyla gidiyordu. Üstelik kapanmış yeni barı olmayan seriler (saat başında 1d ve çoğu 4h) de isteniyordu — dönebilecek tek mum oluşmakta olandı ve depo onu zaten reddediyor (değişmez 1). Ölçüm, 14:00: ~237 istek, **40 `10006`**, **12 sembol** o barın taramasından bayat diye düştü | orta | istek yalnız yeni bar kapandıysa; her istekten önce bekleme; `10006`'da 1.5 s / 4 s ile iki yeniden deneme. Restart sonrası: 79/79 tarandı, 12 istek, 0 ret |
 
-### Sıfırlama (2026-09-21 15:53 UTC, operatör kararı)
+### Sıfırlama (2026-09-21 15:53 yerel / 12:53 UTC, operatör kararı)
 
 Borsa düzleştirildi (perp SOL kapandı, spot stop'lar iptal, AAVE/ETH/VVV satıldı),
 **USDT 3000.54**, üç motorun `tbot.db`/state/log'u yedeklenip silindi, kira tablosu
@@ -519,6 +529,33 @@ kendi yeni koduma uygulanması: ilk testim yeşildi çünkü testi hataya göre 
 #92 tam olarak #59–#61'in zaman ekseni: **borsanın saatiyle olmuş bir şeyi kendi saatimizle
 damgalamak.** Fark 1-2 saniye, ama TP'si bir dakikalık hareketi hedefleyen motorda bu
 işlemlerin bir kısmının bütün ömrü.
+
+### On ikinci tur (2026-09-22, "botları bir kontrol et" isteğinde, üç motor çalışırken)
+
+Defter borsayla karşılaştırıldı: `account/transaction-log`'un toplamı USDT'yi kuruşu
+kuruşuna açıklıyordu (3000.54 − 680.01 spot alım − 19.26 perp = 2301.28). Fark borsada
+değil defterdeydi.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 94 | **Restart açık pozisyonun kâr/zararını iki kez sayıyordu.** `own_starting_cash` pozisyon değerini `portfolio.equity({})` ile, yani **giriş fiyatıyla** alıyordu; `last_equity` ise piyasa fiyatıyla hesaplanmıştı. Kapanıştaki gerçekleşmemiş P&L nakde gömülüyor, pozisyon fiyatlanınca yeniden sayılıyordu. Demo 14:07'de −4.50 gerçekleşmemişle restart edildi: nakit 314.82 tohumlandı, doğrusu 319.31 — equity kalıcı olarak $4.50 düşük. Kârlı pozisyonda aynı yol equity'yi şişirirdi. Runner ve scalp aynı formülü kullanıyordu | yüksek | equity ile birlikte değerlendiği fiyatlar (`EngineState.equity_marks`) yazılıyor; tohumlama o fiyatlarla çıkarıyor (`carried_book`). Runner'ın bar değeri `_record_bar_equity`'de, state.json'da `equity` bar kapanışında, pozisyon fiyatları nabızda yazıldığı için ikisi aynı an değildi — fiyatlar equity'yle **birlikte** kaydediliyor |
+| 95 | **Scalp #92 tamirinden sonra da bir çıkışı tahminle yazdı.** TAO stop'u 00:00:14 UTC'de (funding) **318.79**'dan doldu; emir geçmişi 15 sn sonra hâlâ göstermiyordu, 5 yoklama doldu, kapanış son fiyattan **319.37** yazıldı: −1.1R işlem −0.49R, defter $0.22 iyimser. Borsa zaten düzken beklemenin maliyeti yok, tahmin ise kalıcı yanlış satır. Ayrıca bekleme yoklama **sayısıyla** ölçülüyordu (değişmez 46) | orta | `EXIT_LOOKUP_SECONDS = 60`, `time.monotonic()` ile. Test: 8 yoklama (eski sınırın üstü) boyunca tahmin yazılmıyor, dolum gelince borsanın fiyatıyla kaydediliyor |
+| 96 | **Restart drawdown'u unutturuyordu.** `seed_from_venue` zirveyi o anki equity'ye sıfırlıyor, `RiskBudget` sıfır zirveyle başlıyordu. %12 düşüşte 0.5x'e inmiş motor restart'ta 1.0x'e dönerdi; %50 dondurma da aynı şekilde. #84(c)'nin (kayıp havuzdan geri dolar) drawdown ikizi | yüksek | tavanlı motor `peak_equity` ve `starting_equity`'yi state'ten taşıyor (değişmez 75). Tavansız (`live.yaml`) taşımıyor |
+| 97 | **Açılışta son kapanmış bar yaşına bakılmadan işleniyor.** `_loop` `last_processed = 0` ile başlıyor; sıfırlamadan sonra 06:25'te açılan demo, 06:00'da kapanan barla 06:26'da **AAVE aldı** — 26 dk bayat kapanıştan, backtest'in t+1 açılışından 26 dk sonra. Her restart canlı/backtest ayrışması üretiyor; #46 ile aynı sınıf, bu kez bekleme döngüsü değil açılış | orta | **açık, işaretlendi.** Önerilen: açılışta pozisyonlar yönetilir, ama bar kapanışından birkaç dakikadan fazla geçtiyse yeni giriş yapılmaz. İşlem popülasyonunu değiştirdiği için operatör kararı |
+
+#94 ve #96 aynı yerden: **restart, defterin kesintisiz olduğu sözünü tutmuyordu.**
+Değişmez 71 "kâr da zarar da onundur" diyor; ama zararın bir kısmı ikinci kez yazılıyor,
+drawdown'un hafızası ise hiç taşınmıyordu. Üç motor da tavanlıyken restart her kod
+değişikliğinde oluyor, yani her iki hata da ileri testin ölçtüğü eğriye düzenli olarak
+karışıyordu.
+
+### Sıfırlama (2026-09-22 06:24 UTC, operatör kararı)
+
+Borsa düzleştirildi (spot AAVE/SOL/VVV satıldı, 3 stop iptal, perp düzdü), **USDT
+3000.34**, üç motorun DB/state/log'u `*/backups/pre-reset-20260922-092458.db`'ye
+yedeklenip silindi, kiralar temizlendi. Sıfırlama öncesi hesap −$38 idi (demo ≈ −$18
+gerçekleşmemiş, scalp −$19.26 / 214 işlem, fast işlemsiz). #94–#96 tamiriyle başlatıldı.
+H17 ve H18 **bu andan itibaren** yeniden sayılır.
 
 ### Ölçülmüş borsa gerçekleri — 1 dakikalık maker scalper (2026-09-21, demo'da emirle)
 

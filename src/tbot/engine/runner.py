@@ -63,7 +63,7 @@ from tbot.data.integrity import MIN_BARS_BY_TIMEFRAME
 from tbot.data.store import ParquetStore
 from tbot.engine.claims import SymbolClaims
 from tbot.engine.portfolio import Portfolio, restore_position
-from tbot.engine.siblings import own_starting_cash, sibling_reservation
+from tbot.engine.siblings import carried_book, own_starting_cash, sibling_reservation
 from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.engine.watchdog import Watchdog
 from tbot.execution.broker import Broker, client_order_id
@@ -260,46 +260,7 @@ class Runner:
             self._reconcile()
         self._sync_claims()
 
-        balance = self._equity_now()
-        # Invariant 19: the balance comes from the venue, never from config.
-        # Seeding here keeps the portfolio, the sizing cash limit and the equity
-        # curve on the same real number.
-        #
-        # ``max_capital`` is the exception, and it exists because the real
-        # number stops being *this engine's* number once two engines share an
-        # account. Measured on the demo account: a perpetual fill is settled out
-        # of the same Unified USDT balance the spot engine sizes against, so
-        # both engines would read the full balance, both would adopt it as their
-        # own starting equity, and between them they would risk twice what
-        # either believes it is risking.
-        #
-        # Capped, this engine's equity is its own profit and loss on its own
-        # allocation — which is also the only equity curve that means anything
-        # when judging its hypothesis.
-        cap = self.config.risk.max_capital
-        reserved, breakdown = (0.0, {}) if cap > 0 else sibling_reservation(self.config)
-        last_equity = (self.writer.read() or {}).get("equity")
-        cash = own_starting_cash(
-            venue_free=balance,
-            positions_value=self.portfolio.equity({}) - self.portfolio.cash,
-            cap=cap,
-            last_equity=float(last_equity) if last_equity else None,
-            reserved_for_siblings=reserved,
-        )
-        log.info(
-            "capital_seeded",
-            basis="capped allocation" if cap > 0 else "residual after siblings",
-            venue_free=round(balance, 2),
-            cash=round(cash, 2),
-            cap=cap or None,
-            last_equity=round(float(last_equity), 2) if last_equity else None,
-            reserved_for_siblings=breakdown or None,
-        )
-        self.portfolio.seed_from_venue(cash)
-        balance = self.portfolio.equity({})
-        self._check_balance_against_last_run(balance)
-        self.risk.update_equity(balance)
-        self.state.equity = balance
+        balance = self._seed_capital(self._equity_now())
         self.state.cash = self.portfolio.cash
         self.state.starting_equity = self.portfolio.starting_cash
         self.state.open_positions = self._positions_view()
@@ -572,7 +533,7 @@ class Runner:
             self._maybe_enter(frames, scans, bar_ts)
             self._maybe_arm(frames, scans, bar_ts)
 
-        point = self.portfolio.record_equity(bar_ts, marks)
+        point = self._record_bar_equity(bar_ts, marks)
         if equity_jump_is_implausible(self.state.equity, point.equity):
             # Almost always bad data rather than a real move. Sizing off it
             # would turn a data error into a real loss.
@@ -2640,6 +2601,72 @@ class Runner:
                     consequence="kept claimed so no other engine nets into it; "
                     "reconcile by hand",
                 )
+
+    def _record_bar_equity(self, bar_ts: int, marks: dict[str, float]):
+        """The bar's equity, with the prices behind it saved alongside.
+
+        A restart takes the open positions back out of this equity at these
+        same prices (``carried_book``); at any other price the unrealised P&L
+        lands in cash and is then counted a second time.
+        """
+        point = self.portfolio.record_equity(bar_ts, marks)
+        self.state.equity_marks = {s: marks[s] for s in self.portfolio.positions if s in marks}
+        return point
+
+    def _seed_capital(self, balance: float) -> float:
+        """Seed the book from the venue and the previous run; return equity."""
+        # Invariant 19: the balance comes from the venue, never from config.
+        # Seeding here keeps the portfolio, the sizing cash limit and the equity
+        # curve on the same real number.
+        #
+        # ``max_capital`` is the exception, and it exists because the real
+        # number stops being *this engine's* number once two engines share an
+        # account. Measured on the demo account: a perpetual fill is settled out
+        # of the same Unified USDT balance the spot engine sizes against, so
+        # both engines would read the full balance, both would adopt it as their
+        # own starting equity, and between them they would risk twice what
+        # either believes it is risking.
+        #
+        # Capped, this engine's equity is its own profit and loss on its own
+        # allocation — which is also the only equity curve that means anything
+        # when judging its hypothesis.
+        cap = self.config.risk.max_capital
+        reserved, breakdown = (0.0, {}) if cap > 0 else sibling_reservation(self.config)
+        last = carried_book(self.writer.read())
+        cash = own_starting_cash(
+            venue_free=balance,
+            # At the prices inside ``last.equity`` — see ``carried_book``.
+            positions_value=self.portfolio.equity(last.marks) - self.portfolio.cash,
+            cap=cap,
+            last_equity=last.equity,
+            reserved_for_siblings=reserved,
+        )
+        log.info(
+            "capital_seeded",
+            basis="capped allocation" if cap > 0 else "residual after siblings",
+            venue_free=round(balance, 2),
+            cash=round(cash, 2),
+            cap=cap or None,
+            last_equity=round(last.equity, 2) if last.equity else None,
+            last_peak=round(last.peak, 2) if cap > 0 and last.peak else None,
+            reserved_for_siblings=breakdown or None,
+        )
+        self.portfolio.seed_from_venue(cash, last.marks)
+        if cap > 0:
+            self.portfolio.carry_over(peak=last.peak, starting=last.starting)
+        balance = self.portfolio.equity(last.marks)
+        self._check_balance_against_last_run(balance)
+        self.risk.state.peak_equity = self.portfolio.peak_equity
+        self.risk.update_equity(balance)
+        self.state.equity = balance
+        self.state.equity_marks = {
+            s: last.marks[s] for s in self.portfolio.positions if s in last.marks
+        }
+        self.state.peak_equity = self.portfolio.peak_equity
+        self.state.drawdown = (
+            1.0 - balance / self.portfolio.peak_equity if self.portfolio.peak_equity > 0 else 0.0
+        )
+        return balance
 
     def _check_balance_against_last_run(self, balance: float) -> None:
         """Say something when the account is not the size we last left it.

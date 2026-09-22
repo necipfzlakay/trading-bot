@@ -344,6 +344,75 @@ def test_a_refused_time_stop_is_never_booked_as_an_exit(engine):
     assert db.trades == [] and SOL in eng.portfolio.positions
 
 
+def _filled_and_held(eng, venue):
+    eng._try_enter(_intent())
+    venue.order_states["oid-0"] = {
+        "status": "Filled", "filled": 1.2, "average_price": 99.99, "fee": 0.012,
+        "terminal": True, "filled_terminal": True,
+    }
+    venue.positions = {SOL: 1.2}
+    eng._poll_venue()
+    assert SOL in eng.portfolio.positions
+
+
+def test_a_lagging_history_is_waited_out_not_guessed(engine):
+    """Measured at the 00:00 UTC funding settlement: a TAO stop filled at
+    318.79 was still missing from the order history 15 s later — five 3 s
+    polls — and was booked at the last price, 319.37: -1.1R written as -0.49R.
+    The venue is already flat; waiting costs nothing, a guess is permanent."""
+    eng, venue, db = engine
+    _filled_and_held(eng, venue)
+
+    venue.positions = {}  # the stop filled; the history has not caught up
+    for _ in range(8):  # longer than the old five-poll limit
+        eng._poll_venue()
+    assert db.trades == [] and "exit_terms_unknown" not in db.events
+
+    venue.exit_fill = {"average_price": 99.39, "fee": 0.07, "kind": "stop",
+                       "filled": 1.2, "filled_terminal": True}
+    eng._poll_venue()
+    (trade,) = db.trades
+    assert trade.exit_price == pytest.approx(99.39)
+    assert trade.exit_reason.value == "initial_stop"
+
+
+def test_a_history_that_never_answers_is_booked_after_a_minute_and_flagged(engine):
+    eng, venue, db = engine
+    _filled_and_held(eng, venue)
+
+    venue.positions = {}
+    eng._poll_venue()
+    assert db.trades == []
+    eng._flat_since[SOL] -= 61.0  # a minute of real time, not a count of polls
+    eng._poll_venue()
+
+    (trade,) = db.trades
+    assert trade.exit_reason.value == "initial_stop"
+    assert SOL not in eng.portfolio.positions
+
+
+def test_a_restart_carries_the_book_at_the_prices_its_equity_used(engine, tmp_path):
+    """The scalper's half of the seeding fix: the snapshot saves the marks, the
+    next start takes the position out at them — not at its entry."""
+    from tbot.engine.portfolio import Portfolio
+
+    eng, venue, _db = engine
+    _filled_and_held(eng, venue)
+    eng.stream.ingest(SOL, [1_790_000_000_000, 99.0, 99.0, 98.0, 98.5, 1.0])
+    eng._snapshot()
+    cash_before = eng.portfolio.cash
+    assert eng.state.equity_marks == {SOL: 98.5}
+
+    held = eng.portfolio.positions[SOL]
+    eng.portfolio = Portfolio(starting_cash=eng.config.risk.max_capital)
+    eng.portfolio.positions[SOL] = held  # what reconciliation restores
+    venue.fetch_balance = lambda: {"USDT": 5_000.0}
+    eng._seed_capital()
+
+    assert eng.portfolio.cash == pytest.approx(cash_before)
+    assert eng.portfolio.equity({SOL: 98.5}) == pytest.approx(eng.state.equity)
+
+
 def test_the_entry_rate_is_capped(engine):
     eng, _venue, _db = engine
     now = time.monotonic()

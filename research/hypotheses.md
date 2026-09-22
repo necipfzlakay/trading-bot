@@ -98,6 +98,19 @@ TradFi perp'ler `110123` (sözleşme onayı) ile işlem yapılamaz. Kayıtlar pr
 yeniden başlatmasında silindi; yedek `runtime-scalp/backups/pre-reset-20260921-155301.db`.
 **H18 sayımı 2026-09-21 15:53 UTC sıfırlamasından başlar**; parametreler aynı.
 
+**2026-09-22 06:24 UTC — PROTOKOL YENİDEN BAŞLATMA (ikinci).** Operatör kararıyla hesap
+ve üç motorun kayıtları yeniden sıfırlandı. Sebep sermaye muhasebesi: restart açık
+pozisyonun P&L'ini iki kez sayıyordu ve drawdown'u unutturuyordu (denetim #94, #96);
+ayrıca bir çıkış tahminle yazılmıştı (#95). Strateji parametreleri **değişmedi**; değişen
+yalnız çıkış dolumunu bekleme süresi (5 yoklama → 60 sn), yani kaydın doğruluğu.
+Sıfırlama öncesi koşu (12:57 UTC → 06:24 UTC, ~17 saat): **214 işlem** (momentum 103,
+dönüş 111), 100 TP / 105 stop / 9 zaman stop'u, borsaya göre **−$19.26**. Bu not
+sonuçlar görüldükten sonra yazıldı — sıfırlama kararı sonuçtan değil muhasebe
+hatalarından geldi, ama bu ayrım okuyucuya bırakılmamalı. Dört işlemin çıkışı tahminle
+yazılmıştır (#92'de 3, #95'te 1); havuzlanacaksa bunlar önce borsanın execution
+listesinden düzeltilmeli. Havuzlama kararı operatörde. Yedek
+`runtime-scalp/backups/pre-reset-20260922-092458.db`. **H18 sayımı bu andan başlar.**
+
 ### Kill kriterleri (koşmadan önce yazıldı)
 
 | durum | aksiyon |
@@ -261,6 +274,12 @@ artık başka motorun tuttuğu sembolü atlıyor (`claimed_by_other_engine`). Bu
 stratejinin kuralını değil hangi olayların ona *ulaşabildiğini* değiştirir. Etkisi
 ölçülebilir kalsın diye her atlama `scans`'e sebebiyle yazılıyor; analiz, bu
 satırlar hariç tutularak ve dahil edilerek iki kez yapılacak.
+
+**2026-09-22 06:24 UTC — PROTOKOL YENİDEN BAŞLATMA (ikinci).** Hesap ve üç motorun
+kayıtları yeniden sıfırlandı (denetim #94, #96: restart sermaye muhasebesi). fast bu
+aralıkta 17 barda **hiç işlem açmadı** (772 satır `below_threshold`, 103 `no_setup`),
+yani kaybolan H17 verisi yok. Strateji parametreleri değişmedi; H17 bu andan
+itibaren sayılır. Yedek `runtime-fast/backups/pre-reset-20260922-092458.db`.
 
 ### Neden bu bir deneme sayılıyor ama veri madenlenmiş değil
 

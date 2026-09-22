@@ -52,7 +52,7 @@ from tbot.core.models import (
 )
 from tbot.engine.claims import SymbolClaims
 from tbot.engine.portfolio import Portfolio, restore_position
-from tbot.engine.siblings import own_starting_cash
+from tbot.engine.siblings import carried_book, own_starting_cash
 from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.execution.ccxt_broker import PerpBroker
 from tbot.execution.safety import assert_key_is_safe
@@ -67,9 +67,13 @@ HEARTBEAT_SECONDS = 60  # invariant 37: the dead-man switch is only as sharp as 
 # — measured, a cancelled order took over six seconds to appear — so "not
 # found" is not "no fill" until well past the TTL.
 UNKNOWN_ORDER_GRACE_SECONDS = 90.0
-# Flat at the venue with no closing fill on record yet: wait this many polls
-# before booking the exit at the last price, flagged.
-EXIT_LOOKUP_POLLS = 5
+# Flat at the venue with no closing fill on record yet: keep asking this long
+# before booking the exit at the last price, flagged. Measured: at 00:00 UTC, the
+# funding settlement, a TAO stop that filled at 318.79 was still missing from the
+# order history 15 s later — five 3 s polls — and was booked at 319.37, a -1.1R
+# stop written as -0.49R. Waiting costs nothing, the venue is already flat; a
+# guess is a permanent wrong row. Elapsed time, not a poll count (invariant 46).
+EXIT_LOOKUP_SECONDS = 60.0
 
 
 # Contracts the account may not trade until an agreement is signed in the web
@@ -119,7 +123,7 @@ class ScalpEngine:
     _entries: deque = field(default_factory=deque, init=False)
     _reject_streak: int = field(default=0, init=False)
     _cooldown_until: float = field(default=0.0, init=False)
-    _flat_polls: dict[str, int] = field(default_factory=dict, init=False)
+    _flat_since: dict[str, float] = field(default_factory=dict, init=False)  # monotonic
     _orphans_reported: set[str] = field(default_factory=set, init=False)
     _symbol_rejections: dict[str, int] = field(default_factory=dict, init=False)
     _dropped: set[str] = field(default_factory=set, init=False)
@@ -285,19 +289,22 @@ class ScalpEngine:
         log.info("reconcile_complete", positions=len(self.portfolio.positions))
 
     def _seed_capital(self) -> None:
-        last = (self.writer.read() or {}).get("equity")
+        last = carried_book(self.writer.read())
         free = self.broker.fetch_balance().get(self.config.quote_currency, 0.0)
         cash = own_starting_cash(
             venue_free=free,
-            positions_value=self.portfolio.equity({}) - self.portfolio.cash,
+            # At the prices inside ``last.equity`` — see ``carried_book``.
+            positions_value=self.portfolio.equity(last.marks) - self.portfolio.cash,
             cap=self.config.risk.max_capital,
-            last_equity=float(last) if last else None,
+            last_equity=last.equity,
             reserved_for_siblings=0.0,
         )
-        self.portfolio.seed_from_venue(cash)
+        self.portfolio.seed_from_venue(cash, last.marks)
+        self.portfolio.carry_over(peak=last.peak, starting=last.starting)
         self.state.starting_equity = self.portfolio.starting_cash
+        self.state.peak_equity = self.portfolio.peak_equity
         log.info("capital_seeded", basis="capped allocation", venue_free=round(free, 2),
-                 cash=round(cash, 2), last_equity=last)
+                 cash=round(cash, 2), last_equity=last.equity, last_peak=last.peak)
 
     def _load_history(self, symbol: str) -> None:
         """Closed minutes over REST — at startup, and to refill a gap."""
@@ -511,7 +518,7 @@ class ScalpEngine:
             if float(held.get(symbol, 0.0)) < position.quantity * 0.05:
                 self._book_venue_exit(symbol)
             else:
-                self._flat_polls.pop(symbol, None)
+                self._flat_since.pop(symbol, None)
 
     def _check_kill(self) -> None:
         """The pre-registered H18 kill: at or below the floor, nothing new opens.
@@ -736,9 +743,8 @@ class ScalpEngine:
             )
             self._close(symbol, float(state["average_price"]), float(state.get("fee") or 0.0), reason)
             return
-        seen = self._flat_polls.get(symbol, 0) + 1
-        self._flat_polls[symbol] = seen
-        if seen < EXIT_LOOKUP_POLLS and not force:
+        first_seen = self._flat_since.setdefault(symbol, time.monotonic())
+        if time.monotonic() - first_seen < EXIT_LOOKUP_SECONDS and not force:
             return  # the venue's history lags; ask again next poll
         price = self.stream.last_price(symbol) or position.current_stop
         log.error("exit_terms_unknown", symbol=symbol, booked_at=price,
@@ -748,7 +754,7 @@ class ScalpEngine:
 
     def _close(self, symbol: str, price: float, fee: float, reason: ExitReason) -> None:
         trade = self.portfolio.close_position(symbol, price, now_ms(), reason, fee)
-        self._flat_polls.pop(symbol, None)
+        self._flat_since.pop(symbol, None)
         if trade is None:
             return
         self.db.record_trade(trade)
@@ -814,8 +820,10 @@ class ScalpEngine:
         return rows
 
     def _snapshot(self) -> None:
-        equity = self._equity()
+        marks = self._marks()
+        equity = self.portfolio.equity(marks)
         self.state.equity = equity
+        self.state.equity_marks = marks  # see ``carried_book``
         self.state.cash = self.portfolio.cash
         self.state.peak_equity = max(self.state.peak_equity, equity)
         self.state.drawdown = (

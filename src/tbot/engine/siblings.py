@@ -15,7 +15,9 @@ never installed twice, while ``fast`` and ``scalp`` are separate services.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from tbot.core.clock import now_ms
 from tbot.core.config import PROJECT_ROOT, Config, load_config
@@ -161,3 +163,57 @@ def own_starting_cash(
             log.warning("capital_carried_well_above_allocation", equity=target, cap=cap)
         return min(venue_free, max(0.0, target - positions_value))
     return max(0.0, venue_free - reserved_for_siblings)
+
+
+@dataclass(frozen=True, slots=True)
+class CarriedBook:
+    """What the previous run's last snapshot says this engine's book was."""
+
+    equity: float | None = None
+    # The price each open position was valued at inside ``equity``.
+    marks: dict[str, float] = field(default_factory=dict)
+    peak: float | None = None
+    starting: float | None = None
+
+
+def carried_book(snapshot: dict[str, Any] | None) -> CarriedBook:
+    """Read the previous run's book out of its ``state.json``.
+
+    ``equity`` valued every open position at a price, and a restart takes those
+    positions back out of it to find the cash. It has to use the *same* price.
+    Seeding took them out at entry instead: the unrealised P&L at shutdown was
+    baked into cash, then counted a second time once the position was marked.
+    Measured on the demo engine: restarted with -4.50 unrealised on three spot
+    longs, seeded 314.82 instead of 319.31, and carried the gap for good. A
+    winner would have been counted twice the same way, upwards. A snapshot
+    without ``equity_marks`` (written before they were saved) yields none, which
+    is the old entry-price behaviour.
+
+    ``peak`` and ``starting`` continue the capped engine's book across restarts
+    (``own_starting_cash``). Reset at each start, the peak made the drawdown
+    ladder (invariant 4) and the capital freeze forget every loss the moment
+    the process restarted: an engine 12% down on 0.5x came back on 1.0x.
+    """
+    if not snapshot:
+        return CarriedBook()
+
+    def positive(key: str) -> float | None:
+        try:
+            value = float(snapshot.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    marks: dict[str, float] = {}
+    for symbol, price in (snapshot.get("equity_marks") or {}).items():
+        try:
+            if float(price) > 0:
+                marks[str(symbol)] = float(price)
+        except (TypeError, ValueError):
+            continue
+    return CarriedBook(
+        equity=positive("equity"),
+        marks=marks,
+        peak=positive("peak_equity"),
+        starting=positive("starting_equity"),
+    )

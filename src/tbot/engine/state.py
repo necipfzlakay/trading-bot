@@ -37,6 +37,10 @@ class EngineState:
     bars_processed: int = 0
     restarts: int = 0
     equity: float = 0.0
+    # The price each open position was valued at inside ``equity``. A restart
+    # takes the positions back out of that equity at these same prices; at any
+    # other price the unrealised P&L lands in cash and is then counted again.
+    equity_marks: dict[str, float] = field(default_factory=dict)
     cash: float = 0.0
     peak_equity: float = 0.0
     # What the account was worth when this run began. In live mode that is the

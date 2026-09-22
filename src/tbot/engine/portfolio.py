@@ -59,6 +59,20 @@ class Portfolio:
         self.peak_equity = equity
         log.info("portfolio_seeded_from_venue", cash=round(cash, 2), equity=round(equity, 2))
 
+    def carry_over(self, *, peak: float | None, starting: float | None) -> None:
+        """Continue the previous run's high-water mark and starting point.
+
+        Only for a book that is itself continuous across restarts — a capped
+        engine's (``siblings.own_starting_cash``). Seeding resets both to the
+        equity of the moment, which erases every drawdown at each restart. A
+        residual engine re-reads a wallet that deposits and withdrawals move, so
+        an old peak there would be a drawdown that never happened.
+        """
+        if peak and peak > self.peak_equity:
+            self.peak_equity = peak
+        if starting and starting > 0:
+            self.starting_cash = starting
+
     # -- positions ---------------------------------------------------------
 
     def open_position(
