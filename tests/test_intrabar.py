@@ -364,6 +364,18 @@ def test_a_cancelled_stop_is_never_read_as_a_fill():
     assert resting["terminal"] is False
 
 
+def test_order_state_carries_the_venues_own_fill_time():
+    """Audit #92: the scalp engine opens a position at the venue's fill time;
+    its attached target can fill before the engine's next poll."""
+    from tbot.execution.ccxt_broker import _order_state
+
+    filled = _order_state(
+        {"orderStatus": "Filled", "cumExecQty": "1", "avgPrice": "1", "updatedTime": "1790002864215"}
+    )
+    assert filled["updated_ms"] == 1_790_002_864_215
+    assert _order_state({"orderStatus": "New"})["updated_ms"] == 0  # unknown, not "now"
+
+
 @pytest.fixture
 def make_runner(tmp_path):
     """Build a Runner, optionally as a subclass.

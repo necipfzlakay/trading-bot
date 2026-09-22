@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 514 test
+.venv/bin/python -m pytest -q             # 529 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -509,6 +509,17 @@ dünyasından miras kalan "motor kapatır, sonra kaydeder" akışı, TP'nin de b
 durduğu bir piyasada iki kez çalışan bir kapanış demek. #85 ise #47'nin dersinin
 kendi yeni koduma uygulanması: ilk testim yeşildi çünkü testi hataya göre yazmıştım.
 
+### On birinci tur (2026-09-21, "bot nasıl gidiyor" kontrolünde, üç motor çalışırken)
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 92 | **Scalp girişten 1-2 sn sonra dolan TP'yi göremiyordu.** `opened_ms` borsanın dolum anı değil motorun dolumu *fark ettiği* an (3 sn yoklama) idi; ekli TP/SL dolumla birlikte canlanıyor, yani ondan önce dolan kapanış `recent_reduce_fill`'in `since` filtresine "önceki pozisyonun" diye takılıyordu. 5 yoklama sonra `exit_terms_unknown` → son fiyattan, **`initial_stop` etiketiyle**, tahmini taker komisyonla yazılıyordu. Borsaya soruldu: 40 işlemin 3'ü (#27, #28, #29) aslında TP; biri **+0.39'luk kazanç −0.66 zarar** olarak yazılmış. Defter bu üçte toplam ~$0.80 eksik, TP/stop dağılımı 22/18 değil **25/15**. Test fake'i `since`'i yok saydığı için yakalayamazdı | yüksek | `opened_ms` = girişin borsadaki `updatedTime`'ı (`_order_state.updated_ms`), yoksa gönderim anı — `order.created_ts` **değil**, o sinyal barı. Fake artık filtreyi uyguluyor; iki test tamir geri alınınca kırılıyor. **Mevcut üç kayıt düzeltilmedi** — operatör kararı |
+| 93 | **`Trade.pnl` giriş komisyonunu içermiyor, ama her yerde net diye okunuyor.** `close_position`: `pnl = gross − çıkış fee`; giriş fee'si nakitten düşülüyor (equity doğru) ama işlemin `pnl`'ine hiç girmiyor. `report.py` "Net P&L" diye topluyor, `metrics.py` PF/expectancy'yi, `montecarlo.py` karıştırmayı ondan yapıyor. Ölçüldü (aynı koşu, `--to 2026-09-21`, 118 işlem): Σpnl 139.67 / gerçek net 124.10 (equity sonu 1124.58 ile tutan), **PF 1.346 → 1.298**. Scalp'ta rapor +0.73 der, gerçek −0.34 | orta | **açık, işaretlendi.** Düzeltme repodaki her PF/expectancy sayısını değiştirir (Kapı 1 PF satırı ~1.30 olur, hâlâ ≥ 1.2); DB'deki eski satırlarla karışmaması için anlamın nasıl taşınacağı ayrı karar |
+
+#92 tam olarak #59–#61'in zaman ekseni: **borsanın saatiyle olmuş bir şeyi kendi saatimizle
+damgalamak.** Fark 1-2 saniye, ama TP'si bir dakikalık hareketi hedefleyen motorda bu
+işlemlerin bir kısmının bütün ömrü.
+
 ### Ölçülmüş borsa gerçekleri — 1 dakikalık maker scalper (2026-09-21, demo'da emirle)
 
 `scripts/scalp_probe.py` ile tekrar üretilebilir. Tam çıktı: `research/scalp_venue_facts.md`.
@@ -525,6 +536,9 @@ kendi yeni koduma uygulanması: ilk testim yeşildi çünkü testi hataya göre 
 | TradFi perp (XAU, …) | ❌ `110123 You must agree to the Trading Terms` — arayüzde onay gerekiyor |
 | Canlı maker dolum oranı (ilk 30 dk) | ~%33: sert hareketten hemen sonra en iyi seviyeye katılan PostOnly'lerin çoğu `EC_PostOnlyWillTakeLiquidity` ile anında iptal. **Backtest ~%92 varsaymıştı** |
 | Market stop kayması (ilk 2 işlem) | ARB: −4.6 bps ve +5.8 bps — backtest'in 5 bps varsayımıyla uyumlu |
+| Gerçek komisyon (40 işlem, `fills` + borsa execution listesi) | maker **%0.020**, taker **%0.055** — config %0.01 / %0.06 varsayıyor |
+| TP bacağı nasıl doluyor | **22'de 21'i taker.** `PartialTakeProfit` limit emri tetiklenince kuruluyor ve fiyat zaten oradayken kitabı kesiyor. Backtest TP'yi maker saydı: TP turu backtest'te ~2 bps, gerçekte **~7.5 bps** |
+| Dolum oranı (3.5 saat) | 40 dolum / 116 emir = **%34**; saatte 11.4 işlem (backtest 19.6) |
 
 ### Ölçülmüş borsa gerçekleri — linear perpetual (2026-09-20, demo'da emirle)
 

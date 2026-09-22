@@ -95,6 +95,7 @@ class PendingEntry:
     take_profit: float
     stop_loss: float
     placed: float  # time.monotonic()
+    placed_ms: int = 0  # wall clock just before submission
     cancel_sent: bool = False
     cancel_attempts: int = 0
 
@@ -415,6 +416,7 @@ class ScalpEngine:
             "threshold_bps": round(intent.threshold * 10_000, 2),
         }
 
+        placed_ms = now_ms()
         placed = self.broker.place_maker_entry(order, take_profit, stop_loss)
         self._orders.append(now)
         self.db.upsert_order(placed)
@@ -425,7 +427,9 @@ class ScalpEngine:
 
         self._reject_streak = 0
         self._entries.append(now)
-        self.pending[symbol] = PendingEntry(intent, placed, take_profit, stop_loss, now)
+        self.pending[symbol] = PendingEntry(
+            intent, placed, take_profit, stop_loss, now, placed_ms=placed_ms
+        )
         log.info(
             "maker_entry_placed",
             symbol=symbol,
@@ -660,9 +664,20 @@ class ScalpEngine:
             conviction=0.0,
             regime=Regime.UNKNOWN,
         )
+        # When the venue filled it, not when this process noticed. The target
+        # and stop are attached to the entry and live from the fill on; a poll
+        # (3 s) is slower than a one-minute target, and a closing fill stamped
+        # before ``opened_ms`` is filtered out of ``recent_reduce_fill`` as a
+        # previous position's. Measured: three targets filled 1-2 s after
+        # their entries and were booked as stops at a guessed price, one of
+        # them a +0.39 win written as a -0.66 loss. The submission time is the
+        # fallback: nothing this order opened can have closed before it. Not
+        # ``order.created_ts`` — that is the signal bar, which can precede the
+        # previous position's close on this symbol.
+        opened_ms = int(state.get("updated_ms") or 0) or entry.placed_ms or now_ms()
         position.meta.update(
             {
-                "opened_ms": now_ms(),
+                "opened_ms": opened_ms,
                 "tp_price": entry.take_profit,
                 "arm": entry.intent.arm,
                 "entry_bar_ts": entry.intent.bar_ts,

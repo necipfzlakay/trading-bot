@@ -82,6 +82,9 @@ def _order_state(raw: dict) -> dict[str, float | str]:
         "terminal": status
         in ("Filled", "Cancelled", "Deactivated", "Rejected", "PartiallyFilledCanceled"),
         "filled_terminal": status in ("Filled", "PartiallyFilledCanceled"),
+        # The venue's clock, not ours: when the order last changed — for a
+        # filled order, when it filled. See ``ScalpEngine._book_entry_fill``.
+        "updated_ms": int(_number(raw, "updatedTime")),
     }
 
 

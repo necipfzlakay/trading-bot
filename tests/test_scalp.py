@@ -149,7 +149,11 @@ class FakeVenue:
     def fetch_positions(self):
         return dict(self.positions)
 
-    def recent_reduce_fill(self, _symbol, _since, _side):
+    def recent_reduce_fill(self, _symbol, since, _side):
+        # The real lookup drops a closing fill stamped before ``since`` as a
+        # previous position's. A fake that ignored it hid audit #92.
+        if self.exit_fill and int(self.exit_fill.get("updated_ms") or since) < since:
+            return None
         return self.exit_fill
 
     def submit(self, order):
@@ -277,6 +281,52 @@ def test_a_fill_and_its_venue_exit_are_booked_on_the_venues_terms(engine):
     assert trade.exit_price == pytest.approx(100.29)
     assert trade.exit_reason.value == "take_profit"
     assert eng.claims.owner_of(SOL) is None  # flat at the venue: free again
+
+
+def test_a_target_that_fills_before_the_poll_sees_the_entry_is_still_found(engine):
+    """Audit #92: the attached target lives from the fill, not from our poll.
+
+    Entry filled at T, target at T+1 s, the engine's 3 s poll noticed both at
+    once. ``opened_ms`` was the moment of noticing, so the target's fill was
+    older than the position and filtered out as a previous one's; five polls
+    later the exit was booked as a stop at whatever the last price was.
+    """
+    from tbot.core.clock import now_ms
+
+    eng, venue, db = engine
+    eng._try_enter(_intent())
+    filled_at = now_ms() - 3_000
+    venue.order_states["oid-0"] = {
+        "status": "Filled", "filled": 1.2, "average_price": 99.99, "fee": 0.012,
+        "terminal": True, "filled_terminal": True, "updated_ms": filled_at,
+    }
+    venue.positions = {}  # the target already took it: flat by the first poll
+    venue.exit_fill = {"average_price": 100.29, "fee": 0.012, "kind": "take_profit",
+                       "filled": 1.2, "filled_terminal": True, "updated_ms": filled_at + 1_000}
+    eng._poll_venue()
+
+    (trade,) = db.trades
+    assert trade.exit_reason.value == "take_profit"
+    assert trade.exit_price == pytest.approx(100.29)
+
+
+def test_without_a_venue_time_the_position_opens_at_submission_not_at_noticing(engine):
+    """The fallback must still precede the attached legs — and not be the
+    signal bar, which can precede the previous position's close."""
+    from tbot.core.clock import now_ms
+
+    eng, venue, _db = engine
+    before = now_ms()
+    eng._try_enter(_intent())
+    submitted = eng.pending[SOL].placed_ms
+    assert before <= submitted <= now_ms()
+    venue.order_states["oid-0"] = {
+        "status": "Filled", "filled": 1.2, "average_price": 99.99, "fee": 0.012,
+        "terminal": True, "filled_terminal": True,
+    }
+    venue.positions = {SOL: 1.2}
+    eng._poll_venue()
+    assert eng.portfolio.positions[SOL].meta["opened_ms"] == submitted
 
 
 def test_a_refused_time_stop_is_never_booked_as_an_exit(engine):
