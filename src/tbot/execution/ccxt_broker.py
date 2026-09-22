@@ -366,18 +366,20 @@ class CCXTBroker(Broker):
 
         # A fee larger than a hundredth of the notional means the currency was
         # read wrong, and a wrong fee is worse than a missing one: it lands in
-        # realised PnL where nothing else would ever contradict it.
+        # realised PnL where nothing else would ever contradict it. Zero is
+        # "not reported", and the caller estimates it *outside* the ledger —
+        # returning the assumed rate here, as this did, put a guess in the
+        # column that means "the venue charged this" (invariant 76).
         if value > 0.0 and fee > value * 0.01:
-            spec = self.market_spec(order.symbol)
             log.warning(
                 "fee_currency_implausible",
                 symbol=order.symbol,
                 raw_fee=state.get("fee"),
                 converted=fee,
                 value=value,
-                action="using the assumed taker rate instead",
+                action="treated as unreported; the caller books an estimate beside the ledger",
             )
-            return value * spec.taker_fee
+            return 0.0
         return fee
 
     def _resolve_duplicate(self, order: Order, amount: float, price, params: dict) -> Order:

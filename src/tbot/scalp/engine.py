@@ -647,7 +647,9 @@ class ScalpEngine:
         symbol = entry.order.symbol
         price = float(state.get("average_price") or 0.0) or float(entry.order.price or 0.0)
         quantity = float(state["filled"])
-        fee = max(0.0, float(state.get("fee") or 0.0))
+        fee, fee_estimated = self._fee_split(
+            symbol, float(state.get("fee") or 0.0), price, quantity, "entry", maker=True
+        )
         fill = Fill(
             order_client_id=entry.order.client_id,
             symbol=symbol,
@@ -657,6 +659,7 @@ class ScalpEngine:
             fee=fee,
             ts=now_ms(),
             is_maker=True,
+            fee_estimated=fee_estimated,
         )
         entry.order.status = OrderStatus.FILLED
         entry.order.filled_quantity, entry.order.average_price = quantity, price
@@ -726,6 +729,8 @@ class ScalpEngine:
             log.warning("time_stop_terms_unknown", symbol=symbol,
                         consequence="booked from the venue on the next poll")
             return
+        # ``fee_paid`` is zero when the venue did not report it; ``_close``
+        # estimates that case beside the ledger rather than booking it free.
         self._close(symbol, submitted.average_price, submitted.fee_paid, ExitReason.TIME_STOP)
 
     def _book_venue_exit(self, symbol: str, force: bool = False) -> None:
@@ -749,11 +754,43 @@ class ScalpEngine:
         price = self.stream.last_price(symbol) or position.current_stop
         log.error("exit_terms_unknown", symbol=symbol, booked_at=price,
                   consequence="flat at the venue but no closing fill on record")
+        # No fill, so no reported fee: ``_close`` estimates it beside the ledger.
+        self._close(symbol, price, 0.0, ExitReason.INITIAL_STOP)
+
+    def _fee_split(
+        self,
+        symbol: str,
+        reported: float,
+        price: float,
+        quantity: float,
+        stage: str,
+        *,
+        maker: bool = False,
+    ) -> tuple[float, float]:
+        """``(reported, estimated)`` — exactly one of them carries the fee.
+
+        Only what the venue reported enters the ledger (invariant 76). A leg it
+        did not report on is estimated at the configured rate and kept beside
+        it: out of cash and ``pnl``, shown in the panel's own box. Recording it
+        as zero, as the entry and the time stop did, understated the cost; the
+        exit fallback wrote the guess into the ledger as if charged.
+        """
+        if reported > 0.0:
+            return reported, 0.0
         spec = self.broker.market_spec(symbol)
-        self._close(symbol, price, price * position.quantity * spec.taker_fee, ExitReason.INITIAL_STOP)
+        estimate = price * quantity * (spec.maker_fee if maker else spec.taker_fee)
+        log.warning("fee_unreported", symbol=symbol, stage=stage, estimated=round(estimate, 6),
+                    consequence="estimate kept beside the ledger; not in pnl, fees or cash")
+        return 0.0, estimate
 
     def _close(self, symbol: str, price: float, fee: float, reason: ExitReason) -> None:
-        trade = self.portfolio.close_position(symbol, price, now_ms(), reason, fee)
+        position = self.portfolio.positions.get(symbol)
+        fee_estimated = 0.0
+        if position is not None:
+            fee, fee_estimated = self._fee_split(symbol, fee, price, position.quantity, "exit")
+        trade = self.portfolio.close_position(
+            symbol, price, now_ms(), reason, fee, fee_estimated=fee_estimated
+        )
         self._flat_since.pop(symbol, None)
         if trade is None:
             return
@@ -815,6 +852,7 @@ class ScalpEngine:
                     "conviction": 0.0,
                     "price": round(mark, 8) if mark else None,
                     "fees_paid": round(p.fees_paid, 6),
+                    "fees_estimated": round(p.fees_estimated, 6),
                 }
             )
         return rows

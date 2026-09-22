@@ -259,3 +259,31 @@ def test_the_scalper_s_arms_are_reported_apart_never_summed(tmp_path):
     assert setups["scalp_momentum"]["trades"] == 2
     assert setups["scalp_momentum"]["pnl"] == pytest.approx(0.2)
     assert setups["scalp_reversion"]["pnl"] == pytest.approx(-0.4)
+
+
+def test_estimated_fees_are_served_apart_and_never_in_the_realised_total(tmp_path):
+    """Invariant 76. A fee the venue did not report is shown in its own box,
+    with the net it implies beneath it — never folded into the realised total."""
+    from tbot.core.models import ExitReason, Side, Trade
+
+    cfg = load_config("config/base.yaml")
+    cfg.runtime_dir = tmp_path
+    db = web_app.Database(cfg.db_path)
+    for pnl, fees, estimated in ((2.0, 0.1, 0.0), (-1.0, 0.0, 0.12)):
+        db.record_trade(
+            Trade(
+                symbol="SOL/USDT:USDT", side=Side.BUY, setup="s", entry_ts=0, exit_ts=60_000,
+                entry_price=100.0, exit_price=100.0 + pnl, quantity=1.0, pnl=pnl, fees=fees,
+                r_multiple=pnl, mfe_r=1.0, mae_r=-0.5, bars_held=3,
+                exit_reason=ExitReason.TAKE_PROFIT, fees_estimated=estimated,
+            )
+        )
+    db.close()
+
+    with TestClient(web_app.create_app(cfg)) as client:
+        body = client.get("/api/pnl").json()
+
+    assert body["realised_total"] == pytest.approx(1.0)
+    assert body["fees_total"] == pytest.approx(0.1)
+    assert body["fees_estimated_total"] == pytest.approx(0.12)
+    assert body["symbols"][0]["fees_estimated"] == pytest.approx(0.12)

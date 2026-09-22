@@ -161,6 +161,10 @@ class NoTradeReason(StrEnum):
     # capped on purpose — a loop that can send ten orders a minute can also send
     # them into a venue that is refusing every one.
     THROTTLED = "throttled"
+    # Selected, but the bar was picked up too long after its close to act on —
+    # a restart, or a catch-up behind a slow bar (``entries.max_bar_age_seconds``).
+    # Assigned after scoring, so it is a real score, not "no opinion".
+    STALE_BAR = "stale_bar"
     ENTERED = "entered"  # not a rejection — the row that did become a trade
 
 
@@ -414,6 +418,13 @@ class Fill:
     ts: int
     is_maker: bool = False
     exchange_trade_id: str | None = None
+    # ``fee`` is what the venue *reported* charging, in quote; nothing else may
+    # go there. When the venue did not say — the lookup failed, came back
+    # empty, or in a unit that cannot be right — the fee is still real but its
+    # size is ours, and it lands here instead. The two never add up anywhere
+    # the ledger counts money: an estimate in ``fee`` would pass for a fact in
+    # every PnL, PF and equity figure downstream (invariant 76).
+    fee_estimated: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -439,7 +450,8 @@ class Position:
     setup: str
     risk_amount: float  # 1R in quote currency
     leverage: float = 1.0
-    fees_paid: float = 0.0
+    fees_paid: float = 0.0  # venue-reported only; see ``Fill.fee_estimated``
+    fees_estimated: float = 0.0
     # Excursion tracking — the raw material for empirical stop/target calibration
     max_favorable_price: float = 0.0
     max_adverse_price: float = 0.0
@@ -514,8 +526,12 @@ class Trade:
     entry_price: float
     exit_price: float
     quantity: float
+    # Net of every fee the venue reported — entry, any scale-out and exit. It
+    # used to subtract only the exit fee, while ``fees`` carried both and the
+    # entry fee left cash unseen by any trade: measured on one backtest, the
+    # rows summed to 139.67 while the equity curve had made 124.10 (audit #93).
     pnl: float
-    fees: float
+    fees: float  # venue-reported, all legs; exactly what ``pnl`` is net of
     r_multiple: float
     mfe_r: float
     mae_r: float
@@ -525,6 +541,9 @@ class Trade:
     conviction_at_entry: float = 0.0
     leverage: float = 1.0
     meta: dict[str, Any] = field(default_factory=dict)
+    # Our estimate for legs the venue did not report a fee on. Not in ``pnl``,
+    # not in ``fees``: the panel shows it beside them, never inside them.
+    fees_estimated: float = 0.0
 
     @property
     def duration_ms(self) -> int:

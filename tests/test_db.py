@@ -32,7 +32,7 @@ def db(tmp_path):
 
 
 def test_schema_and_run_bookkeeping(db):
-    assert db.get_meta("schema_version") == "1"
+    assert db.get_meta("schema_version") == "2"
     assert db.run_id == 1
     db.stop_run("clean")
     runs = db.query("SELECT * FROM runs")
@@ -268,3 +268,108 @@ def test_transaction_rolls_back_on_failure(db):
         )
         raise RuntimeError("boom")
     assert db.query("SELECT * FROM events") == []
+
+
+def test_estimated_fees_survive_the_database(db):
+    fill = Fill("o1", "BTC/USDT", Side.BUY, 1.0, 100.0, 0.0, 1, fee_estimated=0.1)
+    db.record_fill(fill)
+    assert db.query("SELECT fee, fee_estimated FROM fills") == [{"fee": 0.0, "fee_estimated": 0.1}]
+
+    pos = Position(
+        symbol="BTC/USDT", side=Side.BUY, quantity=1.0, entry_price=100.0, entry_ts=1,
+        initial_stop=90.0, current_stop=90.0, setup="s", risk_amount=10.0,
+        fees_estimated=0.1,
+    )
+    db.upsert_position(pos)
+    assert db.load_positions()[0]["fees_estimated"] == 0.1
+
+    trade = Trade(
+        symbol="BTC/USDT", side=Side.BUY, setup="s", entry_ts=1, exit_ts=2,
+        entry_price=100.0, exit_price=110.0, quantity=1.0, pnl=9.9, fees=0.1,
+        r_multiple=1.0, mfe_r=1.0, mae_r=0.0, bars_held=1,
+        exit_reason=ExitReason.TAKE_PROFIT, fees_estimated=0.11,
+    )
+    db.record_trade(trade)
+    row = db.recent_trades()[0]
+    assert row["fees_estimated"] == 0.11
+    assert row["pnl_all_fees"] == 1  # written on the new basis, never restated
+    assert db.realised_by_symbol()[0]["fees_estimated"] == pytest.approx(0.11)
+    assert db.realised_by_setup()[0]["fees_estimated"] == pytest.approx(0.11)
+
+
+_OLD_TRADES = """
+CREATE TABLE trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, symbol TEXT NOT NULL,
+    side TEXT NOT NULL, setup TEXT NOT NULL, entry_ts INTEGER NOT NULL,
+    exit_ts INTEGER NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL,
+    quantity REAL NOT NULL, pnl REAL NOT NULL, fees REAL NOT NULL,
+    r_multiple REAL NOT NULL, mfe_r REAL NOT NULL, mae_r REAL NOT NULL,
+    bars_held INTEGER NOT NULL, exit_reason TEXT NOT NULL, regime_at_entry TEXT NOT NULL,
+    conviction_at_entry REAL NOT NULL DEFAULT 0, leverage REAL NOT NULL DEFAULT 1.0,
+    meta TEXT
+);
+"""
+
+
+def _old_row(conn, side, entry, exit_, qty, pnl, fees):
+    conn.execute(
+        "INSERT INTO trades(symbol, side, setup, entry_ts, exit_ts, entry_price, exit_price,"
+        " quantity, pnl, fees, r_multiple, mfe_r, mae_r, bars_held, exit_reason,"
+        " regime_at_entry) VALUES('X/USDT', ?, 's', 1, 2, ?, ?, ?, ?, ?, 0, 0, 0, 1,"
+        " 'take_profit', 'unknown')",
+        (side, entry, exit_, qty, pnl, fees),
+    )
+
+
+def test_rows_written_on_the_old_basis_are_restated_once(tmp_path):
+    """The old ``pnl`` left the entry fee out; every running engine has such rows.
+
+    ``gross - fees`` recomputes the new figure from the row alone, and the gap
+    must be an entry fee. A row whose gap is not one (a scale-out banked money
+    the row does not carry) is left as written rather than restated wrongly.
+    """
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(_OLD_TRADES)
+    # long: gross +20, entry fee 0.2 and exit fee 0.22 -> old pnl 19.78
+    _old_row(conn, "buy", 100.0, 110.0, 2.0, 20.0 - 0.22, 0.42)
+    # short: gross +10, entry 0.06, exit 0.054 -> old pnl 9.946
+    _old_row(conn, "sell", 100.0, 90.0, 1.0, 10.0 - 0.054, 0.114)
+    # a scale-out banked +5 the row cannot show: gap 5.2 is not an entry fee
+    _old_row(conn, "buy", 100.0, 110.0, 1.0, 10.0 + 5.0 - 0.2, 0.4)
+    conn.commit()
+    conn.close()
+
+    database = Database(path)
+    rows = database.query("SELECT pnl, pnl_all_fees, fees_estimated FROM trades ORDER BY id")
+    assert rows[0]["pnl"] == pytest.approx(20.0 - 0.42) and rows[0]["pnl_all_fees"] == 1
+    assert rows[1]["pnl"] == pytest.approx(10.0 - 0.114) and rows[1]["pnl_all_fees"] == 1
+    assert rows[2]["pnl"] == pytest.approx(14.8) and rows[2]["pnl_all_fees"] == 0
+    assert all(r["fees_estimated"] == 0.0 for r in rows)
+    database.close()
+
+    # The panel opens the same file: a second open must not subtract again.
+    again = Database(path)
+    assert again.query("SELECT pnl FROM trades ORDER BY id")[0]["pnl"] == pytest.approx(19.58)
+    again.close()
+
+
+def test_a_row_inserted_by_old_code_after_the_migration_is_restated_too(tmp_path):
+    """Engine and panel restart separately: an engine still on the old code
+    writes rows without mentioning the new column. The column's default marks
+    them as old-basis so the next open brings them over."""
+    path = tmp_path / "t.db"
+    Database(path).close()
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    _old_row(conn, "buy", 100.0, 110.0, 2.0, 20.0 - 0.22, 0.42)
+    conn.commit()
+    conn.close()
+
+    database = Database(path)
+    (row,) = database.query("SELECT pnl, pnl_all_fees FROM trades")
+    assert row["pnl"] == pytest.approx(19.58) and row["pnl_all_fees"] == 1
+    database.close()

@@ -105,6 +105,15 @@ BARS_PER_YEAR = {"1h": 8760, "4h": 2190, "1d": 365}
 HEARTBEAT_SECONDS = 60
 
 
+def bar_age_seconds(bar_ts: int, timeframe: str, now: int) -> float:
+    """Seconds since the bar opening at ``bar_ts`` *closed*, at ``now`` (ms).
+
+    Bars are keyed by their open, so the close is one timeframe later. Measured
+    from the open, every bar would look an hour old on arrival.
+    """
+    return (now - (bar_ts + tf_ms(timeframe))) / 1000
+
+
 @dataclass(slots=True)
 class Runner:
     """Owns the live loop and everything it touches."""
@@ -454,6 +463,9 @@ class Runner:
     # -- per bar -----------------------------------------------------------
 
     def _process_bar(self, bar_ts: int) -> None:
+        # Taken before anything else runs: the question is how late the loop
+        # picked this bar up, not how long the bar then takes to process.
+        bar_age_s = bar_age_seconds(bar_ts, self.config.timeframes.trigger, now_ms())
         frames = self._refresh_data()
         if not frames:
             self.risk.degrade("no market data available")
@@ -530,8 +542,7 @@ class Runner:
                         f"Open positions are still managed and protected.",
                     )
         elif not self._paused and not self.risk.state.degraded and self.state.status != "safe_mode":
-            self._maybe_enter(frames, scans, bar_ts)
-            self._maybe_arm(frames, scans, bar_ts)
+            self._enter_unless_stale(frames, scans, bar_ts, bar_age_s)
 
         point = self._record_bar_equity(bar_ts, marks)
         if equity_jump_is_implausible(self.state.equity, point.equity):
@@ -1066,20 +1077,47 @@ class Runner:
             reason=reason,
         )
 
-    def _venue_fee(self, symbol: str, state: dict, price: float) -> float | None:
-        """The fee the venue charged on a closing fill, in quote.
+    def _venue_fee(
+        self, symbol: str, state: dict, price: float, *, in_base: bool = False
+    ) -> float | None:
+        """The fee the venue charged on a fill, in quote.
 
         A closing fill is a sale on spot and settles in quote on a perpetual, so
         the raw figure is already dollars — only a spot *buy* pays in the base
-        asset (invariant 61), and no venue exit is one. ``None`` when the venue
-        did not say, or said something implausible: over 1% of notional means
-        the unit was misread, and a wrong fee is worse than the assumed one.
+        asset (invariant 61), which is what ``in_base`` is for. ``None`` when
+        the venue did not say, or said something implausible: over 1% of
+        notional means the unit was misread, and a wrong fee is worse than none.
         """
         raw = float(state.get("fee") or 0.0)
+        if in_base:
+            raw *= price
         notional = price * float(state.get("filled") or 0.0)
         if raw <= 0.0 or (notional > 0.0 and raw > notional * 0.01):
             return None
         return raw
+
+    def _fee_split(
+        self, symbol: str, reported: float | None, price: float, quantity: float, stage: str
+    ) -> tuple[float, float]:
+        """``(reported, estimated)`` — exactly one of them carries the fee.
+
+        What the venue reported goes into the ledger. What it did not is still
+        a real cost, but its size is ours: it is estimated at the taker rate
+        and kept *beside* the ledger — out of cash, out of ``pnl`` — so the
+        book never mixes a guess with a fact (invariant 76). The panel shows
+        the estimate in its own box.
+        """
+        if reported is not None and reported > 0.0:
+            return reported, 0.0
+        estimate = price * quantity * self.broker.market_spec(symbol).taker_fee
+        log.warning(
+            "fee_unreported",
+            symbol=symbol,
+            stage=stage,
+            estimated=round(estimate, 6),
+            consequence="estimate kept beside the ledger; not in pnl, fees or cash",
+        )
+        return 0.0, estimate
 
     def _close_from_venue_fill(
         self,
@@ -1098,8 +1136,7 @@ class Runner:
         if position is None:
             return
 
-        if fee is None:
-            fee = price * position.quantity * self.broker.market_spec(symbol).taker_fee
+        fee, fee_estimated = self._fee_split(symbol, fee, price, position.quantity, "venue_exit")
         if reason is None:
             reason = (
                 ExitReason.INITIAL_STOP
@@ -1107,7 +1144,9 @@ class Runner:
                 else ExitReason.TRAILING_STOP
             )
         closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
-        trade = self.portfolio.close_position(symbol, price, now_ms(), reason, fee)
+        trade = self.portfolio.close_position(
+            symbol, price, now_ms(), reason, fee, fee_estimated=fee_estimated
+        )
         if trade is None:
             return
 
@@ -1198,6 +1237,9 @@ class Runner:
             )
             return
         fill_price, filled = self._fill_terms(submitted, plan.price, wanted, "scale_out")
+        fee, fee_estimated = self._fee_split(
+            position.symbol, submitted.fee_paid, fill_price, filled, "scale_out"
+        )
         # Same side the order was built with. Scaling out of a short is a
         # buy-to-cover; writing SELL here would put a trade in the fills table
         # that never happened in that direction.
@@ -1207,13 +1249,18 @@ class Runner:
             side=position.side.opposite,
             quantity=filled,
             price=fill_price,
-            fee=submitted.fee_paid,
+            fee=fee,
             ts=bar_ts,
+            fee_estimated=fee_estimated,
         )
         self.db.upsert_order(submitted)
         self.db.record_fill(fill)
         sold = self.portfolio.scale_out(
-            position.symbol, fill.price, fill.quantity / max(original, 1e-12), fill.fee
+            position.symbol,
+            fill.price,
+            fill.quantity / max(original, 1e-12),
+            fill.fee,
+            fee_estimated=fill.fee_estimated,
         )
         if not sold:
             return
@@ -1584,6 +1631,34 @@ class Runner:
                 row.no_trade_reason = NoTradeReason.BELOW_THRESHOLD
         return selected
 
+    def _enter_unless_stale(
+        self, frames: dict, scans: list[ScanRow], bar_ts: int, age_s: float
+    ) -> None:
+        """Enter on this bar only if it was picked up soon after its close.
+
+        The backtest enters at the next open, seconds after the close. An entry
+        sent half an hour later is sized off a price the market has left and is
+        a trade the backtest never made (audit #97). The selection still runs so
+        the scan table names the symbols that were held back, rather than
+        leaving them at "eligible" (invariant 34).
+        """
+        if age_s <= self.config.entries.max_bar_age_seconds:
+            self._maybe_enter(frames, scans, bar_ts)
+            self._maybe_arm(frames, scans, bar_ts)
+            return
+
+        held = self._select(scans)
+        for row in held:
+            row.no_trade_reason = NoTradeReason.STALE_BAR
+        log.warning(
+            "bar_too_old_for_entries",
+            bar=iso(bar_ts),
+            age_s=round(age_s),
+            limit_s=self.config.entries.max_bar_age_seconds,
+            held_back=[r.symbol for r in held],
+            consequence="open positions managed; no new entries until the next bar",
+        )
+
     def _maybe_enter(self, frames: dict, scans: list[ScanRow], bar_ts: int) -> None:
         """Try candidates best-first, and leave a reason on every one of them.
 
@@ -1742,14 +1817,18 @@ class Runner:
         # inverted, stop on the wrong side of the entry, exits that can never
         # trigger. The literal was harmless only while spot made BUY the sole
         # possibility.
+        fee, fee_estimated = self._fee_split(
+            row.symbol, submitted.fee_paid, fill_price, filled, "entry"
+        )
         fill = Fill(
             order_client_id=submitted.client_id,
             symbol=row.symbol,
             side=side,
             quantity=filled,
             price=fill_price,
-            fee=submitted.fee_paid,
+            fee=fee,
             ts=bar_ts,
+            fee_estimated=fee_estimated,
         )
         self.db.record_fill(fill)
 
@@ -1998,8 +2077,11 @@ class Runner:
 
         filled = float(state.get("filled") or 0.0)
         price = float(state.get("average_price") or 0.0) or float(armed["trigger"])
-        spec = self.broker.market_spec(symbol)
-        fee = price * filled * spec.taker_fee
+        # The venue's own figure; this used to be the taker rate times the fill
+        # every time, written as if charged. A spot buy pays in the base asset.
+        fee, fee_estimated = self._fee_split(
+            symbol, self._venue_fee(symbol, state, price, in_base=True), price, filled, "armed_entry"
+        )
 
         fill = Fill(
             order_client_id=str(armed["client_id"]),
@@ -2009,6 +2091,7 @@ class Runner:
             price=price,
             fee=fee,
             ts=now_ms(),
+            fee_estimated=fee_estimated,
         )
         self.db.record_fill(fill)
 
@@ -2302,9 +2385,6 @@ class Runner:
             order_type=OrderType.MARKET,
             reduce_only=True,
         )
-        # Zero means "the venue never told us", not "it was free" — the
-        # assumed rate below stands in only for that case.
-        charged = 0.0
         self._cancel_protective_stop(symbol)
         submitted = self.watchdog.call("submit_exit", lambda: self.broker.submit(order))
         if submitted is not None:
@@ -2322,7 +2402,11 @@ class Runner:
             return
 
         price, quantity = self._fill_terms(submitted, price, position.quantity, "exit")
-        charged = submitted.fee_paid
+        # Zero means "the venue never told us", not "it was free". That case
+        # is estimated beside the ledger; it used to be written into it.
+        fee, fee_estimated = self._fee_split(
+            symbol, submitted.fee_paid, price, position.quantity, "exit"
+        )
         self.db.record_fill(
             Fill(
                 order_client_id=submitted.client_id,
@@ -2330,16 +2414,20 @@ class Runner:
                 side=position.side.opposite,
                 quantity=quantity,
                 price=price,
-                fee=charged,
+                fee=fee,
                 ts=bar_ts,
+                fee_estimated=fee_estimated,
             )
         )
 
-        spec = self.broker.market_spec(symbol)
-        fee = charged if charged > 0.0 else price * position.quantity * spec.taker_fee
         closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
         trade = self.portfolio.close_position(
-            symbol, price, bar_ts, reason or ExitReason.TRAILING_STOP, fee
+            symbol,
+            price,
+            bar_ts,
+            reason or ExitReason.TRAILING_STOP,
+            fee,
+            fee_estimated=fee_estimated,
         )
         if trade is None:
             return
@@ -2878,6 +2966,7 @@ class Runner:
                     # position that is worth nothing (same rule as holdings).
                     "price": round(mark, 8) if mark else None,
                     "fees_paid": round(p.fees_paid, 6),
+                    "fees_estimated": round(p.fees_estimated, 6),
                 }
             )
         return rows

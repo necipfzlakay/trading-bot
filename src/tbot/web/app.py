@@ -212,6 +212,10 @@ def create_app(config: Config | None = None, engines: dict[str, Config] | None =
                 "starting_equity": snapshot.get("starting_equity"),
                 "realised_total": sum(float(r["pnl"] or 0.0) for r in rows),
                 "fees_total": sum(float(r["fees"] or 0.0) for r in rows),
+                # Fees the venue never reported. Served on their own and never
+                # folded into ``realised_total`` (invariant 76): the panel shows
+                # them in a separate box, with the estimated net beneath it.
+                "fees_estimated_total": sum(float(r["fees_estimated"] or 0.0) for r in rows),
             }
         )
 

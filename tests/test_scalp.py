@@ -585,3 +585,52 @@ def test_every_agreement_refusal_family_drops_the_symbol(engine, reason):
     eng._try_enter(_intent())
     assert SOL in eng._dropped
     assert eng._reject_streak == 0
+
+
+def test_a_venue_exit_with_both_fees_reported_is_net_of_both(engine):
+    """Audit #93 on the scalper: ``pnl`` left the entry fee out, so the panel
+    showed +0.20 over 29 trades while equity had lost 0.54."""
+    eng, venue, db = engine
+    _filled_and_held(eng, venue)  # entry fee 0.012, reported
+    venue.positions = {}
+    venue.exit_fill = {"average_price": 100.29, "fee": 0.07, "kind": "take_profit",
+                       "filled": 1.2, "filled_terminal": True}
+    eng._poll_venue()
+
+    (trade,) = db.trades
+    assert trade.pnl == pytest.approx((100.29 - 99.99) * 1.2 - 0.012 - 0.07)
+    assert trade.fees == pytest.approx(0.082) and trade.fees_estimated == 0.0
+    assert eng.portfolio.cash - 1_000.0 == pytest.approx(trade.pnl)
+
+
+def test_fees_the_venue_did_not_report_are_estimated_beside_the_ledger(engine):
+    """An entry whose ``cumExecFee`` came back empty was booked free; an exit
+    with no fill on record was booked with our taker guess *as if charged*.
+    Both are estimates now, and neither reaches ``pnl``, ``fees`` or cash."""
+    eng, venue, db = engine
+    eng._try_enter(_intent())
+    venue.order_states["oid-0"] = {
+        "status": "Filled", "filled": 1.2, "average_price": 99.99, "fee": 0.0,
+        "terminal": True, "filled_terminal": True,
+    }
+    venue.positions = {SOL: 1.2}
+    eng._poll_venue()
+    position = eng.portfolio.positions[SOL]
+    assert position.fees_paid == 0.0
+    assert position.fees_estimated == pytest.approx(99.99 * 1.2 * SPEC.maker_fee)
+    (entry_fill,) = db.fills
+    assert entry_fill.fee == 0.0 and entry_fill.fee_estimated > 0.0
+
+    venue.positions = {}
+    eng._poll_venue()
+    eng._flat_since[SOL] -= 61.0  # no closing fill ever shows up
+    eng._poll_venue()
+
+    (trade,) = db.trades
+    assert trade.fees == 0.0
+    gross = (trade.exit_price - 99.99) * 1.2
+    assert trade.pnl == pytest.approx(gross)
+    assert trade.fees_estimated == pytest.approx(
+        99.99 * 1.2 * SPEC.maker_fee + trade.exit_price * 1.2 * SPEC.taker_fee
+    )
+    assert eng.portfolio.cash - 1_000.0 == pytest.approx(trade.pnl)

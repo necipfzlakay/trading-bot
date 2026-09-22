@@ -503,6 +503,17 @@ class EntryConfig(StrictModel):
     # of scored candidates die on it - so whether it earns its place decides
     # how often this bot trades at all.
     require_setup: bool = True
+    # How long after a bar's close its decision may still become an entry.
+    # Every number in the repo is the backtest's, and the backtest buys at the
+    # next open — seconds after the close. The loop used to process whatever
+    # bar had closed last on startup, however old: after the 2026-09-22 reset
+    # the demo engine came up at 06:25 and bought AAVE at 06:26 off the close
+    # of 06:00, 26 minutes after the price it was sized from (audit #97).
+    # Measured on the bar the loop *picks up*, not when the entry is sent: the
+    # 79-symbol fast engine needs ~3.5 minutes per bar on every bar, and that
+    # is a constant of the engine, not a stale decision. Open positions are
+    # managed whatever the age.
+    max_bar_age_seconds: float = Field(default=300.0, ge=30, le=86_400)
 
 
 class DataConfig(StrictModel):

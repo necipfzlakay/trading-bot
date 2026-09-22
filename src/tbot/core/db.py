@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from tbot.core.clock import now_ms
+from tbot.core.logging import get_logger
 from tbot.core.models import (
     Conviction,
     EquityPoint,
@@ -28,7 +29,9 @@ from tbot.core.models import (
     Trade,
 )
 
-SCHEMA_VERSION = 1
+log = get_logger("core.db")
+
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -87,6 +90,7 @@ CREATE TABLE IF NOT EXISTS fills (
     is_maker          INTEGER NOT NULL DEFAULT 0,
     exchange_trade_id TEXT,
     ts                INTEGER NOT NULL,
+    fee_estimated     REAL NOT NULL DEFAULT 0,
     UNIQUE(order_client_id, exchange_trade_id)
 );
 CREATE INDEX IF NOT EXISTS idx_fills_symbol_ts ON fills(symbol, ts);
@@ -111,7 +115,8 @@ CREATE TABLE IF NOT EXISTS positions (
     bars_held           INTEGER NOT NULL DEFAULT 0,
     conviction_at_entry REAL NOT NULL DEFAULT 0,
     entry_conviction_id INTEGER,
-    meta                TEXT
+    meta                TEXT,
+    fees_estimated      REAL NOT NULL DEFAULT 0
 );
 
 -- Closed round trips: the unit of performance measurement. MFE/MAE are stored
@@ -137,7 +142,14 @@ CREATE TABLE IF NOT EXISTS trades (
     regime_at_entry     TEXT NOT NULL,
     conviction_at_entry REAL NOT NULL DEFAULT 0,
     leverage            REAL NOT NULL DEFAULT 1.0,
-    meta                TEXT
+    meta                TEXT,
+    -- Ours, for legs the venue did not report a fee on. Never inside pnl.
+    fees_estimated      REAL NOT NULL DEFAULT 0,
+    -- 1 = pnl is net of every reported fee. 0 = the old basis, which left the
+    -- entry fee out (audit #93). The default is the OLD basis on purpose: a
+    -- row inserted by code that predates this column never mentions it, and
+    -- must be recognisable as such so ``_restate_pnl`` can bring it over.
+    pnl_all_fees        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_trades_exit_ts ON trades(exit_ts);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol  ON trades(symbol);
@@ -238,6 +250,8 @@ class Database:
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._add_missing_columns()
+        self._restate_pnl()
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -245,6 +259,72 @@ class Database:
         )
         self._conn.commit()
         self.run_id: int | None = None
+
+    # -- migrations --------------------------------------------------------
+
+    # ``CREATE TABLE IF NOT EXISTS`` never touches a table that already exists,
+    # so a column added to SCHEMA reaches only new databases. Every running
+    # engine has one that predates it.
+    _ADDED_COLUMNS = (
+        ("fills", "fee_estimated", "REAL NOT NULL DEFAULT 0"),
+        ("positions", "fees_estimated", "REAL NOT NULL DEFAULT 0"),
+        ("trades", "fees_estimated", "REAL NOT NULL DEFAULT 0"),
+        ("trades", "pnl_all_fees", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
+    def _add_missing_columns(self) -> None:
+        for table, column, decl in self._ADDED_COLUMNS:
+            have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column in have:
+                continue
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError as exc:
+                # The engine and its panel open the same file; the other one
+                # may have added it between the check and here.
+                if "duplicate column" not in str(exc):
+                    raise
+        self._conn.commit()
+
+    def _restate_pnl(self) -> None:
+        """Bring rows written on the old basis to the one ``pnl`` means now.
+
+        The old ``pnl`` was ``gross - exit fee``; ``fees`` held every leg. So
+        ``gross - fees`` is the new figure, recomputable from the row alone —
+        and the gap between the two must be the entry fee: never negative,
+        never more than ``fees``. A row outside that band had a scale-out,
+        whose banked slice the row does not carry; it is left as written and
+        reported rather than restated with a number that would be wrong.
+
+        One statement, guarded by the flag, so the engine and the panel both
+        running it cannot subtract a fee twice. Rows inserted later by a
+        process still on the old code arrive flagged 0 and are picked up on
+        the next open.
+        """
+        gross = (
+            "(exit_price - entry_price) * quantity * "
+            "(CASE side WHEN 'buy' THEN 1.0 ELSE -1.0 END)"
+        )
+        cur = self._conn.execute(
+            f"""UPDATE trades
+                   SET pnl = {gross} - fees, pnl_all_fees = 1
+                 WHERE pnl_all_fees = 0
+                   AND pnl - ({gross} - fees) BETWEEN -1e-6 AND fees + 1e-6"""
+        )
+        restated = cur.rowcount
+        self._conn.commit()
+        left = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE pnl_all_fees = 0"
+        ).fetchone()["n"]
+        if restated:
+            log.info("trades_pnl_restated", rows=restated, basis="net of every reported fee")
+        if left:
+            log.warning(
+                "trades_pnl_not_restated",
+                rows=left,
+                reason="pnl minus the recomputed net is not an entry fee (scale-out?)",
+                consequence="these rows still exclude the entry fee",
+            )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -336,8 +416,9 @@ class Database:
     def record_fill(self, fill: Fill) -> None:
         self._conn.execute(
             """INSERT OR IGNORE INTO fills(order_client_id, run_id, symbol, side, quantity,
-                                           price, fee, is_maker, exchange_trade_id, ts)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                           price, fee, is_maker, exchange_trade_id, ts,
+                                           fee_estimated)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 fill.order_client_id,
                 self.run_id,
@@ -349,6 +430,7 @@ class Database:
                 int(fill.is_maker),
                 fill.exchange_trade_id,
                 fill.ts,
+                fill.fee_estimated,
             ),
         )
         self._conn.commit()
@@ -360,8 +442,9 @@ class Database:
             """INSERT INTO positions(symbol, run_id, side, quantity, entry_price, entry_ts,
                                      initial_stop, current_stop, setup, risk_amount, leverage,
                                      fees_paid, max_favorable_price, max_adverse_price, bars_held,
-                                     conviction_at_entry, entry_conviction_id, meta)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                     conviction_at_entry, entry_conviction_id, meta,
+                                     fees_estimated)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(symbol) DO UPDATE SET
                    run_id=excluded.run_id, side=excluded.side,
                    quantity=excluded.quantity,
@@ -378,7 +461,7 @@ class Database:
                    bars_held=excluded.bars_held,
                    conviction_at_entry=excluded.conviction_at_entry,
                    entry_conviction_id=excluded.entry_conviction_id,
-                   meta=excluded.meta""",
+                   meta=excluded.meta, fees_estimated=excluded.fees_estimated""",
             (
                 pos.symbol,
                 self.run_id,
@@ -398,6 +481,7 @@ class Database:
                 pos.conviction_at_entry,
                 pos.entry_conviction_id,
                 json.dumps(pos.meta),
+                pos.fees_estimated,
             ),
         )
         self._conn.commit()
@@ -414,8 +498,8 @@ class Database:
             """INSERT INTO trades(run_id, symbol, side, setup, entry_ts, exit_ts, entry_price,
                                   exit_price, quantity, pnl, fees, r_multiple, mfe_r, mae_r,
                                   bars_held, exit_reason, regime_at_entry, conviction_at_entry,
-                                  leverage, meta)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  leverage, meta, fees_estimated, pnl_all_fees)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
             (
                 self.run_id,
                 trade.symbol,
@@ -437,6 +521,7 @@ class Database:
                 trade.conviction_at_entry,
                 trade.leverage,
                 json.dumps(trade.meta),
+                trade.fees_estimated,
             ),
         )
         self._conn.commit()
@@ -453,10 +538,11 @@ class Database:
     def realised_by_symbol(self) -> list[dict[str, Any]]:
         """Closed-trade money, per symbol. "Which of these actually paid?"
 
-        ``pnl`` is already net of fees where the engine recorded them, so
-        ``fees`` comes back alongside rather than subtracted twice — it answers
-        a different question ("what did the round trip cost?") and the panel
-        shows both.
+        ``pnl`` is already net of every fee the venue reported, so ``fees``
+        comes back alongside rather than subtracted twice — it answers a
+        different question ("what did the round trip cost?") and the panel
+        shows both. ``fees_estimated`` is the part the venue never reported:
+        in neither ``pnl`` nor ``fees``, shown beside them (invariant 76).
 
         Deliberately every trade, not a recent window: a symbol's contribution
         is the sum of its life, and a rolling cut would let a loser drop out of
@@ -469,6 +555,7 @@ class Database:
                           COUNT(*)                                   AS trades,
                           SUM(pnl)                                   AS pnl,
                           SUM(fees)                                  AS fees,
+                          SUM(fees_estimated)                        AS fees_estimated,
                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
                           SUM(r_multiple)                            AS r_total,
                           MAX(exit_ts)                               AS last_exit_ts
@@ -492,6 +579,7 @@ class Database:
                           COUNT(*)                                   AS trades,
                           SUM(pnl)                                   AS pnl,
                           SUM(fees)                                  AS fees,
+                          SUM(fees_estimated)                        AS fees_estimated,
                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)   AS wins,
                           AVG(r_multiple)                            AS avg_r
                      FROM trades

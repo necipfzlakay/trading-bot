@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 538 test
+.venv/bin/python -m pytest -q             # 553 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -265,6 +265,19 @@ testi oku — hepsinin kendini koruyan bir testi var.
     %50 dondurmayı her restart'ta unutturur. Tavansız motor taşımaz: onun
     cüzdanını yatırım/çekim oynatır, eski zirve olmamış bir düşüş olur.
     → `Portfolio.carry_over`
+76. **Defter yalnız borsanın bildirdiği komisyonu taşır; tahmin yanında durur.**
+    `pnl` bildirilen **her** bacağın (giriş, kısmi, çıkış) komisyonundan nettir, ve
+    nakit de yalnız onu öder — yani equity − başlangıç = Σpnl + açık. Borsanın
+    bildirmediği bacak (sorgu düştü, boş döndü, birimi imkânsız) sıfır yazılmaz,
+    tahmin de defterin içine yazılmaz: `fees_estimated`'e gider, panelde ayrı
+    "Tahmini fee" kutusunda, altında küçük "tahmini K/Z" ile. Eskiden tahmin
+    `fees`'e "ödendi" diye yazılıyor, bildirilmeyen giriş ise bedava sayılıyordu.
+    → `Runner._fee_split`, `ScalpEngine._fee_split`, `Portfolio.close_position`
+77. **Bayat bardan giriş yok.** Backtest kapanıştan saniyeler sonra girer; motor
+    barı kapanışından `entries.max_bar_age_seconds` (300) sonra *aldıysa* o bar
+    pozisyon yönetir ama giriş açmaz, seçilenler `stale_bar` ile işaretlenir.
+    Ölçülen yaş barın **alındığı** an: fast'in 79 sembolü her barda ~3.5 dk
+    sürüyor, o motorun sabiti, bayat karar değil. → `Runner._enter_unless_stale`
 68. **v5 çağrısının kategorisi ve sembolü sınıfın, literal değil.** ccxt'nin
     yardımcıları türev sözleşme varsayıyor; `category: "spot"` ve
     `replace("/","")` perp'te ya boş liste ya `10001` döndürüyor — ikisi de
@@ -524,7 +537,7 @@ kendi yeni koduma uygulanması: ilk testim yeşildi çünkü testi hataya göre 
 | # | sorun | ciddiyet | durum |
 |---|---|---|---|
 | 92 | **Scalp girişten 1-2 sn sonra dolan TP'yi göremiyordu.** `opened_ms` borsanın dolum anı değil motorun dolumu *fark ettiği* an (3 sn yoklama) idi; ekli TP/SL dolumla birlikte canlanıyor, yani ondan önce dolan kapanış `recent_reduce_fill`'in `since` filtresine "önceki pozisyonun" diye takılıyordu. 5 yoklama sonra `exit_terms_unknown` → son fiyattan, **`initial_stop` etiketiyle**, tahmini taker komisyonla yazılıyordu. Borsaya soruldu: 40 işlemin 3'ü (#27, #28, #29) aslında TP; biri **+0.39'luk kazanç −0.66 zarar** olarak yazılmış. Defter bu üçte toplam ~$0.80 eksik, TP/stop dağılımı 22/18 değil **25/15**. Test fake'i `since`'i yok saydığı için yakalayamazdı | yüksek | `opened_ms` = girişin borsadaki `updatedTime`'ı (`_order_state.updated_ms`), yoksa gönderim anı — `order.created_ts` **değil**, o sinyal barı. Fake artık filtreyi uyguluyor; iki test tamir geri alınınca kırılıyor. **Mevcut üç kayıt düzeltilmedi** — operatör kararı |
-| 93 | **`Trade.pnl` giriş komisyonunu içermiyor, ama her yerde net diye okunuyor.** `close_position`: `pnl = gross − çıkış fee`; giriş fee'si nakitten düşülüyor (equity doğru) ama işlemin `pnl`'ine hiç girmiyor. `report.py` "Net P&L" diye topluyor, `metrics.py` PF/expectancy'yi, `montecarlo.py` karıştırmayı ondan yapıyor. Ölçüldü (aynı koşu, `--to 2026-09-21`, 118 işlem): Σpnl 139.67 / gerçek net 124.10 (equity sonu 1124.58 ile tutan), **PF 1.346 → 1.298**. Scalp'ta rapor +0.73 der, gerçek −0.34 | orta | **açık, işaretlendi.** Düzeltme repodaki her PF/expectancy sayısını değiştirir (Kapı 1 PF satırı ~1.30 olur, hâlâ ≥ 1.2); DB'deki eski satırlarla karışmaması için anlamın nasıl taşınacağı ayrı karar |
+| 93 | **`Trade.pnl` giriş komisyonunu içermiyor, ama her yerde net diye okunuyor.** `close_position`: `pnl = gross − çıkış fee`; giriş fee'si nakitten düşülüyor (equity doğru) ama işlemin `pnl`'ine hiç girmiyor. `report.py` "Net P&L" diye topluyor, `metrics.py` PF/expectancy'yi, `montecarlo.py` karıştırmayı ondan yapıyor. Ölçüldü (aynı koşu, `--to 2026-09-21`, 118 işlem): Σpnl 139.67 / gerçek net 124.10 (equity sonu 1124.58 ile tutan), **PF 1.346 → 1.298**. Scalp'ta rapor +0.73 der, gerçek −0.34 | orta | **düzeltildi (2026-09-22, operatör kararı).** `pnl` artık bildirilen her bacaktan net (değişmez 76). Eski satırlar DB açılışında **bir kez** yeniden yazılıyor: `gross − fees`, aradaki fark giriş komisyonu olmak zorunda (0 ≤ fark ≤ fees), değilse (kısmi çıkış) satır bırakılıp raporlanıyor; `pnl_all_fees` bayrağı iki kez düşülmesini engelliyor. Scalp kopyasında denendi: 30 satır, Σpnl −1.096 = equity 998.904 − 1000, kuruşu kuruşuna. Aynı turda borsanın bildirmediği komisyon ayrı sütuna (`fees_estimated`) taşındı. **Kapı 1 PF satırı eski tabanda** (1.36); yeni tabanda ~1.30, yeniden ölçülmedi |
 
 #92 tam olarak #59–#61'in zaman ekseni: **borsanın saatiyle olmuş bir şeyi kendi saatimizle
 damgalamak.** Fark 1-2 saniye, ama TP'si bir dakikalık hareketi hedefleyen motorda bu
@@ -541,7 +554,7 @@ değil defterdeydi.
 | 94 | **Restart açık pozisyonun kâr/zararını iki kez sayıyordu.** `own_starting_cash` pozisyon değerini `portfolio.equity({})` ile, yani **giriş fiyatıyla** alıyordu; `last_equity` ise piyasa fiyatıyla hesaplanmıştı. Kapanıştaki gerçekleşmemiş P&L nakde gömülüyor, pozisyon fiyatlanınca yeniden sayılıyordu. Demo 14:07'de −4.50 gerçekleşmemişle restart edildi: nakit 314.82 tohumlandı, doğrusu 319.31 — equity kalıcı olarak $4.50 düşük. Kârlı pozisyonda aynı yol equity'yi şişirirdi. Runner ve scalp aynı formülü kullanıyordu | yüksek | equity ile birlikte değerlendiği fiyatlar (`EngineState.equity_marks`) yazılıyor; tohumlama o fiyatlarla çıkarıyor (`carried_book`). Runner'ın bar değeri `_record_bar_equity`'de, state.json'da `equity` bar kapanışında, pozisyon fiyatları nabızda yazıldığı için ikisi aynı an değildi — fiyatlar equity'yle **birlikte** kaydediliyor |
 | 95 | **Scalp #92 tamirinden sonra da bir çıkışı tahminle yazdı.** TAO stop'u 00:00:14 UTC'de (funding) **318.79**'dan doldu; emir geçmişi 15 sn sonra hâlâ göstermiyordu, 5 yoklama doldu, kapanış son fiyattan **319.37** yazıldı: −1.1R işlem −0.49R, defter $0.22 iyimser. Borsa zaten düzken beklemenin maliyeti yok, tahmin ise kalıcı yanlış satır. Ayrıca bekleme yoklama **sayısıyla** ölçülüyordu (değişmez 46) | orta | `EXIT_LOOKUP_SECONDS = 60`, `time.monotonic()` ile. Test: 8 yoklama (eski sınırın üstü) boyunca tahmin yazılmıyor, dolum gelince borsanın fiyatıyla kaydediliyor |
 | 96 | **Restart drawdown'u unutturuyordu.** `seed_from_venue` zirveyi o anki equity'ye sıfırlıyor, `RiskBudget` sıfır zirveyle başlıyordu. %12 düşüşte 0.5x'e inmiş motor restart'ta 1.0x'e dönerdi; %50 dondurma da aynı şekilde. #84(c)'nin (kayıp havuzdan geri dolar) drawdown ikizi | yüksek | tavanlı motor `peak_equity` ve `starting_equity`'yi state'ten taşıyor (değişmez 75). Tavansız (`live.yaml`) taşımıyor |
-| 97 | **Açılışta son kapanmış bar yaşına bakılmadan işleniyor.** `_loop` `last_processed = 0` ile başlıyor; sıfırlamadan sonra 06:25'te açılan demo, 06:00'da kapanan barla 06:26'da **AAVE aldı** — 26 dk bayat kapanıştan, backtest'in t+1 açılışından 26 dk sonra. Her restart canlı/backtest ayrışması üretiyor; #46 ile aynı sınıf, bu kez bekleme döngüsü değil açılış | orta | **açık, işaretlendi.** Önerilen: açılışta pozisyonlar yönetilir, ama bar kapanışından birkaç dakikadan fazla geçtiyse yeni giriş yapılmaz. İşlem popülasyonunu değiştirdiği için operatör kararı |
+| 97 | **Açılışta son kapanmış bar yaşına bakılmadan işleniyor.** `_loop` `last_processed = 0` ile başlıyor; sıfırlamadan sonra 06:25'te açılan demo, 06:00'da kapanan barla 06:26'da **AAVE aldı** — 26 dk bayat kapanıştan, backtest'in t+1 açılışından 26 dk sonra. Her restart canlı/backtest ayrışması üretiyor; #46 ile aynı sınıf, bu kez bekleme döngüsü değil açılış | orta | **düzeltildi (2026-09-22, operatör kararı).** Bar alındığında kapanışından 300 sn'den eskiyse pozisyonlar yönetilir, giriş açılmaz, seçilenler `stale_bar` (değişmez 77). Scalp motoru ayrı döngü, etkilenmiyor |
 
 #94 ve #96 aynı yerden: **restart, defterin kesintisiz olduğu sözünü tutmuyordu.**
 Değişmez 71 "kâr da zarar da onundur" diyor; ama zararın bir kısmı ikinci kez yazılıyor,
@@ -752,7 +765,7 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 | kontrol | değer | |
 |---|---|---|
 | işlem ≥ 50 | 116 | ✅ |
-| profit factor ≥ 1.2 | 1.36 | ✅ |
+| profit factor ≥ 1.2 | 1.36 (eski taban, giriş komisyonu hariç — yeni tabanda ~1.30, #93) | ✅ |
 | maks düşüş ≤ %20 | %15.8 | ✅ |
 | DSR anlamlı | p=1.000 | ⚠️ **geçersiz — bkz. denetim #77** |
 | CPCV yollarının çoğu pozitif | %51.1 | ✅ |

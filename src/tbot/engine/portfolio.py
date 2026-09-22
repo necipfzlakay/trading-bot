@@ -98,6 +98,7 @@ class Portfolio:
             risk_amount=risk_amount,
             leverage=leverage,
             fees_paid=fill.fee,
+            fees_estimated=fill.fee_estimated,
             conviction_at_entry=conviction,
             entry_conviction_id=conviction_id,
             # ``original_quantity`` is what R is measured against for the rest
@@ -107,11 +108,19 @@ class Portfolio:
             meta={"regime_at_entry": regime.value, "original_quantity": fill.quantity},
         )
         self.positions[fill.symbol] = position
+        # Only what the venue reported. An estimated fee is shown beside the
+        # book, never deducted inside it, so cash and ``pnl`` stay one ledger:
+        # equity minus the start is exactly the trades' sum plus what is open.
         self.cash -= fill.notional + fill.fee
         return position
 
     def scale_out(
-        self, symbol: str, price: float, fraction: float, fee: float = 0.0
+        self,
+        symbol: str,
+        price: float,
+        fraction: float,
+        fee: float = 0.0,
+        fee_estimated: float = 0.0,
     ) -> float | None:
         """Sell part of a position, keeping the rest open. Returns the quantity sold.
 
@@ -137,6 +146,7 @@ class Portfolio:
         gross = (price - position.entry_price) * quantity * position.side.sign
         position.quantity -= quantity
         position.fees_paid += fee
+        position.fees_estimated += fee_estimated
         position.meta["scaled_out"] = True
         position.meta["realised_pnl"] = float(position.meta.get("realised_pnl", 0.0)) + gross
         position.meta["scaled_quantity"] = (
@@ -151,8 +161,20 @@ class Portfolio:
         return quantity
 
     def close_position(
-        self, symbol: str, exit_price: float, exit_ts: int, reason: ExitReason, fee: float = 0.0
+        self,
+        symbol: str,
+        exit_price: float,
+        exit_ts: int,
+        reason: ExitReason,
+        fee: float = 0.0,
+        fee_estimated: float = 0.0,
     ) -> Trade | None:
+        """Close the whole position and write its one ``Trade``.
+
+        ``fee`` is the exit fee the venue reported; ``fee_estimated`` is ours
+        for an exit it did not report on. Only the first reaches ``pnl`` and
+        cash (invariant 76).
+        """
         position = self.positions.pop(symbol, None)
         if position is None:
             return None
@@ -161,8 +183,11 @@ class Portfolio:
         # Anything already taken off at a scale-out level is part of this
         # trade's result, not a separate one.
         realised_earlier = float(position.meta.get("realised_pnl", 0.0))
+        # Every reported leg: the entry (and any scale-out) already left cash
+        # when it was paid, so a ``pnl`` that subtracts only the exit fee sums
+        # to more than the account made (audit #93).
         total_fees = position.fees_paid + fee
-        pnl = gross + realised_earlier - fee
+        pnl = gross + realised_earlier - total_fees
 
         # Measured against the risk the position actually carried — original
         # quantity times the initial stop distance — so R stays comparable
@@ -200,6 +225,7 @@ class Portfolio:
             regime_at_entry=Regime(position.meta.get("regime_at_entry", Regime.UNKNOWN.value)),
             conviction_at_entry=position.conviction_at_entry,
             leverage=position.leverage,
+            fees_estimated=position.fees_estimated + fee_estimated,
         )
         self.trades.append(trade)
         self.cash += self._returned
@@ -281,6 +307,7 @@ class Portfolio:
             "win_rate": len(wins) / len(self.trades) if self.trades else 0.0,
             "total_pnl": self.total_pnl(),
             "total_fees": sum(t.fees for t in self.trades),
+            "total_fees_estimated": sum(t.fees_estimated for t in self.trades),
             "profit_factor": gross_win / gross_loss if gross_loss > 0 else float("inf"),
             "expectancy_r": (
                 sum(t.r_multiple for t in self.trades) / len(self.trades) if self.trades else 0.0
@@ -310,6 +337,8 @@ def restore_position(raw: dict) -> Position:
         risk_amount=raw["risk_amount"],
         leverage=raw["leverage"],
         fees_paid=raw["fees_paid"],
+        # ``get``: a row written before the column existed has no estimate.
+        fees_estimated=float(raw.get("fees_estimated") or 0.0),
         max_favorable_price=raw["max_favorable_price"],
         max_adverse_price=raw["max_adverse_price"],
         bars_held=raw["bars_held"],

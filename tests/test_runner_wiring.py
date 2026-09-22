@@ -1703,3 +1703,133 @@ def test_a_bar_that_closes_while_the_previous_one_is_processing_is_not_skipped(m
     loop._loop()
 
     assert processed == [11 * 3_600_000, 12 * 3_600_000]
+
+
+def test_a_fee_in_an_impossible_unit_is_unreported_not_replaced_by_our_rate():
+    """Over 1% of notional means the unit was misread. This used to return the
+    assumed taker rate *as the venue's fee* — a guess in the column that means
+    "charged". Unreported is zero here; the caller estimates it beside the book."""
+    exchange = _settling_exchange(
+        {
+            "orderId": "ex-1", "orderLinkId": "tb-vvv-entr-test", "orderStatus": "Filled",
+            "cumExecQty": "1.31", "cumExecValue": "34.16218", "cumExecFee": "0.9",
+            "avgPrice": "26.078", "side": "Sell",
+        }
+    )
+    order = _market_order()
+    from tbot.core.models import Side
+
+    order.side = Side.SELL
+    submitted = _settling_broker(exchange).submit(order)
+
+    assert submitted.average_price == pytest.approx(26.078)  # the fill itself is known
+    assert submitted.fee_paid == 0.0
+
+
+def test_an_exit_whose_fee_the_venue_did_not_report_keeps_the_estimate_out_of_pnl():
+    """The exit path wrote ``price * qty * taker`` into the trade as if charged."""
+    from tbot.core.models import ExitReason, OrderStatus
+
+    runner, _e, fills, trades, _p = _exit_fixture(
+        venue_holds=1.0, venue_fill=None, submit_status="filled"
+    )
+    runner.portfolio.positions["SOL/USDT:USDT"].fees_paid = 0.0675  # entry, reported
+
+    def submit(order):
+        order.status = OrderStatus.FILLED
+        order.average_price, order.filled_quantity, order.fee_paid = 114.0, 1.0, 0.0
+        return order
+
+    runner.broker.submit = submit
+    cash_before = runner.portfolio.cash
+    runner._close("SOL/USDT:USDT", 114.0, 1_000, ExitReason.TIME_STOP)
+
+    (trade,) = trades
+    assert trade.fees == pytest.approx(0.0675)  # only what the venue reported
+    assert trade.fees_estimated == pytest.approx(114.0 * SPEC.taker_fee)
+    assert trade.pnl == pytest.approx((114.0 - 112.58) - 0.0675)
+    (fill,) = fills
+    assert fill.fee == 0.0 and fill.fee_estimated == pytest.approx(114.0 * SPEC.taker_fee)
+    assert runner.portfolio.cash - cash_before == pytest.approx(114.0)  # proceeds, no guess
+
+
+def test_a_venue_exit_without_a_reported_fee_is_estimated_beside_the_ledger():
+    from tbot.core.models import ExitReason
+
+    venue_fill = {
+        "filled_terminal": True, "filled": 1.0, "average_price": 114.34,
+        "fee": 0.0, "kind": "take_profit",
+    }
+    runner, _e, _f, trades, _p = _exit_fixture(
+        venue_holds=0.0, venue_fill=venue_fill, submit_status="rejected"
+    )
+    runner._close("SOL/USDT:USDT", 114.33, 1_000, ExitReason.TAKE_PROFIT)
+
+    (trade,) = trades
+    assert trade.fees == 0.0
+    assert trade.fees_estimated == pytest.approx(114.34 * SPEC.taker_fee)
+    assert trade.pnl == pytest.approx(114.34 - 112.58)
+
+
+def test_bar_age_is_measured_from_the_close_not_the_open():
+    """Bars are keyed by their open; measured from it, every bar arrives an
+    hour old and nothing would ever be entered."""
+    from tbot.engine.runner import bar_age_seconds
+
+    hour = 3_600_000
+    five_am = 1_790_056_800_000  # 2026-09-22 05:00 UTC
+    assert bar_age_seconds(five_am, "1h", five_am + hour + 2_000) == pytest.approx(2.0)
+    # The reset: the engine came up at 06:25 and bought off the 06:00 close.
+    assert bar_age_seconds(five_am, "1h", five_am + hour + 26 * 60_000) == pytest.approx(1560.0)
+
+
+def _stale_fixture():
+    from tbot.core.config import Config, ConvictionConfig
+    from tbot.engine.runner import Runner
+
+    entered: list[str] = []
+
+    class Recording(Runner):
+        def _enter(self, data, row, bar_ts):
+            entered.append(row.symbol)
+            return True
+
+        def _maybe_arm(self, frames, scans, bar_ts):
+            pass
+
+    class Book:
+        positions: dict = {}
+
+    runner = Recording.__new__(Recording)
+    runner.portfolio = Book()
+    base = Config()
+    runner.config = base.model_copy(
+        update={"conviction": ConvictionConfig(selection="absolute")}
+    )
+    return runner, entered
+
+
+def test_a_bar_picked_up_long_after_its_close_opens_nothing():
+    """Audit #97: after the 2026-09-22 reset the demo engine came up at 06:25
+    and bought AAVE at 06:26 off the 06:00 close — a trade the backtest, which
+    enters seconds after the close, never made. The selection still runs, so
+    the scan table names what was held back (invariant 34)."""
+    from tbot.core.models import NoTradeReason
+
+    runner, entered = _stale_fixture()
+    rows = [_scan_row("AAA/USDT", 80.0), _scan_row("BBB/USDT", 70.0)]
+    runner._enter_unless_stale({r.symbol: {} for r in rows}, rows, 0, age_s=1560.0)
+
+    assert entered == []
+    assert all(r.no_trade_reason is NoTradeReason.STALE_BAR for r in rows)
+
+
+def test_a_bar_picked_up_on_time_enters_as_before():
+    from tbot.core.models import NoTradeReason
+
+    runner, entered = _stale_fixture()
+    rows = [_scan_row("AAA/USDT", 80.0)]
+    runner._enter_unless_stale({r.symbol: {} for r in rows}, rows, 0, age_s=2.0)
+
+    assert entered == ["AAA/USDT"]
+    assert rows[0].no_trade_reason is NoTradeReason.ENTERED

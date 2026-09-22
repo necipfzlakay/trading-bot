@@ -244,3 +244,58 @@ def test_orphan_open_orders_are_reported():
     )
     report = reconcile({}, {}, [order], known_client_ids=set())
     assert report.orphan_orders == ["unknown-id"]
+
+
+def test_trade_pnl_is_net_of_every_reported_fee_and_matches_the_cash():
+    """``pnl`` subtracted only the exit fee while cash paid both legs.
+
+    Measured on one backtest (audit #93): the trade rows summed to 139.67, the
+    equity curve had made 124.10, and PF read 1.346 instead of 1.298. The
+    identity that must hold is the one the account sees: what cash gained over
+    the round trip is exactly the trade's ``pnl``.
+    """
+    from tbot.core.models import Fill
+
+    portfolio = Portfolio(starting_cash=1000.0)
+    fill = Fill("o1", "BTC/USDT", Side.BUY, 2.0, 100.0, 0.20, 0)
+    portfolio.open_position(fill, 90.0, "s", 20.0, 70.0, Regime.TREND_UP)
+    trade = portfolio.close_position("BTC/USDT", 110.0, 1, ExitReason.TAKE_PROFIT, fee=0.22)
+
+    assert trade.pnl == pytest.approx(2.0 * 10.0 - 0.20 - 0.22)
+    assert trade.fees == pytest.approx(0.42)
+    assert portfolio.cash - 1000.0 == pytest.approx(trade.pnl)
+
+
+def test_an_estimated_fee_is_carried_beside_the_ledger_never_inside_it():
+    """A fee the venue did not report is real, but its size is ours.
+
+    It used to be written into ``fees`` as if charged (or as zero), so a guess
+    passed for a fact in every PnL, PF and equity figure. It must reach the
+    trade — the panel shows it — and stay out of ``pnl``, ``fees`` and cash.
+    """
+    from tbot.core.models import Fill
+
+    portfolio = Portfolio(starting_cash=1000.0)
+    fill = Fill("o1", "BTC/USDT", Side.BUY, 2.0, 100.0, 0.0, 0, fee_estimated=0.20)
+    portfolio.open_position(fill, 90.0, "s", 20.0, 70.0, Regime.TREND_UP)
+    trade = portfolio.close_position(
+        "BTC/USDT", 110.0, 1, ExitReason.TAKE_PROFIT, fee=0.0, fee_estimated=0.22
+    )
+
+    assert trade.pnl == pytest.approx(20.0)
+    assert trade.fees == 0.0
+    assert trade.fees_estimated == pytest.approx(0.42)
+    assert portfolio.cash - 1000.0 == pytest.approx(trade.pnl)
+    assert portfolio.summary()["total_fees_estimated"] == pytest.approx(0.42)
+
+
+def test_a_short_s_pnl_is_net_of_both_legs_too():
+    from tbot.core.models import Fill
+
+    portfolio = Portfolio(starting_cash=1000.0)
+    fill = Fill("o1", "S/USDT", Side.SELL, 1.0, 100.0, 0.06, 0)
+    portfolio.open_position(fill, 105.0, "s", 5.0, 70.0, Regime.TREND_DOWN)
+    trade = portfolio.close_position("S/USDT", 90.0, 1, ExitReason.TAKE_PROFIT, fee=0.054)
+
+    assert trade.pnl == pytest.approx(10.0 - 0.06 - 0.054)
+    assert portfolio.cash - 1000.0 == pytest.approx(trade.pnl)

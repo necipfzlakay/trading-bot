@@ -363,6 +363,18 @@ function table(el, cols, rows, render, foot){
    Fees are subtracted here because they are already paid. The exit fee is not,
    and is not guessed: an unrealised number that quietly prices a sale nobody
    has made is the same mistake as `average_price or price` (invariant 60). */
+/* Reported fee, then the estimate beside it — never added together
+   (invariant 76). The estimate is marked "~" so a screenshot cannot pass it
+   off as something the venue charged. */
+function feeCell(reported, estimated){
+  const r = Number(reported)||0, e = Number(estimated)||0;
+  if(!r && !e) return '—';
+  const parts = [];
+  if(r) parts.push(fmt(r));
+  if(e) parts.push(`<span class="warn" title="borsa bildirmedi — tahmin, toplamlara dahil değil">~${fmt(e)}</span>`);
+  return parts.join(' ');
+}
+
 function money(p, px){
   const qty = Math.abs(Number(p.quantity)||0);
   const cost = nz(p.entry) && qty ? p.entry*qty : null;
@@ -392,6 +404,7 @@ const REASON = {
   stale_data:           ['veri bayat',         'Son bar çok eski, puanlama yapılmadı'],
   risk_budget_exhausted:['risk bütçesi bitti', 'Bu dönemin risk bütçesi tükendi'],
   cooldown_same_bar:    ['aynı bar beklemesi', 'Aynı barda ikinci giriş yok'],
+  stale_bar:            ['bar bayat',          'Seçildi, ama bar kapanışının üzerinden çok zaman geçmişti (restart ya da gecikme). Backtest bir sonraki açılışta girer; yarım saat sonraki giriş onun ölçmediği bir işlem olurdu'],
   entered:              ['işleme girdi',       'Bu satır pozisyona dönüştü — red değil'],
   eligible:             ['uygun',              'Engel yok'],
 };
@@ -665,6 +678,10 @@ async function refresh(){
 
   const pnlTrades = (pnl0&&pnl0.symbols||[]).reduce((t,r)=>t+(r.trades||0), 0);
   const pnlDone = pnl0 ? Number(pnl0.realised_total)||0 : null;
+  // Fees the venue never reported (invariant 76). Kept out of every total on
+  // this page — "Gerçekleşen" included — and shown in their own box, with the
+  // net they would imply printed small beneath it.
+  const feeEst = pnl0 ? Number(pnl0.fees_estimated_total)||0 : 0;
   $('kpis').innerHTML = [
     ['Equity',   fmt(s.equity), cls(delta), base?`başlangıç ${fmt(base)}`:'',
       'Hesabın toplam değeri: nakit + açık pozisyonların güncel piyasa değeri. Canlıda borsadan okunur.'],
@@ -679,7 +696,10 @@ async function refresh(){
     // shows up. One "profit" figure would hide exactly that case.
     ['Gerçekleşen', nz(pnlDone)?sign(pnlDone):'—', cls(pnlDone),
       pnlTrades?`${pnlTrades} kapanmış işlem`:'henüz kapanmış işlem yok',
-      'Kapanmış işlemlerden kalan net para, komisyon düşülmüş. Bu sayı artık değişmez.'],
+      'Kapanmış işlemlerden kalan net para. Yalnız borsanın bildirdiği komisyon düşülmüştür; bildirmediği komisyon yandaki "Tahmini fee" kutusunda. Bu sayı artık değişmez.'],
+    ['Tahmini fee', feeEst>0?fmt(feeEst):'—', feeEst>0?'warn':'dim',
+      feeEst>0&&nz(pnlDone)?`tahmini K/Z ${sign(pnlDone-feeEst)}`:'hepsi borsadan okundu',
+      'Borsanın dolum için komisyon bildirmediği bacaklar (sorgu başarısız, boş ya da birimi yanlış döndü). Varsayılan oranla tahmin edilir ve hiçbir toplama katılmaz — Gerçekleşen de, Equity de yalnız borsanın bildirdiğini içerir. Alttaki "tahmini K/Z", Gerçekleşen eksi bu tahmin.'],
     ['Açık K/Z', pos.length?(openKnown?sign(openPnl):'—'):'—', cls(pos.length&&openKnown?openPnl:null),
       pos.length?`maliyet ${fmt(openCost)}`:'açık pozisyon yok',
       'Elde tutulan pozisyonların şu anki kâr/zararı. Piyasayla oynar ve pozisyon kapanana kadar gerçekleşmez.'],
@@ -708,7 +728,7 @@ async function refresh(){
      {t:'fiyat', num:1, h:'Borsadan okunan anlık fiyat — son bar kapanışı değil'},
      {t:'maliyet', num:1, h:'Bu pozisyona giren para: giriş fiyatı × adet (USDT)'},
      {t:'değer', num:1, h:'Şu anki piyasa değeri: anlık fiyat × adet (USDT)'},
-     {t:'K/Z', num:1, h:'Açık kâr/zarar, USDT. Ödenmiş giriş komisyonu düşülmüştür; çıkış komisyonu daha ödenmedi, o yüzden tahmin edilmez'},
+     {t:'K/Z', num:1, h:'Açık kâr/zarar, USDT. Borsanın bildirdiği giriş komisyonu düşülmüştür; çıkış komisyonu daha ödenmedi, o yüzden tahmin edilmez'},
      {t:'K/Z %', num:1, h:'Açık kâr/zararın bu pozisyonun maliyetine oranı'},
      {t:'stop', num:1, h:'Koruyucu stop seviyesi. Borsada duruyor, yani bot kapalıyken de korur'},
      {t:'R şimdi', num:1, h:'Şu anki kâr/zarar, risk birimi cinsinden. 1R = giriş ile ilk stop arası mesafe. +1.05 = risk ettiğinin 1.05 katı kârda'},
@@ -775,6 +795,7 @@ async function refresh(){
       trades: r ? r.trades : 0,
       wins: r ? r.wins : 0,
       fees: r ? Number(r.fees)||0 : 0,
+      feesEst: r ? Number(r.fees_estimated)||0 : 0,
       realised: rp,
       open: op,
       // Unknown is not zero. A position whose price could not be read must not
@@ -800,14 +821,14 @@ async function refresh(){
      {t:'isabet', num:1, h:'Kârla kapanan işlemlerin oranı'},
      {t:'ort. R', num:1, h:'İşlem başına ortalama R'},
      {t:'gerçekleşen', num:1, h:'Kapanmış işlemlerin net kâr/zararı (USDT), komisyon düşülmüş'},
-     {t:'komisyon', num:1, h:'Bu kuruluma ödenen toplam ücret'},
+     {t:'komisyon', num:1, h:'Bu kuruluma ödenen toplam ücret. ~ ile başlayan kısım borsanın bildirmediği, tahmin edilen ve gerçekleşene dahil olmayan komisyon'},
      {t:'',cl:'fill'}],
     (pnl0&&pnl0.setups)||[], r=>`<tr><td class="sym">${esc(r.setup)}</td>
       <td class="num dim">${r.trades}</td>
       <td class="num dim">${r.trades?pct(r.wins/r.trades):'—'}</td>
       <td class="num ${cls(r.avg_r)}">${fmt(r.avg_r,3)}</td>
       <td class="num ${cls(r.pnl)}">${sign(Number(r.pnl)||0)}</td>
-      <td class="num faint">${r.fees?fmt(r.fees):'—'}</td><td class="fill"></td></tr>`);
+      <td class="num faint">${feeCell(r.fees, r.fees_estimated)}</td><td class="fill"></td></tr>`);
 
   table($('pnl'),
     [{t:'sembol', h:'Enstrüman'},
@@ -817,7 +838,7 @@ async function refresh(){
      {t:'açık', num:1, h:'Hâlâ açık pozisyonun şu anki kâr/zararı (USDT). Kapanana kadar gerçekleşmez'},
      {t:'toplam', num:1, h:'Gerçekleşen + açık: bu sembolün hesaba net katkısı (USDT)'},
      {t:'hesaba etkisi', num:1, h:'Toplamın bu koşunun başlangıç equity\'sine oranı — sembolün kendi maliyetine değil'},
-     {t:'komisyon', num:1, h:'Bu sembole ödenen toplam ücret. Gerçekleşenden zaten düşülmüştür'},
+     {t:'komisyon', num:1, h:'Bu sembole ödenen, borsanın bildirdiği ücret — gerçekleşenden zaten düşülmüştür. ~ ile başlayan kısım borsanın bildirmediği, tahmin edilen ve hiçbir toplama katılmayan komisyon'},
      {t:'',cl:'fill'}],
     pnlRows, r=>`<tr><td class="sym">${esc(r.symbol)}</td>
       <td class="num dim">${r.trades||'—'}</td>
@@ -826,7 +847,7 @@ async function refresh(){
       <td class="num ${cls(r.open)}">${r.openCost?sign(r.open):'—'}</td>
       <td class="num ${cls(r.total)}">${sign(r.total)}</td>
       <td class="num ${cls(r.total)}">${base&&r.total!=null?pct(r.total/base):'—'}</td>
-      <td class="num faint">${r.fees?fmt(r.fees):'—'}</td><td class="fill"></td></tr>`,
+      <td class="num faint">${feeCell(r.fees, r.feesEst)}</td><td class="fill"></td></tr>`,
     pnlRows.length ? `<tr><td class="sym">toplam</td>
       <td class="num">${sum('trades')||'—'}</td>
       <td class="num dim">${sum('trades')?pct(sum('wins')/sum('trades')):'—'}</td>
@@ -834,7 +855,7 @@ async function refresh(){
       <td class="num ${cls(openKnown?openPnl:null)}">${pos.length?(openKnown?sign(openPnl):'—'):'—'}</td>
       <td class="num ${cls(allKnown&&openKnown?grandTotal:null)}">${allKnown&&openKnown?sign(grandTotal):'—'}</td>
       <td class="num ${cls(allKnown&&openKnown?grandTotal:null)}">${base&&allKnown&&openKnown?pct(grandTotal/base):'—'}</td>
-      <td class="num faint">${sum('fees')?fmt(sum('fees')):'—'}</td><td class="fill"></td></tr>` : '');
+      <td class="num faint">${feeCell(sum('fees'), sum('feesEst'))}</td><td class="fill"></td></tr>` : '');
 
   // Three columns, not one. Showing only "free" would report a position that
   // is correctly protected — its stop reserves the base asset — as no position.

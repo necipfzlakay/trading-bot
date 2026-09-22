@@ -87,6 +87,17 @@ def main() -> int:
     if trades.empty:
         lines += ["_Bu dönemde kapanan işlem yok._", ""]
     else:
+        # Fees the venue never reported: shown beside the P&L, never subtracted
+        # from it (invariant 76).
+        estimated = float(trades["fees_estimated"].sum()) if "fees_estimated" in trades else 0.0
+        estimated_line = (
+            [
+                f"- Tahmini komisyon (borsa bildirmedi, P&L'e dahil değil): {estimated:.4f} "
+                f"· tahmini P&L: {trades['pnl'].sum() - estimated:+.4f}"
+            ]
+            if estimated > 0
+            else []
+        )
         wins = trades[trades["pnl"] > 0]
         gross_win = float(wins["pnl"].sum())
         gross_loss = float(-trades[trades["pnl"] <= 0]["pnl"].sum())
@@ -95,6 +106,7 @@ def main() -> int:
             f"- Expectancy: **{trades['r_multiple'].mean():+.3f}R** · "
             f"profit factor: **{gross_win / gross_loss if gross_loss else float('inf'):.2f}**",
             f"- Net P&L: **{trades['pnl'].sum():+.4f}** · komisyon: {trades['fees'].sum():.4f}",
+            *estimated_line,
             f"- Ortalama MFE {trades['mfe_r'].mean():+.2f}R · "
             f"ortalama MAE {trades['mae_r'].mean():+.2f}R",
             f"- Ortalama tutuş: {trades['bars_held'].mean():.0f} bar",
