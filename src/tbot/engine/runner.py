@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +63,12 @@ from tbot.data.integrity import MIN_BARS_BY_TIMEFRAME
 from tbot.data.store import ParquetStore
 from tbot.engine.claims import SymbolClaims
 from tbot.engine.portfolio import Portfolio, restore_position
-from tbot.engine.siblings import carried_book, own_starting_cash, sibling_reservation
+from tbot.engine.siblings import (
+    CarriedBook,
+    carried_book,
+    own_starting_cash,
+    sibling_reservation,
+)
 from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.engine.watchdog import Watchdog
 from tbot.execution.broker import Broker, client_order_id
@@ -265,11 +270,17 @@ class Runner:
                 ip_whitelist_acknowledged=self.config.security.ip_whitelist_acknowledged,
             )
 
+        # Before reconciliation: booking an exit the venue performed while we
+        # were down writes a snapshot, which would then be read back as the
+        # previous run's book (the scalp engine did exactly that — see
+        # ``ScalpEngine.start``).
+        carried = carried_book(self.writer.read())
+        realised = 0.0
         if self.config.engine.reconcile_on_start:
-            self._reconcile()
+            realised = self._reconcile(carried.marks)
         self._sync_claims()
 
-        balance = self._seed_capital(self._equity_now())
+        balance = self._seed_capital(self._equity_now(), carried, realised_since=realised)
         self.state.cash = self.portfolio.cash
         self.state.starting_equity = self.portfolio.starting_cash
         self.state.open_positions = self._positions_view()
@@ -1138,11 +1149,11 @@ class Runner:
 
         fee, fee_estimated = self._fee_split(symbol, fee, price, position.quantity, "venue_exit")
         if reason is None:
-            reason = (
-                ExitReason.INITIAL_STOP
-                if position.current_stop <= position.initial_stop
-                else ExitReason.TRAILING_STOP
-            )
+            # Trailed means moved in the position's favour: up for a long,
+            # *down* for a short. ``current <= initial`` read every trailed
+            # short as its initial stop (invariant 64's class).
+            trailed = (position.current_stop - position.initial_stop) * position.side.sign > 0
+            reason = ExitReason.TRAILING_STOP if trailed else ExitReason.INITIAL_STOP
         closing_meta = dict(getattr(self.portfolio.positions.get(symbol), "meta", {}) or {})
         trade = self.portfolio.close_position(
             symbol, price, now_ms(), reason, fee, fee_estimated=fee_estimated
@@ -2565,7 +2576,19 @@ class Runner:
                     + "\n".join(f"• {c}" for c in concerns[:4])
                 )
 
-    def _reconcile(self) -> None:
+    def _reconcile(self, marks: dict[str, float] | None = None) -> float:
+        """Local positions against the venue at startup.
+
+        A position the venue closed while the process was down — its own stop,
+        or a perpetual's target — is booked on the venue's fill, as
+        ``_detect_venue_exits`` would have done had we been running. It used to
+        be dropped: no trade row, and the book settled at the previous run's
+        mark instead of the fill. Since what fills while nobody watches is
+        mostly stops, that biased every statistic upward.
+
+        Returns what those exits changed the book by, measured from the prices
+        the previous run's equity used (``marks``), so seeding can carry it.
+        """
         for raw in self.db.load_positions():
             self.portfolio.positions[raw["symbol"]] = restore_position(raw)
 
@@ -2583,13 +2606,24 @@ class Runner:
                 reason="venue positions could not be read",
                 consequence="local positions are kept as-is until the next successful read",
             )
-            return
+            return 0.0
         if self.claims is not None:
             # A position another engine claimed is theirs, working as designed.
             # Reporting it as ``unexpected_venue_position`` on every start is a
             # warning no action can clear (audit #32's lesson).
             others = self.claims.held_by_others()
             venue_positions = {s: q for s, q in venue_positions.items() if s not in others}
+
+        valued_before = self.portfolio.equity(marks or {})
+        if isinstance(self.broker, CCXTBroker):
+            for symbol, position in list(self.portfolio.positions.items()):
+                if float(venue_positions.get(symbol, 0.0)) >= position.quantity * 0.05:
+                    continue
+                state = self._venue_exit_state(symbol, position)
+                if state and state.get("filled_terminal") and float(state.get("filled") or 0) > 0:
+                    self._close_from_venue_state(symbol, position, state)
+        realised = self.portfolio.equity(marks or {}) - valued_before
+
         open_orders = (
             self.watchdog.call(
                 "fetch_open_orders", lambda: self.broker.fetch_open_orders(), default=[]
@@ -2637,6 +2671,9 @@ class Runner:
         )
         if not report.clean and self.notifier:
             self.notifier.notify_error("Reconciliation mismatch", report.summary())
+        if realised:
+            log.info("venue_exits_booked_at_start", realised=round(realised, 6))
+        return realised
 
     def _release_claim(self, symbol: str) -> None:
         if self.claims is not None and self.claims.release(symbol):
@@ -2701,8 +2738,18 @@ class Runner:
         self.state.equity_marks = {s: marks[s] for s in self.portfolio.positions if s in marks}
         return point
 
-    def _seed_capital(self, balance: float) -> float:
-        """Seed the book from the venue and the previous run; return equity."""
+    def _seed_capital(
+        self,
+        balance: float,
+        last: CarriedBook | None = None,
+        *,
+        realised_since: float = 0.0,
+    ) -> float:
+        """Seed the book from the venue and the previous run; return equity.
+
+        ``realised_since`` is what exits booked at startup changed the book by
+        relative to the previous run's equity (``_reconcile``).
+        """
         # Invariant 19: the balance comes from the venue, never from config.
         # Seeding here keeps the portfolio, the sizing cash limit and the equity
         # curve on the same real number.
@@ -2720,7 +2767,9 @@ class Runner:
         # when judging its hypothesis.
         cap = self.config.risk.max_capital
         reserved, breakdown = (0.0, {}) if cap > 0 else sibling_reservation(self.config)
-        last = carried_book(self.writer.read())
+        last = carried_book(self.writer.read()) if last is None else last
+        if last.equity is not None and realised_since:
+            last = replace(last, equity=last.equity + realised_since)
         cash = own_starting_cash(
             venue_free=balance,
             # At the prices inside ``last.equity`` — see ``carried_book``.

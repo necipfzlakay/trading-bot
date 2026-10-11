@@ -33,7 +33,7 @@ from __future__ import annotations
 import signal as os_signal
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tbot.core.clock import now_ms
 from tbot.core.config import Config, Secrets
@@ -52,7 +52,7 @@ from tbot.core.models import (
 )
 from tbot.engine.claims import SymbolClaims
 from tbot.engine.portfolio import Portfolio, restore_position
-from tbot.engine.siblings import carried_book, own_starting_cash
+from tbot.engine.siblings import CarriedBook, carried_book, own_starting_cash
 from tbot.engine.state import EngineState, RestartTracker, StateWriter
 from tbot.execution.ccxt_broker import PerpBroker
 from tbot.execution.safety import assert_key_is_safe
@@ -175,8 +175,14 @@ class ScalpEngine:
         self.broker.load_markets()
         self._restrict_to_tradeable_books()
         self._cancel_leftover_entries()
-        self._reconcile()
-        self._seed_capital()
+        # Before reconciliation: closing a position the venue exited while we
+        # were down writes a snapshot, and that snapshot — the unseeded book —
+        # would then be read back as the previous run's. Measured: 567.46 of a
+        # $1000 allocation came back as 1317.73 with its peak reset, the $500
+        # kill criterion pushed out of reach.
+        carried = carried_book(self.writer.read())
+        realised = self._reconcile(carried.marks)
+        self._seed_capital(carried, realised_since=realised)
         for symbol in self.symbols:
             self._load_history(symbol)
         if not self.stream.start():
@@ -262,14 +268,23 @@ class ScalpEngine:
                 self.broker.cancel_order(order.symbol, order.exchange_id)
                 log.info("leftover_entry_cancelled", symbol=order.symbol, client_id=order.client_id)
 
-    def _reconcile(self) -> None:
-        """Local positions against the venue, before anything new is opened."""
+    def _reconcile(self, marks: dict[str, float] | None = None) -> float:
+        """Local positions against the venue, before anything new is opened.
+
+        Returns what the exits booked here changed the book by, measured from
+        the prices the previous run's equity valued them at (``marks``). That
+        equity is where seeding restarts from, and it knew nothing of a stop
+        that filled after the process went down: without the difference the
+        trade's P&L reaches ``trades`` but not the book, and equity minus the
+        allocation stops equalling the sum of the trades (invariant 76).
+        """
         for raw in self.db.load_positions():
             self.portfolio.positions[raw["symbol"]] = restore_position(raw)
         held = self.broker.fetch_positions()
         if held is None:
             log.error("reconcile_skipped", reason="venue positions unreadable")
-            return
+            return 0.0
+        valued_before = self.portfolio.equity(marks or {})
         for symbol, position in list(self.portfolio.positions.items()):
             self.claims.claim(symbol, reason="held at start")
             if float(held.get(symbol, 0.0)) < position.quantity * 0.05:
@@ -286,10 +301,17 @@ class ScalpEngine:
                     venue_quantity=held.get(symbol),
                     consequence="kept claimed so no other engine nets into it",
                 )
-        log.info("reconcile_complete", positions=len(self.portfolio.positions))
+        realised = self.portfolio.equity(marks or {}) - valued_before
+        log.info("reconcile_complete", positions=len(self.portfolio.positions),
+                 realised_while_down=round(realised, 6))
+        return realised
 
-    def _seed_capital(self) -> None:
-        last = carried_book(self.writer.read())
+    def _seed_capital(
+        self, last: CarriedBook | None = None, *, realised_since: float = 0.0
+    ) -> None:
+        last = carried_book(self.writer.read()) if last is None else last
+        if last.equity is not None and realised_since:
+            last = replace(last, equity=last.equity + realised_since)
         free = self.broker.fetch_balance().get(self.config.quote_currency, 0.0)
         cash = own_starting_cash(
             venue_free=free,

@@ -280,6 +280,8 @@ def test_the_perp_broker_refuses_to_start_above_the_configured_leverage():
     broker._specs = {}
 
     class Exchange:
+        markets = {"SOL/USDT:USDT": {}}
+
         def set_leverage(self, *a, **k):
             return None
 
@@ -314,6 +316,8 @@ def test_leverage_above_one_requires_isolated_margin():
     broker._specs = {}
 
     class Exchange:
+        markets = {"SOL/USDT:USDT": {}}
+
         def set_leverage(self, *a, **k):
             return None
 
@@ -329,6 +333,47 @@ def test_leverage_above_one_requires_isolated_margin():
     broker.exchange = Exchange()
     with pytest.raises(RuntimeError, match="isolated margin"):
         broker.assert_venue_ready(["SOL/USDT:USDT"])
+
+
+def test_a_delisted_symbol_does_not_stop_the_perp_engine():
+    """Bybit delisted STG/USDT:USDT mid-test. ``set_leverage`` failed on it,
+    the preflight refused, and the fast engine crash-looped under launchd. A
+    symbol the venue no longer lists cannot be ordered or held; it leaves the
+    universe, the rest of the preflight still binds.
+    """
+    from tbot.core.models import Venue
+    from tbot.execution.ccxt_broker import PerpBroker
+
+    broker = PerpBroker.__new__(PerpBroker)
+    broker.quote = "USDT"
+    broker.venue = Venue.BYBIT_DEMO
+    broker.margin_mode = "isolated"
+    broker.leverage = 1.0
+    broker._markets_loaded = True
+    broker._specs = {}
+    asked: list[str] = []
+
+    class Exchange:
+        markets = {"SOL/USDT:USDT": {}}
+
+        def set_leverage(self, leverage, symbol):
+            asked.append(symbol)
+            if symbol not in self.markets:
+                raise ccxt.BadSymbol(f"bybit does not have market symbol {symbol}")
+
+        def set_margin_mode(self, *a, **k):
+            return None
+
+        def privateGetV5PositionList(self, params):
+            return {"result": {"list": [{"symbol": "SOLUSDT", "leverage": "1"}]}}
+
+        def privateGetV5AccountInfo(self, params):
+            return {"result": {"marginMode": "ISOLATED_MARGIN"}}
+
+    broker.exchange = Exchange()
+    broker.assert_venue_ready(["SOL/USDT:USDT", "STG/USDT:USDT"])
+    assert asked == ["SOL/USDT:USDT"]
+    assert broker.listed(["SOL/USDT:USDT", "STG/USDT:USDT"]) == ["SOL/USDT:USDT"]
 
 
 # --------------------------------------------------------------------------

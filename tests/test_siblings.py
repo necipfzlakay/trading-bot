@@ -273,3 +273,72 @@ def test_a_snapshot_is_read_defensively():
     assert last.equity == pytest.approx(990.5)
     assert last.marks == {"C": 2.5}  # zero and garbage are "no price", not a price
     assert last.peak is None
+
+
+class _VenueClosedIt:
+    """A venue on which the position's own stop filled while we were down."""
+
+    def __new__(cls, specs, price: float, fee: float):
+        from tbot.execution.ccxt_broker import CCXTBroker
+
+        class Broker(CCXTBroker):
+            def __init__(self):  # noqa: D107 — no network, no credentials
+                self.venue, self.quote = None, "USDT"
+
+            def fetch_positions(self):
+                return {}
+
+            def fetch_open_orders(self):
+                return []
+
+            def order_state(self, symbol, order_id):
+                return {"status": "Filled", "filled": 1.0, "average_price": price, "fee": fee,
+                        "terminal": True, "filled_terminal": True}
+
+            def market_spec(self, symbol):
+                return specs.market_spec(symbol)
+
+        return Broker()
+
+
+def test_a_stop_that_filled_while_down_is_booked_not_dropped(tmp_path):
+    """Startup reconciliation used to drop a position the venue had closed: no
+    trade row, and the book settled at the last mark rather than the fill.
+    What fills while nobody watches is mostly stops, so every statistic read
+    better than the account. Now it is the venue's fill, in the trades and in
+    the book alike (invariant 76)."""
+    runner = _capped_runner(tmp_path)
+    position = _long(entry=100.0)
+    position.meta["stop_order_id"] = "1"
+    runner.db.upsert_position(position)
+    runner.broker = _VenueClosedIt(runner.broker, price=85.0, fee=0.085)
+    _last_run(runner.config, equity=995.0, cash=900.0, equity_marks={SPOT: 95.0},
+              peak_equity=1_000.0, starting_equity=1_000.0)
+
+    from tbot.engine.siblings import carried_book
+
+    carried = carried_book(runner.writer.read())
+    realised = runner._reconcile(carried.marks)
+    equity = runner._seed_capital(5_000.0, carried, realised_since=realised)
+
+    (trade,) = runner.db.query("SELECT exit_price, pnl, exit_reason FROM trades")
+    assert trade["exit_price"] == pytest.approx(85.0)
+    assert trade["exit_reason"] == "initial_stop"
+    assert equity == pytest.approx(900.0 + 85.0 - 0.085)
+    assert equity == pytest.approx(1_000.0 + trade["pnl"])
+    assert SPOT not in runner.portfolio.positions
+
+
+def test_a_trailed_short_stop_is_labelled_trailing(tmp_path):
+    """A short's stop trails *down*. ``current <= initial`` called every one
+    of them the initial stop, and the exit-reason split misread the shorts."""
+    from tbot.core.models import Position, Side
+
+    runner = _capped_runner(tmp_path)
+    runner.portfolio.positions[SPOT] = Position(
+        symbol=SPOT, side=Side.SELL, quantity=1.0, entry_price=100.0, entry_ts=0,
+        initial_stop=110.0, current_stop=104.0, setup="test", risk_amount=10.0,
+    )
+    runner._close_from_venue_fill(SPOT, 104.0, fee=0.1)
+    (trade,) = runner.db.query("SELECT exit_reason FROM trades")
+    assert trade["exit_reason"] == "trailing_stop"

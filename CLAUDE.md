@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 553 test
+.venv/bin/python -m pytest -q             # 558 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -278,6 +278,23 @@ testi oku — hepsinin kendini koruyan bir testi var.
     pozisyon yönetir ama giriş açmaz, seçilenler `stale_bar` ile işaretlenir.
     Ölçülen yaş barın **alındığı** an: fast'in 79 sembolü her barda ~3.5 dk
     sürüyor, o motorun sabiti, bayat karar değil. → `Runner._enter_unless_stale`
+78. **Listeden kalkmış sembol açılışı engellemez, evrenden düşer.** Bybit STG
+    perp'ini ileri testin ortasında delist etti; kaldıraç kontrolü onu kuramadı,
+    motor açılmayı reddetti ve launchd altında crash-loop'a girdi. Listede olmayan
+    sembolde emir de pozisyon da olamaz, yani bu güvenlik sorusu değil. Değişmez
+    69'un istisnası değil: evreni *borsa* değiştirdi, `symbols_delisted` yazılır.
+    → `CCXTBroker.listed`
+79. **Önceki koşunun defteri açılışta her yazımdan önce okunur.** Mutabakat,
+    motor kapalıyken kapanan pozisyonu kaydederken snapshot yazar; tohumlama
+    sonra o dosyayı önceki koşu sanıyordu. Ölçüldü: scalp 567.46 → **1317.73**,
+    zirve sıfırlandı, $500 öldürme eşiği erişilemez oldu. → `ScalpEngine.start`,
+    `Runner.start`
+80. **Motor kapalıyken borsada kapanan pozisyon kaydedilir, düşürülmez.** Runner
+    mutabakatı onu sessizce siliyordu: işlem satırı yok, defter dolumdan değil son
+    işaretten kapanıyor. Kimse bakmazken dolan şey çoğunlukla stop'tur — her
+    istatistik hesaptan iyi okunurdu. Dolum borsadan okunur ve kapanan
+    pozisyonun önceki equity'ye göre farkı tohumlamaya taşınır (değişmez 76).
+    → `Runner._reconcile`, `ScalpEngine._reconcile`
 68. **v5 çağrısının kategorisi ve sembolü sınıfın, literal değil.** ccxt'nin
     yardımcıları türev sözleşme varsayıyor; `category: "spot"` ve
     `replace("/","")` perp'te ya boş liste ya `10001` döndürüyor — ikisi de
@@ -570,6 +587,33 @@ yedeklenip silindi, kiralar temizlendi. Sıfırlama öncesi hesap −$38 idi (de
 gerçekleşmemiş, scalp −$19.26 / 214 işlem, fast işlemsiz). #94–#96 tamiriyle başlatıldı.
 H17 ve H18 **bu andan itibaren** yeniden sayılır.
 
+### On üçüncü tur (2026-10-12, Mac kapanıp açıldıktan sonra "bot çalışıyor mu" kontrolünde)
+
+Mac 23:10 yerel saatte kapandı, launchd açılışta üç motoru geri getirdi. Açılışın
+kendisi iki hata gösterdi; ikisini takip eden kod okuması üç tane daha.
+
+| # | sorun | ciddiyet | durum |
+|---|---|---|---|
+| 98 | **fast crash-loop'taydı.** Bybit STG/USDT:USDT'yi delist etmiş; `assert_venue_ready` her sembole kaldıraç kurmaya çalışıyor, bulamayınca motoru reddediyordu. launchd ~45 sn'de bir yeniden başlatıyor, her seferinde aynı ret. 44 dakika boyunca iki açık perp pozisyonu yalnız borsa stop'uyla korundu | yüksek | `CCXTBroker.listed`: listede olmayan sembol `symbols_delisted` ile düşer (değişmez 78) |
+| 99 | **Scalp açılışta kendi defterini ezdi.** Kapalıyken HBAR ve DOGE borsada kapanmış; `_reconcile` onları kaydederken `_snapshot()` çağırdı, state.json'a tohumlanmamış defter (1317.73) yazıldı, `_seed_capital` bunu önceki koşu diye okudu. Equity 567 → 1317, zirve sıfır, **öldürme eşiği ($500) 67 dolar uzaktan 817 dolar uzağa** taşındı. #84(c)'nin aynı sonucu, başka bir kapıdan | kritik | önceki defter mutabakattan önce okunuyor (değişmez 79) |
+| 100 | Scalp: kapalıyken kapanan pozisyonun, önceki equity'nin kullandığı fiyattan gerçek dolumuna kadarki farkı defterden düşüyordu — işlem satırında var, nakitte yok | orta | `_reconcile` farkı döndürüyor, tohumlama ekliyor; test değişmez 76'yı açılışta ölçüyor |
+| 101 | **Runner kapalıyken kapanan pozisyonu siliyordu.** İşlem satırı yazılmıyor, defter son işaretten kapanıyor. Geçmişte hiç olmamış (7 açılışın 7'si temiz) ama Mac kapandığı her gece olabilir, ve olduğunda kaybolan şey stop'lar — istatistik iyimser kayar | yüksek | borsanın dolumu `_close_from_venue_state` ile kaydediliyor (değişmez 80) |
+| 102 | **Trail eden short stop'u `initial_stop` diye etiketleniyordu.** `current_stop <= initial_stop` long için "trail etmedi", short için "trail etti" demek. fast'te 11 short `initial_stop` yazılmış, en iyisi −0.31R. R ve pnl doğru, `exit_reason` dağılımı yanlış — #64 sınıfı, yön literali | düşük | `side.sign` ile |
+
+#99 ve #101 aynı yerden: **açılış, kapalıyken olanı ilk gören an — ve tam orada defter
+henüz kurulmamış.** Kapalıyken olan her şey bu pencereden geçiyor; Mac'in her kapanışı
+onu açıyor. Beşinin de kendi testi var, her biri tamir geri alınınca kırılıyor.
+
+### Sıfırlama (2026-10-12 00:31 yerel / 2026-10-11 21:31 UTC, operatör kararı)
+
+`ops/reset.sh --usdt 3000`: perp AERO/NEAR kapatıldı, spot NEAR/WLD satıldı, 2 stop iptal,
+**USDT 3000.80**, üç DB `*/backups/pre-reset-20261012-0031*.db`'ye yedeklendi. Her motor
+yine **$1000**. Sıfırlama öncesi (2026-09-22 → 10-11): demo 10 işlem −$38.5, fast 47
+işlem −$121.7 (CI [−0.58, −0.10]R), scalp 4333 işlem −$432.7 (komisyon $394.5). H18
+**reddedildi** (iki kol da 300. işlemde kapatma kuralını tetiklemişti); scalp operatör
+kararıyla ölçüm için çalışmaya devam ediyor, yeni deneme sayılmıyor. H17'nin 50 işlemlik
+yargısı havuzlu: 47 + sıfırlama sonrası ilk 3 (`research/hypotheses.md`).
+
 ### Ölçülmüş borsa gerçekleri — 1 dakikalık maker scalper (2026-09-21, demo'da emirle)
 
 `scripts/scalp_probe.py` ile tekrar üretilebilir. Tam çıktı: `research/scalp_venue_facts.md`.
@@ -764,11 +808,11 @@ Strateji v1 ölçüldü (`runtime/reports/cpcv.md`):
 
 | kontrol | değer | |
 |---|---|---|
-| işlem ≥ 50 | 116 | ✅ |
-| profit factor ≥ 1.2 | 1.36 (eski taban, giriş komisyonu hariç — yeni tabanda ~1.30, #93) | ✅ |
+| işlem ≥ 50 | 124 | ✅ |
+| profit factor ≥ 1.2 | 1.31 (net taban, #93) | ✅ |
 | maks düşüş ≤ %20 | %15.8 | ✅ |
-| DSR anlamlı | p=1.000 | ⚠️ **geçersiz — bkz. denetim #77** |
-| CPCV yollarının çoğu pozitif | %51.1 | ✅ |
+| DSR anlamlı | **p=0.882** (düzeltilmiş eşik, `--trials 19`) | ❌ |
+| CPCV yollarının çoğu pozitif | %53.3 | ✅ |
 | PBO ≤ 0.5 | 0.33 | ✅ |
 
 Altı kontrolden beşi geçiyor. Kalan tek engel DSR'dı, **ve o satır bozuk bir
@@ -791,8 +835,11 @@ Eşik `sqrt(2 ln N)` gibi büyüyor: 17'den 100'e çıkmak sadece +0.41 Sharpe.
 **Deneme sayısı bağlayıcı kısıt değil ve hiç olmadı.** Gözlenen Sharpe 0.40;
 tek denemede bile 0.95 gerekiyor. Eksik olan bütçe değil, edge.
 
-⚠️ Tablo **yeniden ölçülmedi** — bot durdurulup `--to` ile sabitlenmesi gerekiyor
-(değişmez 45, 49). DSR satırı o koşuya kadar geçersiz sayılmalı.
+**Yeniden ölçüldü (2026-10-12, motorlar durdurulmuşken, arşiv sonu 2026-10-11 20:00
+UTC):** 124 işlem, PF 1.31, DSR **p=0.882**, CPCV %53.3, PBO 0.33. Gözlenen yıllık
+Sharpe 0.40 — kapı artık geçilebilir, ve bu strateji onu **geçemiyor**. 1000 deneme
+bile gereken eşiği 2.84'e çıkarır; eksik olan bütçe değil, edge. `cpcv_report.py`'nin
+`--to`'su yok — tekrar üretmek için motorlar durdurulur.
 
 ⚠️ **Bu iyileşme bir kod değişikliğine atfedilemez.** Önce denetim #40'ın tamirine
 bağlanmıştı; sabit ölçüm o tamirin no-op olduğunu gösterdi (#47, #49). PBO'nun

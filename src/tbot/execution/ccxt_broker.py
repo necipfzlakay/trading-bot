@@ -151,6 +151,24 @@ class CCXTBroker(Broker):
             self.exchange.load_markets()
             self._markets_loaded = True
 
+    def listed(self, symbols: list[str]) -> list[str]:
+        """The symbols the venue still lists, in order; the rest are logged.
+
+        A delisted symbol cannot be ordered and cannot carry a position, so it
+        is not a safety question — but every preflight that asks the venue
+        about it fails, and the perp one refuses to start. Bybit delisted
+        STG/USDT:USDT mid-test and the fast engine crash-looped under launchd.
+        Open positions are untouched: they are managed from the book, not the
+        universe (invariant 15).
+        """
+        self.load_markets()
+        markets = self.exchange.markets or {}
+        kept = [s for s in symbols if s in markets]
+        gone = [s for s in symbols if s not in markets]
+        if gone:
+            log.warning("symbols_delisted", symbols=gone, kept=len(kept))
+        return kept
+
     def market_spec(self, symbol: str) -> MarketSpec:
         self.load_markets()
         if symbol in self._specs:
@@ -1419,7 +1437,7 @@ class PerpBroker(CCXTBroker):
         There is no acknowledgement flag, for the same reason
         ``assert_key_is_safe`` has none.
         """
-        self.load_markets()
+        symbols = self.listed(symbols)
         problems: list[str] = []
 
         for symbol in symbols:

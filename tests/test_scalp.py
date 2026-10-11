@@ -413,6 +413,79 @@ def test_a_restart_carries_the_book_at_the_prices_its_equity_used(engine, tmp_pa
     assert eng.portfolio.equity({SOL: 98.5}) == pytest.approx(eng.state.equity)
 
 
+def test_a_close_found_at_startup_does_not_overwrite_the_book_it_restarts_from(
+    engine, monkeypatch
+):
+    """Measured: the Mac was shut down, two stops filled while it was off, and
+    reconciliation booked them — writing a snapshot of the still-unseeded
+    book. Seeding then read *that* as the previous run: 567.46 came back as
+    1317.73 with its peak reset, and the $500 kill moved out of reach."""
+    from tbot.engine.portfolio import Portfolio
+    from tbot.scalp import engine as module
+
+    eng, venue, _db = engine
+    eng.state.equity, eng.state.peak_equity, eng.state.starting_equity = 567.46, 1000.8, 1000.0
+    eng.writer.write(eng.state)
+
+    eng.portfolio = Portfolio(starting_cash=1317.73)  # what a fresh process holds
+    venue.fetch_balance = lambda: {"USDT": 5_000.0}
+    monkeypatch.setattr(module, "assert_key_is_safe", lambda *a, **k: None)
+    monkeypatch.setattr(_db, "start_run", lambda **k: 1, raising=False)
+    monkeypatch.setattr(venue, "exchange", None, raising=False)
+    monkeypatch.setattr(venue, "load_markets", lambda: None, raising=False)
+    for name in ("_restrict_to_tradeable_books", "_cancel_leftover_entries", "_load_history"):
+        monkeypatch.setattr(eng, name, lambda *a, **k: None)
+    # A close found at startup writes a snapshot.
+    monkeypatch.setattr(eng, "_reconcile", lambda *_: eng._snapshot() or 0.0)
+    monkeypatch.setattr(eng.stream, "start", lambda: False)
+    monkeypatch.setattr(eng, "_shutdown", lambda: None)
+
+    with pytest.raises(RuntimeError, match="websocket"):
+        eng.start()
+    assert eng.portfolio.cash == pytest.approx(567.46)
+    assert eng.portfolio.peak_equity == pytest.approx(1000.8)
+
+
+def test_a_stop_that_filled_while_down_reaches_the_book_not_only_the_trades(
+    engine, monkeypatch
+):
+    """The previous run's equity valued the position at its last mark; the stop
+    then filled lower while the process was down. Seeding from that equity
+    alone dropped the difference: the trade row carried the loss, the book did
+    not, and equity minus the allocation stopped equalling the trades
+    (invariant 76)."""
+    from tbot.engine.portfolio import Portfolio
+    from tbot.scalp import engine as module
+
+    eng, venue, db = engine
+    _filled_and_held(eng, venue)
+    eng.stream.ingest(SOL, [1_790_000_000_000, 99.0, 99.0, 98.0, 98.5, 1.0])
+    eng._snapshot()  # shutdown: SOL valued at 98.5
+
+    held = eng.portfolio.positions[SOL]
+    eng.portfolio = Portfolio(starting_cash=1317.73)  # a fresh process
+    eng.portfolio.positions[SOL] = held  # what the database restores
+    venue.positions = {}
+    venue.exit_fill = {"average_price": 97.0, "fee": 0.07, "kind": "stop",
+                       "filled": 1.2, "filled_terminal": True}
+    venue.fetch_balance = lambda: {"USDT": 5_000.0}
+    monkeypatch.setattr(module, "assert_key_is_safe", lambda *a, **k: None)
+    monkeypatch.setattr(db, "start_run", lambda **k: 1, raising=False)
+    monkeypatch.setattr(db, "load_positions", lambda: [], raising=False)
+    monkeypatch.setattr(venue, "exchange", None, raising=False)
+    monkeypatch.setattr(venue, "load_markets", lambda: None, raising=False)
+    for name in ("_restrict_to_tradeable_books", "_cancel_leftover_entries", "_load_history"):
+        monkeypatch.setattr(eng, name, lambda *a, **k: None)
+    monkeypatch.setattr(eng.stream, "start", lambda: False)
+    monkeypatch.setattr(eng, "_shutdown", lambda: None)
+
+    with pytest.raises(RuntimeError, match="websocket"):
+        eng.start()
+    (trade,) = db.trades
+    assert trade.exit_price == pytest.approx(97.0)
+    assert eng.portfolio.equity({}) == pytest.approx(1_000.0 + trade.pnl)
+
+
 def test_the_entry_rate_is_capped(engine):
     eng, _venue, _db = engine
     now = time.monotonic()

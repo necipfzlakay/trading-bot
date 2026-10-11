@@ -31,9 +31,9 @@ bir sonrakinin barını yükseltiyor.
 | 14 | Kurulum kapısı gereksiz — kesitsel sıralama tek başına yeter (açık hipotez #4) | mimari denetim | **test edildi, REDDEDİLDİ** — 3.6x işlem (103→367) ama Kapı 1'de 5/6 → **2/6**, PBO 0.33 → **0.67** | 1 |
 | 15 | Taker akış dengesizliği (CVD) kısa vadede edge taşır | fiyattan bağımsız tek kaynak | **taranıp REDDEDİLDİ** — üst desil lift +0.8 puan, gereken +13. Strateji koşulmadı | 0 (indikatör taraması) |
 | 16 | Perp ücret katmanı ve short tarafı kısa vadeli aritmetiği değiştirir | operatör sorusu | **tarandı** — maliyet %0.30→%0.07, short tabanı long'dan +2.1 puan iyi. Açık %8.8 puandan **%1.8 puana** indi, ama kapanmadı | 0 (bariyer taraması, strateji koşulmadı) |
-| 17 | **Kesitsel conviction skoru perp'te SHORT tarafında %0.07 maliyeti karşılar** | H16'nın bıraktığı açık | **ÖN-KAYITLI, ileri test koşuyor** — aşağıya bakın | 1 |
-| 18a | **1m sert hareketi takip (momentum), maker giriş, perp** | operatör: "dakikada 10 işlem açabilen bot" | **ÖN-KAYITLI, beklenti NEGATİF** — aşağıya bakın | 1 |
-| 18b | **1m sert hareketi sönümleme (dönüş), aynı tetik, aynı motor** | 18a ile rastgele bölüşülmüş A/B kolu | **ÖN-KAYITLI, beklenti NEGATİF** | 1 |
+| 17 | **Kesitsel conviction skoru perp'te SHORT tarafında %0.07 maliyeti karşılar** | H16'nın bıraktığı açık | **ileri test, 47/50 işlem** — ara CI [−0.58, −0.10]R, tamamen sıfırın altında; yargı 50'de (havuzlu) | 1 |
+| 18a | **1m sert hareketi takip (momentum), maker giriş, perp** | operatör: "dakikada 10 işlem açabilen bot" | **REDDEDİLDİ** — 2182 işlem, −%0.095/işlem, komisyon öncesi bile negatif | 1 |
+| 18b | **1m sert hareketi sönümleme (dönüş), aynı tetik, aynı motor** | 18a ile rastgele bölüşülmüş A/B kolu | **REDDEDİLDİ** — 2151 işlem, −%0.074/işlem, brüt ≈ 0 | 1 |
 
 **Kümülatif deneme: 19.** Bir sonraki CPCV koşusunda `--trials 19` geçirin.
 
@@ -110,6 +110,29 @@ hatalarından geldi, ama bu ayrım okuyucuya bırakılmamalı. Dört işlemin ç
 yazılmıştır (#92'de 3, #95'te 1); havuzlanacaksa bunlar önce borsanın execution
 listesinden düzeltilmeli. Havuzlama kararı operatörde. Yedek
 `runtime-scalp/backups/pre-reset-20260922-092458.db`. **H18 sayımı bu andan başlar.**
+
+**2026-10-11 — SONUÇ (sıfırlama öncesi, 2026-09-22 06:24 → 2026-10-11 20:55 UTC, 470 saat).**
+4333 işlem (1717 TP / 1835 stop / 781 zaman), Σpnl **−$432.73**, bildirilen komisyon
+**$394.45** — kaybın %91'i. Kol başına, işlem başına net getiri, bootstrap %95 CI:
+
+| kol | n | net | ilk 300 işlem | komisyon öncesi |
+|---|---|---|---|---|
+| H18a momentum | 2182 | −%0.095 [−0.107, −0.082] | −%0.066 [−0.101, −0.030] | **−%0.019** [−0.031, −0.007] |
+| H18b dönüş | 2151 | −%0.074 [−0.087, −0.062] | −%0.072 [−0.107, −0.037] | +%0.003 [−0.010, +0.015] |
+
+**İki kol da 300. işlemde ön-kayıtlı kapatma kuralını tetiklemişti** (CI tamamen sıfırın
+altında) — kural uygulanmadı, çünkü sonuç kimse bakmadan birikti. Beklentiyle uyumlu:
+H18a −%0.02/−%0.05 bekleniyordu, −%0.095 çıktı (maker girişin ters seçimi: komisyon
+*öncesi* bile negatif); H18b −%0.05/−%0.10 bekleniyordu, −%0.074. Dönüşün brüt edge'i
+sıfır, momentumun brüt edge'i **negatif**. **H18 REDDEDİLDİ**, iki kol da.
+
+**Operatör kararı: motor durmuyor.** 2026-10-12 sıfırlamasından sonra aynı parametrelerle
+koşmaya devam ediyor. Bu **yeni bir hipotez denemesi değil** ve deneme sayacını
+artırmıyor: H18'in cevabı yukarıda, sonraki koşu yalnız borsa gerçeklerini (dolum
+oranı, gerçek komisyon, TP'nin taker dolması) daha uzun pencerede ölçüyor. Sonraki
+veriden "H18 aslında pozitifmiş" okunacaksa önce bu paragraf okunmalı: aynı hipotezi
+reddedildikten sonra tekrar sormak, DSR'ın fiyatladığı şeyin ta kendisi.
+Yedek: `runtime-scalp/backups/pre-reset-20261012-*.db`.
 
 ### Kill kriterleri (koşmadan önce yazıldı)
 
@@ -280,6 +303,27 @@ kayıtları yeniden sıfırlandı (denetim #94, #96: restart sermaye muhasebesi)
 aralıkta 17 barda **hiç işlem açmadı** (772 satır `below_threshold`, 103 `no_setup`),
 yani kaybolan H17 verisi yok. Strateji parametreleri değişmedi; H17 bu andan
 itibaren sayılır. Yedek `runtime-fast/backups/pre-reset-20260922-092458.db`.
+
+**2026-10-11 — 47 işlemde ara durum (kural 50'de yargı istiyor, yargı değil).**
+2026-09-22 06:24 → 2026-10-11 20:10 UTC: 47 işlem, Σpnl −$121.71, ortalama
+**−0.349R**, bootstrap %95 CI **[−0.583, −0.095]R** (işlem başına getiri −%1.32,
+CI [−2.18, −0.41]). Long 32 / short 15, ikisi de ≈ −0.34R; rejim ayrımı aynı
+(trend_up 32 → −0.355R, trend_down 15 → −0.334R) — yani kâr düşen rejimde de yok.
+Ön-kayıtlı beklenti −%0.05 idi; gözlenen çok daha kötü.
+
+**Havuzlama kararı (sonraki işlemler görülmeden yazıldı):** 2026-10-12 sıfırlaması
+yalnız muhasebeyi sıfırlıyor; strateji parametreleri **değişmedi**, bu aralıkta
+yapılan düzeltmeler (#98 delist, #99–#101 açılış muhasebesi, #102 short stop etiketi)
+hiçbir giriş ya da çıkış kararına dokunmuyor. Bu yüzden 50 işlemlik yargı **bu 47
+işlem + sıfırlama sonrası ilk 3 işlem** üzerinden verilir; 47'nin ham verisi
+`runtime-fast/backups/pre-reset-20261012-*.db`'de. Kural değişmedi: CI tamamen sıfırın
+altındaysa **kapat**. 3 işlemin bu CI'yi sıfırın üstüne taşıması pratikte imkânsız;
+bunu şimdi yazıyorum ki 50. işlemde "biraz daha bekleyelim" denmesin.
+
+**Etiket düzeltmesi (#102).** `_close_from_venue_fill` stop'un trail edip etmediğini
+`current <= initial` ile okuyordu — short için ters. 11 short `initial_stop` yazılmış,
+en iyisi −0.31R: bunların bir kısmı aslında trailing stop'tu. R ve pnl doğru; yalnız
+`exit_reason` dağılımı short'ta yanlış.
 
 ### Neden bu bir deneme sayılıyor ama veri madenlenmiş değil
 

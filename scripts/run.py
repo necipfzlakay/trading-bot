@@ -95,6 +95,7 @@ def main() -> int:
     db = Database(cfg.db_path)
     store = ParquetStore(cfg.data.parquet_dir)
     broker = build_broker(cfg, secrets, symbols)
+    symbols = broker.listed(symbols)
 
     runner = Runner(
         config=cfg,
@@ -142,6 +143,7 @@ def run_scalp(cfg, secrets, symbols: list[str]) -> int:
 
     db = Database(cfg.db_path)
     broker = build_broker(cfg, secrets, symbols)
+    symbols = broker.listed(symbols)
     try:
         ScalpEngine(config=cfg, secrets=secrets, db=db, broker=broker, symbols=symbols).start()
     finally:
