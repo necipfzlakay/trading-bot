@@ -613,7 +613,9 @@ class EngineConfig(StrictModel):
     # bar. ``scalp`` is the one-minute maker loop in ``tbot.scalp`` — measured,
     # the Runner needs ~3.5 minutes to process one bar over 79 symbols, so it
     # cannot carry a one-minute strategy at all.
-    kind: Literal["bar", "scalp"] = "bar"
+    # ``rebalance`` is the daily-close loop in ``tbot.rebalance``: H19 carry,
+    # H20 trend and H21 cross-sectional momentum, each a few trades a month.
+    kind: Literal["bar", "scalp", "rebalance"] = "bar"
     loop_interval_seconds: float = Field(default=5.0, gt=0, le=300)
     # Restart storm detection: beyond this, drop to safe mode instead of thrashing.
     max_restarts_per_hour: int = Field(default=10, ge=1)
@@ -675,6 +677,55 @@ class ScalpConfig(StrictModel):
     kill_equity: float = Field(default=500.0, ge=0)
 
 
+class RebalanceConfig(StrictModel):
+    """The daily-close rebalancing strategies (H19-H21). Pre-registered.
+
+    Fixed from the literature's defaults before the archive was asked anything
+    (``research/hypotheses.md``); ``scripts/rebalance_research.py`` replays them
+    once. They are the hypothesis under test, not settings to tune: changing one
+    and re-running is a new trial, and the DSR prices it.
+
+    Every position is sized once, at entry, to an equal share of the engine's
+    equity, and held at that quantity until its rule says to leave.
+    """
+
+    strategy: Literal["trend", "xsmom", "carry"] = "trend"
+
+    # H20 — time-series trend: long while the close is above its 140-day
+    # (20-week) simple average, otherwise cash. Decided on Mondays.
+    trend_symbols: list[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
+    trend_sma_days: int = Field(default=140, ge=20, le=400)
+
+    # H21 — cross-sectional momentum: rank by 28-day return, hold the top 4
+    # with a positive return; a held name stays while it ranks within 8.
+    xsmom_lookback_days: int = Field(default=28, ge=5, le=365)
+    xsmom_top_k: int = Field(default=4, ge=1, le=20)
+    xsmom_hold_rank: int = Field(default=8, ge=1, le=40)
+
+    # H19 — funding carry: spot long + perp short on the same name. Enter when
+    # the last 7 days of settled funding sum to >= 0.21% (~11%/yr), leave when
+    # the sum falls to 0 or below. At most 4 pairs.
+    carry_window_days: int = Field(default=7, ge=1, le=60)
+    carry_enter_sum: float = Field(default=0.0021, gt=0, le=0.1)
+    carry_exit_sum: float = Field(default=0.0, ge=-0.05, le=0.1)
+    carry_max_pairs: int = Field(default=4, ge=1, le=20)
+    # Funding paid or received is read back from the venue this often.
+    carry_funding_poll_seconds: int = Field(default=900, ge=60, le=86_400)
+    # A pair whose legs drift apart by more than this fraction of the spot
+    # quantity is reported; the engine never resizes a leg on its own.
+    carry_leg_tolerance: float = Field(default=0.02, gt=0, le=0.5)
+
+    # Weekly strategies decide on this weekday's daily close (0 = Monday,
+    # the venue's own week, invariant 17). Carry decides every day.
+    decision_weekday: int = Field(default=0, ge=0, le=6)
+    # Daily bars fetched over REST for each decision; must cover the longest
+    # lookback with room for a gap.
+    history_days: int = Field(default=200, ge=30, le=1000)
+    # Pre-registered freeze: at or below this equity no new position is opened;
+    # open ones are still managed by their rule. 0 disables it.
+    freeze_equity: float = Field(default=0.0, ge=0)
+
+
 class Config(BaseModel):
     """Root configuration, assembled from YAML and validated as a whole.
 
@@ -707,6 +758,7 @@ class Config(BaseModel):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
     scalp: ScalpConfig = Field(default_factory=ScalpConfig)
+    rebalance: RebalanceConfig = Field(default_factory=RebalanceConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     runtime_dir: Path = Path("runtime")
@@ -731,6 +783,20 @@ class Config(BaseModel):
                 raise ValueError("engine.kind: scalp requires risk.max_capital (its allocation)")
             if self.scalp.kill_equity >= self.risk.max_capital:
                 raise ValueError("scalp.kill_equity must sit below risk.max_capital")
+        if self.engine.kind == "rebalance":
+            # Several engines now share the spot wallet as well as the perp
+            # one; a coin two engines hold is one neither can account for
+            # (invariant 81). The allocation is what a forward test is judged on.
+            if not self.engine.symbol_claims:
+                raise ValueError("engine.kind: rebalance requires engine.symbol_claims: true")
+            if self.risk.max_capital <= 0:
+                raise ValueError("engine.kind: rebalance requires risk.max_capital")
+            if self.risk.max_leverage != 1.0:
+                raise ValueError("engine.kind: rebalance runs unlevered (risk.max_leverage: 1.0)")
+            if self.rebalance.freeze_equity >= self.risk.max_capital:
+                raise ValueError("rebalance.freeze_equity must sit below risk.max_capital")
+            if self.rebalance.xsmom_hold_rank < self.rebalance.xsmom_top_k:
+                raise ValueError("rebalance.xsmom_hold_rank cannot be tighter than xsmom_top_k")
         if self.engine.symbol_claims and self.entries.armed_breakout:
             # An armed entry rests at the venue and fills on its own, without
             # passing through the path that claims a symbol first — so it could

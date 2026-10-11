@@ -4,6 +4,13 @@ extends: base.yaml
 mode: live
 venue: bybit-demo
 
+engine:
+  # Spot cüzdanı artık trend/xsmom/carry ile paylaşılıyor. Aynı coin'i iki motor
+  # tutarsa biri kendi stop'unun dolduğunu göremez, çıkışı ötekinin malını
+  # satabilir (değişmez 81). Kira sahibi adı "main" (namespace boş kalır,
+  # client id'ler değişmez — değişmez 54).
+  symbol_claims: true
+
 risk:
   # Aynı demo hesapta üç motor var ve her birinin kendi $1000'i var (operatör,
   # 2026-09-21 sıfırlaması). Tavan motorun ilk tahsisi; sonrasında kendi

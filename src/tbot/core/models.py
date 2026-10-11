@@ -127,6 +127,10 @@ class ExitReason(StrEnum):
     MANUAL_FLATTEN = "manual_flatten"
     LIQUIDATION = "liquidation"
     BACKTEST_END = "backtest_end"
+    # The strategy's own rule said to leave (``tbot.rebalance``): the trend
+    # turned, the name fell out of the ranks, the funding dried up. Those
+    # strategies have no stop and no target — the rule *is* the exit.
+    SIGNAL_EXIT = "signal_exit"
 
 
 class NoTradeReason(StrEnum):

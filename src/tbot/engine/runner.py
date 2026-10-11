@@ -66,6 +66,7 @@ from tbot.engine.portfolio import Portfolio, restore_position
 from tbot.engine.siblings import (
     CarriedBook,
     carried_book,
+    claim_owner,
     own_starting_cash,
     sibling_reservation,
 )
@@ -203,7 +204,7 @@ class Runner:
         self.slippage = SlippageTracker(assumed_bps=self.config.execution.slippage_bps)
         if self.config.engine.symbol_claims:
             self.claims = SymbolClaims(
-                self.config.engine.claims_path, self.config.engine.namespace
+                self.config.engine.claims_path, claim_owner(self.config)
             )
 
         gate = LeverageGate(self.config.promotion_path)

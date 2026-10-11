@@ -1,0 +1,51 @@
+# Bot #6 — "carry": H19, funding carry (research/hypotheses.md).
+#
+# Aynı isimde spot long + perp short, eşit miktar: fiyat hareketi birbirini
+# götürür, kalan funding'dir. Her gün 00:00 UTC'de: son 7 günün funding toplamı
+# ≥ %0.21 (≈ yıllık %11) → çift açılır; ≤ 0 → kapanır. En fazla 4 çift; her
+# bacak tahsisin 1/8'i (çift başına iki bacak sermaye bağlar). Perp 1x
+# (değişmez 57). Hedge bacağı reddedilirse spot bacak hemen geri satılır.
+#
+# Evren: ana motorun spot evreninde perp'i de olan 18 isim (sabit).
+extends: base.yaml
+
+mode: live
+venue: bybit-demo
+
+runtime_dir: runtime-carry
+
+engine:
+  namespace: ca
+  kind: rebalance
+  # Hem spot (ana motor, trend, xsmom) hem perp (fast, scalp) ile paylaşıyor.
+  symbol_claims: true
+
+web:
+  port: 8792
+
+telegram:
+  enabled: false
+
+universe:
+  symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ENA/USDT", "AAVE/USDT", "NEAR/USDT", "LINK/USDT", "UNI/USDT", "WLD/USDT", "MNT/USDT", "ARB/USDT", "SUI/USDT", "ONDO/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LTC/USDT"]
+
+data:
+  parquet_dir: runtime-carry/data
+  fetch_derivatives: false
+
+execution:
+  market_type: spot
+
+risk:
+  max_capital: 1000.0
+  max_leverage: 1.0
+
+rebalance:
+  strategy: carry
+  carry_window_days: 7
+  carry_enter_sum: 0.0021
+  carry_exit_sum: 0.0
+  carry_max_pairs: 4
+  # Ön-kayıtlı dondurma: $900'da (−%10) yeni çift açılmaz. Hedge'li bir
+  # stratejide %10 kayıp modelin bozulduğu demektir, piyasa değil.
+  freeze_equity: 900.0

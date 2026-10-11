@@ -53,6 +53,8 @@ def main() -> int:
 
     if cfg.engine.kind == "scalp":
         return run_scalp(cfg, secrets, symbols)
+    if cfg.engine.kind == "rebalance":
+        return run_rebalance(cfg, secrets, symbols)
 
     blocks, selected, decay = indicator_selection(cfg)
     if not blocks:
@@ -146,6 +148,52 @@ def run_scalp(cfg, secrets, symbols: list[str]) -> int:
     symbols = broker.listed(symbols)
     try:
         ScalpEngine(config=cfg, secrets=secrets, db=db, broker=broker, symbols=symbols).start()
+    finally:
+        db.close()
+    return 0
+
+
+def run_rebalance(cfg, secrets, symbols: list[str]) -> int:
+    """The daily-close loop (``engine.kind: rebalance``): H19 carry, H20 trend, H21 xsmom.
+
+    Spot is the main broker. Carry also shorts the perpetual of each name, so it
+    gets a second, linear broker, held at 1x like every perp engine here
+    (invariant 57), and trades only the names listed on both venues.
+    """
+    from tbot.execution.ccxt_broker import PerpBroker
+    from tbot.rebalance.engine import RebalanceEngine, perp_of
+
+    lock = SingleInstanceLock(cfg.runtime_dir / "engine.lock")
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        print(f"\n{exc}\n")
+        return 1
+
+    rb = cfg.rebalance
+    print(f"\n  engine  rebalance/{rb.strategy} (namespace {cfg.engine.namespace})")
+    print(f"  venue   {cfg.venue.value}  [{venue_label(cfg.venue)}]")
+    print(f"  symbols {len(symbols)}")
+    print(f"  capital {cfg.risk.max_capital:.0f} {cfg.quote_currency}"
+          + (f" · freeze at {rb.freeze_equity:.0f}" if rb.freeze_equity else "") + "\n")
+
+    db = Database(cfg.db_path)
+    broker = build_broker(cfg, secrets, symbols)
+    symbols = broker.listed(symbols)
+    perp = None
+    if rb.strategy == "carry":
+        key, secret = secrets.credentials_for(cfg.venue)
+        perp = PerpBroker(key, secret, cfg.venue, cfg.quote_currency,
+                          margin_mode="isolated", leverage=1.0)
+        perp.load_markets()
+        shorts = perp.listed([perp_of(s) for s in symbols])
+        symbols = [s for s in symbols if perp_of(s) in shorts]
+        perp.refresh_fees(shorts)
+        perp.assert_venue_ready(shorts)
+    try:
+        RebalanceEngine(
+            config=cfg, secrets=secrets, db=db, broker=broker, symbols=symbols, perp=perp
+        ).start()
     finally:
         db.close()
     return 0

@@ -160,6 +160,23 @@ class Portfolio:
             self.cash += position.entry_price * quantity + gross - fee
         return quantity
 
+    def book_income(self, symbol: str, amount: float) -> bool:
+        """Cash the venue paid to (or took from) an open position — funding.
+
+        Banked in cash at once, as the venue does, and carried on the position
+        as realised P&L so that ``close_position`` folds it into the trade's
+        ``pnl``: equity minus the start stays the sum of the trades plus what
+        is open (invariant 76). A short perp receives funding when the rate is
+        positive; ``amount`` is signed as the venue reports it.
+        """
+        position = self.positions.get(symbol)
+        if position is None:
+            return False
+        position.meta["realised_pnl"] = float(position.meta.get("realised_pnl", 0.0)) + amount
+        position.meta["income"] = float(position.meta.get("income", 0.0)) + amount
+        self.cash += amount
+        return True
+
     def close_position(
         self,
         symbol: str,

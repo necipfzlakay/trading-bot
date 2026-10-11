@@ -261,9 +261,11 @@ except Exception as exc:
 from tbot.engine.siblings import assert_claims_consistent, sibling_configs
 try:
     assert_claims_consistent(cfg)
-    peers = [s for s in sibling_configs(cfg) if s.execution.market_type == "linear"]
-    if cfg.execution.market_type == "linear" and peers:
-        names = ", ".join(s.engine.namespace for s in peers)
+    from tbot.engine.siblings import markets
+    mine = markets(cfg)
+    peers = [s for s in sibling_configs(cfg) if markets(s) & mine]
+    if peers:
+        names = ", ".join(s.engine.namespace or "main" for s in peers)
         print(f"  {GOOD} symbol claims shared with: {names}")
 except Exception as exc:
     print(f"  {BAD} {exc}")
@@ -283,6 +285,11 @@ if cfg.engine.kind == "scalp":
     s = cfg.scalp
     print(f"  {GOOD} scalp: {', '.join(s.arms)} · TP {s.take_profit_pct:.2%} / "
           f"SL {s.stop_loss_pct:.2%} · kill at {s.kill_equity:.0f}")
+elif cfg.engine.kind == "rebalance":
+    # Decides from daily closes or settled funding alone (tbot.rebalance.signals).
+    r = cfg.rebalance
+    print(f"  {GOOD} rebalance: {r.strategy} · freeze at {r.freeze_equity:.0f} · "
+          f"claims {'on' if cfg.engine.symbol_claims else 'OFF'}")
 else:
     blocks, _sel, _decay = indicator_selection(cfg)
     if blocks:

@@ -1423,6 +1423,58 @@ class PerpBroker(CCXTBroker):
                 return str(market["symbol"])
         return None
 
+    # -- funding -----------------------------------------------------------
+
+    _LOG_WINDOW_MS = 7 * 86_400_000 - 60_000  # the transaction log answers 7 days at most
+
+    def funding_settlements(self, symbol: str, since_ms: int) -> list[tuple[int, float, str]] | None:
+        """Funding the venue settled on this contract after ``since_ms``.
+
+        ``(transaction_ms, signed_amount_in_quote, id)``, oldest first, read from
+        the account's own transaction log — what was actually paid, not a rate
+        times a size we computed. The log is account-wide, so on a shared
+        account it is filtered to this contract; claims make the contract this
+        engine's alone (``engine.claims``). Measured on demo: a short holding
+        HBAR at a positive rate shows ``change`` +0.0116; a long AERO −0.0060.
+
+        ``None`` when the venue could not be read — unknown is not "nothing was
+        paid", and the caller keeps its cursor so the next poll asks again.
+        """
+        venue_id = self._bare(symbol)
+        base = symbol.split("/")[0]
+        now = now_ms()
+        start = max(int(since_ms) + 1, now - 30 * 86_400_000)
+        found: list[tuple[int, float, str]] = []
+        while start < now:
+            end = min(start + self._LOG_WINDOW_MS, now)
+            cursor = ""
+            while True:
+                params = {
+                    "accountType": "UNIFIED", "category": "linear", "currency": self.quote,
+                    "baseCoin": base, "type": "SETTLEMENT",
+                    "startTime": start, "endTime": end, "limit": 50,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    response = self.exchange.privateGetV5AccountTransactionLog(params)
+                except ccxt.BaseError as exc:
+                    log.warning("funding_log_unreadable", symbol=symbol, error=str(exc)[:160])
+                    return None
+                result = response.get("result") or {}
+                for row in result.get("list") or []:
+                    if str(row.get("symbol") or "") != venue_id:
+                        continue
+                    ts = int(row.get("transactionTime") or 0)
+                    if ts <= since_ms:
+                        continue
+                    found.append((ts, float(row.get("change") or 0.0), str(row.get("id") or "")))
+                cursor = str(result.get("nextPageCursor") or "")
+                if not cursor or not (result.get("list") or []):
+                    break
+            start = end
+        return sorted(set(found))
+
     # -- safety ------------------------------------------------------------
 
     def assert_venue_ready(self, symbols: list[str]) -> None:

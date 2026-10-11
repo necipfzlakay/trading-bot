@@ -1,0 +1,45 @@
+# Bot #4 — "trend": H20, zaman serisi trend takibi (research/hypotheses.md).
+#
+# BTC ve ETH spot, yalnız long. Pazartesi 00:00 UTC'de (haftalık sınır, değişmez
+# 17) kapanış 140 günlük ortalamanın üstündeyse tutar, altındaysa nakit. Stop
+# yok: kural çıkıştır. Her isim tahsisin yarısıyla bir kez boyutlanır.
+# Parametreler ön-kayıtlı; ayar düğmesi değil.
+extends: base.yaml
+
+mode: live
+venue: bybit-demo
+
+runtime_dir: runtime-trend
+
+engine:
+  namespace: tr
+  kind: rebalance
+  symbol_claims: true # spot cüzdanı ana motorla paylaşılıyor (değişmez 81)
+
+web:
+  port: 8790
+
+telegram:
+  enabled: false
+
+universe:
+  symbols: ["BTC/USDT", "ETH/USDT"]
+
+data:
+  parquet_dir: runtime-trend/data
+  fetch_derivatives: false
+
+execution:
+  market_type: spot
+
+risk:
+  max_capital: 1000.0
+  max_leverage: 1.0
+
+rebalance:
+  strategy: trend
+  trend_symbols: ["BTC/USDT", "ETH/USDT"]
+  trend_sma_days: 140
+  decision_weekday: 0
+  # Ön-kayıtlı dondurma: $650'da (−%35) yeni pozisyon açılmaz.
+  freeze_equity: 650.0

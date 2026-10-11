@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 558 test
+.venv/bin/python -m pytest -q             # 577 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -295,6 +295,13 @@ testi oku — hepsinin kendini koruyan bir testi var.
     istatistik hesaptan iyi okunurdu. Dolum borsadan okunur ve kapanan
     pozisyonun önceki equity'ye göre farkı tohumlamaya taşınır (değişmez 76).
     → `Runner._reconcile`, `ScalpEngine._reconcile`
+81. **Spot coin'i de kiralanır.** Spot'ta borsa netlemez, ama iki motor aynı
+    coin'i tutarsa ikisi de toplam bakiyeyi kendi sanır: birinin stop'u dolduğunda
+    bakiye hâlâ ötekinin malıyla dolu görünür (`_detect_venue_exits` dolumu
+    göremez) ve çıkışı ötekinin coin'ini satar. Bu yüzden spot işlem yapan her
+    motor kira tutar — ana motor dahil, sahip adı `main` (namespace boş kalır,
+    değişmez 54). Carry hem spot hem perp'te sayılır. → `siblings.markets`,
+    `assert_claims_consistent`, `claim_owner`
 68. **v5 çağrısının kategorisi ve sembolü sınıfın, literal değil.** ccxt'nin
     yardımcıları türev sözleşme varsayıyor; `category: "spot"` ve
     `replace("/","")` perp'te ya boş liste ya `10001` döndürüyor — ikisi de
@@ -728,12 +735,13 @@ Performans ölçüldü, sorun değil: 21 sembol tam tarama 6.5s + 63 REST çağr
 | `execution/ccxt_broker.py::PerpBroker` | Linear perpetual: short, borsa tarafı hedef, kaldıraç kapısı, PostOnly+ekli TP/SL |
 | `engine/claims.py` `siblings.py` | Perp sembol kiralama; kardeş motorları bulma, sermaye tohumlama |
 | `scalp/signal.py` `stream.py` `engine.py` `backtest.py` | 1m scalper: tek saf sinyal, WS kapanmış barlar, maker döngüsü, aynı sinyalle replay |
+| `rebalance/signals.py` `engine.py` `backtest.py` | Günlük kapanışta yeniden dengeleme (H19 carry, H20 trend, H21 xsmom): saf sinyaller, REST döngüsü, aynı sinyalle replay |
 
 ## Komutlar
 
 ```bash
 ./ops/pre-install.sh                                      # tüm kurulum + ölçüm
-./ops/bot.sh start demo|live|fast|scalp                   # 7/24 (launchd üretir)
+./ops/bot.sh start demo|live|fast|scalp|trend|xsmom|carry # 7/24 (launchd üretir)
 ./ops/bot.sh status | stop | restart | logs -f            # motor adı opsiyonel
 ./ops/bot.sh engines                                      # tanımlı motorlar
 
@@ -747,6 +755,7 @@ python scripts/dashboard.py --config config/fast.yaml     # panel :8788 (sekmeli
 python scripts/perp_probe.py                              # perp borsa gerçekleri
 python scripts/scalp_probe.py                             # 1m maker scalper borsa gerçekleri
 python scripts/scalp_backtest.py --to <ISO>               # H18 backtest (bir kez, ayarsız)
+python scripts/rebalance_research.py                      # H19–H21 arşiv ölçümü (bir kez, ayarsız)
 python scripts/claims.py [--release SYM]                  # perp sembol kiraları
 python scripts/report.py --since 30d                      # durum raporu
 python scripts/llm_impact.py                              # LLM karşı-olgusal
@@ -898,10 +907,10 @@ Kod yanlış demek değil. Aynı veriye kaç kez soru sorulduğunun bedeli var v
 ürettiği veri madenlenmemiş), daha fazla sembol/geçmiş, ya da tek seferlik test
 edilen yeni hipotez sınıfı.
 
-**Kümülatif deneme: 19** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
-koşusunda `--trials 19` geçirin — DSR her denemeyi fiyatlıyor. 17'nci H17:
-perp + short; 18–19'uncu H18a/H18b: 1m scalper'ın iki kolu. Üçü de ön-kayıtlı,
-ileri testte.
+**Kümülatif deneme: 22** (kaynak: `research/hypotheses.md`). Bir sonraki CPCV
+koşusunda `--trials 22` geçirin — DSR her denemeyi fiyatlıyor. 17'nci H17:
+perp + short; 18–19'uncu H18a/H18b: 1m scalper'ın iki kolu (reddedildi);
+20–22'nci H19 carry, H20 trend, H21 xsmom. Hepsi ön-kayıtlı.
 `ops/pre-install.sh` bu sayıyı o dosyadan okuyup otomatik geçiriyor.
 
 Bu bir başarısızlık değil, sistemin çalıştığının kanıtı: altyapı yanlış bir
@@ -923,6 +932,32 @@ barını yükseltiyor.
 - [x] Faz 8 — LLM rolleri + redaksiyon + etki ölçümü
 - [ ] Faz 9 — Bybit demo, 4 hafta (Kapı 1 geçilmeden anlamsız)
 - [ ] Faz 10 — canlı $100 (Kapı 3'e bağlı)
+
+### Dördüncü–altıncı motorlar — günlük kapanışta yeniden dengeleme (H19–H21, 2026-10-12)
+
+Üçü de `engine.kind: rebalance` (`tbot/rebalance/`), her biri $1000, 1x, stop'suz —
+kural çıkıştır. Ortak döngü: 00:00 UTC kapanışından 90 sn sonra REST'ten kapanmış
+günlük bar (ya da settle olmuş funding) çekilir, saf `signals` fonksiyonu tutulacak
+isimleri söyler, önce çıkışlar sonra girişler market emriyle. Her pozisyon girişte
+eşit payla bir kez boyutlanır, miktar sabit. Kapanıştan 6 saat sonra alınan karar
+yalnız çıkış yapar (değişmez 77'nin bu motordaki karşılığı). Nabız 60 sn, equity 5 dk.
+
+| motor | config | port | strateji | karar |
+|---|---|---|---|---|
+| trend | `trend.yaml` (`tr`) | 8790 | H20: BTC+ETH, 140g SMA üstünde long | Pazartesi 00:00 UTC |
+| xsmom | `xsmom.yaml` (`xs`) | 8791 | H21: 21 spot sembolde 28g getiride ilk 4, tampon 8 | Pazartesi 00:00 UTC |
+| carry | `carry.yaml` (`ca`) | 8792 | H19: spot long + perp short, 7g funding ≥ %0.21 | her gün 00:00 UTC |
+
+- Carry'nin iki broker'ı var (spot + `PerpBroker`); perp bacağı spot bacağın **elde
+  kalan** miktarına göre (spot alım komisyonu coin'den, değişmez 23). Hedge reddedilirse
+  spot bacak hemen geri satılır. Funding borsanın işlem günlüğünden okunur
+  (`PerpBroker.funding_settlements`, `type=SETTLEMENT`, `baseCoin` filtresi) ve
+  `Portfolio.book_income` ile hem nakde hem pozisyonun realised P&L'ine yazılır, yani
+  işlemin `pnl`'ine girer (değişmez 76).
+- Arşiv ölçümü (`scripts/rebalance_research.py`): trend +%56 / al-tut +%131; xsmom
+  +%231 ama düşüş %78 ve ikinci yarıda edge yok; carry 2 yılda +%2.5, son yılda hiç
+  sinyal yok. Beklenti ve kill kriterleri `research/hypotheses.md`'de.
+- Panel komutları (pause/resume/flatten) bu motorda `command.json`'dan okunuyor.
 
 ### Üçüncü motor ("scalp") — 1 dakikalık maker scalper (H18)
 

@@ -1,0 +1,48 @@
+# Bot #5 — "xsmom": H21, kesitsel momentum sepeti (research/hypotheses.md).
+#
+# Ana motorun 21 spot sembolü (2026-09 evreni, sabit — değişmez 69). Pazartesi
+# 00:00 UTC'de 28 günlük getiriye göre sıralar; getirisi pozitif ilk 4'ü tutar,
+# tutulan isim 8. sıranın dışına düşene ya da getirisi negatife dönene kadar
+# kalır. Stop yok. Ana motorla aynı coin'leri hedefler; kim önce alırsa o
+# tutar (kira), diğeri atlar.
+extends: base.yaml
+
+mode: live
+venue: bybit-demo
+
+runtime_dir: runtime-xsmom
+
+engine:
+  namespace: xs
+  kind: rebalance
+  symbol_claims: true
+
+web:
+  port: 8791
+
+telegram:
+  enabled: false
+
+universe:
+  symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ENA/USDT", "AAVE/USDT", "NEAR/USDT", "LINK/USDT", "UNI/USDT", "WLD/USDT", "MNT/USDT", "ARB/USDT", "SUI/USDT", "ONDO/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "VVV/USDT", "FLOCK/USDT", "BR/USDT", "LTC/USDT"]
+
+data:
+  parquet_dir: runtime-xsmom/data
+  fetch_derivatives: false
+
+execution:
+  market_type: spot
+
+risk:
+  max_capital: 1000.0
+  max_leverage: 1.0
+
+rebalance:
+  strategy: xsmom
+  xsmom_lookback_days: 28
+  xsmom_top_k: 4
+  xsmom_hold_rank: 8
+  decision_weekday: 0
+  # Ön-kayıtlı dondurma: $500'da (−%50) yeni pozisyon açılmaz. Arşivde maks.
+  # düşüş %78 — bu eşik o düşüşün ortasında devreye girer, bilerek.
+  freeze_equity: 500.0

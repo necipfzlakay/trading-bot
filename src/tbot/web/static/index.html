@@ -744,7 +744,8 @@ async function refresh(){
       const risk = Math.abs(p.entry - p.stop) || null;
       const dir = p.side==='sell' ? -1 : 1;
       const r = nz(px) && risk ? dir*(px-p.entry)/risk : null;
-      const toStop = nz(px) && px ? dir*(px-p.stop)/px : null;
+      // Rule-exit engines (tbot.rebalance) hold no stop: no distance to show.
+      const toStop = nz(px) && px && nz(p.stop) ? dir*(px-p.stop)/px : null;
       return `<tr><td class="sym">${esc(p.symbol)}</td><td class="dim">${term(SETUP, p.setup)}</td>
         <td class="num dim">${fmt(m.qty,6)}</td>
         <td class="num">${fmt(p.entry,4)}</td>

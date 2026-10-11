@@ -53,40 +53,62 @@ def sibling_configs(config: Config, config_dir: Path | None = None) -> list[Conf
     return list(found.values())
 
 
+def markets(config: Config) -> set[str]:
+    """The venue markets an engine holds positions in.
+
+    Carry is the one engine on two: a spot long and a perpetual short of the
+    same name (``tbot.rebalance``).
+    """
+    found = {config.execution.market_type}
+    if config.engine.kind == "rebalance" and config.rebalance.strategy == "carry":
+        found |= {"spot", "linear"}
+    return found
+
+
+def claim_owner(config: Config) -> str:
+    """The name an engine claims symbols under — the panel's name for it.
+
+    The main engine keeps the empty namespace (its client ids predate
+    namespaces, invariant 54), and an empty owner would match every other
+    empty owner; ``main`` is what ``web.app.engine_key`` already calls it.
+    """
+    return config.engine.namespace or "main"
+
+
 def assert_claims_consistent(config: Config, siblings: list[Config] | None = None) -> None:
-    """Refuse to start a perp engine beside another perp engine that ignores claims.
+    """Refuse to start beside an engine on the same market that ignores claims.
 
     One engine honouring claims is no protection: the one that does not will
-    open the symbol regardless, and the venue nets the two positions. Every
-    perpetual engine on the account must use the same claim table, or none may
-    run beside another.
+    open the symbol regardless. On perpetuals the venue nets the two positions
+    (one-way mode). On spot nothing nets, which is worse in its own way: both
+    engines read the same coin balance as theirs, so one's stop filling is
+    invisible to it while the other still holds the coin, and its exit can sell
+    the other's inventory (invariant 81). Every engine on a market must use the
+    same claim table, or none may run beside another there.
     """
-    if config.execution.market_type != "linear":
-        return
-    peers = [
-        s
-        for s in (siblings if siblings is not None else sibling_configs(config))
-        if s.execution.market_type == "linear"
-    ]
-    if not peers:
-        return
-    offenders = [
-        s.engine.namespace or "(default)"
-        for s in [config, *peers]
-        if not s.engine.symbol_claims
-    ]
-    if offenders:
-        raise RuntimeError(
-            "several perpetual engines share this account, and one-way mode nets "
-            "their positions per symbol — every one of them must set "
-            f"engine.symbol_claims: true. Missing on: {', '.join(offenders)}"
-        )
-    paths = {s.engine.claims_path for s in [config, *peers]}
-    if len(paths) > 1:
-        raise RuntimeError(
-            "perpetual engines on one account must share one claim table; "
-            f"found {sorted(str(p) for p in paths)}"
-        )
+    peers_all = siblings if siblings is not None else sibling_configs(config)
+    for market in sorted(markets(config)):
+        peers = [s for s in peers_all if market in markets(s)]
+        if not peers:
+            continue
+        offenders = [
+            s.engine.namespace or "(default)"
+            for s in [config, *peers]
+            if not s.engine.symbol_claims
+        ]
+        if offenders:
+            raise RuntimeError(
+                f"several engines hold {market} positions on this account; one coin "
+                "or contract held by two of them is one neither can account for — "
+                "every one of them must set engine.symbol_claims: true. "
+                f"Missing on: {', '.join(offenders)}"
+            )
+        paths = {s.engine.claims_path for s in [config, *peers]}
+        if len(paths) > 1:
+            raise RuntimeError(
+                f"engines trading {market} on one account must share one claim table; "
+                f"found {sorted(str(p) for p in paths)}"
+            )
 
 
 # A sibling's own state is trusted for this long after its last heartbeat

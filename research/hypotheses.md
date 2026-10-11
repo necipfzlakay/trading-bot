@@ -34,8 +34,108 @@ bir sonrakinin barını yükseltiyor.
 | 17 | **Kesitsel conviction skoru perp'te SHORT tarafında %0.07 maliyeti karşılar** | H16'nın bıraktığı açık | **ileri test, 47/50 işlem** — ara CI [−0.58, −0.10]R, tamamen sıfırın altında; yargı 50'de (havuzlu) | 1 |
 | 18a | **1m sert hareketi takip (momentum), maker giriş, perp** | operatör: "dakikada 10 işlem açabilen bot" | **REDDEDİLDİ** — 2182 işlem, −%0.095/işlem, komisyon öncesi bile negatif | 1 |
 | 18b | **1m sert hareketi sönümleme (dönüş), aynı tetik, aynı motor** | 18a ile rastgele bölüşülmüş A/B kolu | **REDDEDİLDİ** — 2151 işlem, −%0.074/işlem, brüt ≈ 0 | 1 |
+| 19 | **Funding carry: spot long + perp short, 7g funding toplamı ≥ %0.21'de** | operatör: "tahmin değil, ücret toplayan bir şey" | **ÖN-KAYITLI, ileri test** — arşivde 2 yılda +%2.5, son yıl **hiç sinyal yok** | 1 |
+| 20 | **Zaman serisi trend: BTC+ETH, 140g SMA üstünde long, değilse nakit** | "uzun ufuk >> kısa ufuk" bulgusu | **ÖN-KAYITLI, ileri test** — arşivde +%56 / al-tut +%131, düşüş %37 / %58 | 1 |
+| 21 | **Kesitsel momentum sepeti: 28g getiride ilk 4, tampon 8, haftalık** | tail analizinin katmansız hali (H1'in sade tekrarı) | **ÖN-KAYITLI, ileri test** — arşivde +%231 / al-tut +%82, ama **düşüş %78** ve ikinci yarıda +%1.9 / +%42 | 1 |
 
-**Kümülatif deneme: 19.** Bir sonraki CPCV koşusunda `--trials 19` geçirin.
+**Kümülatif deneme: 22.** Bir sonraki CPCV koşusunda `--trials 22` geçirin.
+
+## 20.–22. deneme: H19 carry, H20 trend, H21 xsmom — ÖN-KAYIT (canlı koşudan önce yazıldı)
+
+**Tarih:** 2026-10-12 · **Motorlar:** `config/carry.yaml`, `config/trend.yaml`,
+`config/xsmom.yaml` (`engine.kind: rebalance`) · **Tahsis:** her biri $1000, 1x, kaldıraçsız
+
+### Neden soruluyor
+
+Üç motorun (demo, fast, scalp) ortak dersi: **fiyatın nereye gideceğini kısa vadede
+tahmin etmek bu evrende komisyona yeniliyor** (değişmez 53, 58; H17 47 işlemde CI
+tamamen sıfırın altında; H18 iki kolda reddedildi; Kapı 1 DSR p=0.882). Üç farklı soru:
+
+- **H19** tahmin etmiyor: kaldıraçlı long'ların ödediği funding'i, iki bacağı fiyat
+  hareketini götüren bir pozisyonla topluyor. Gelir yapısal; soru maliyeti karşılayıp
+  karşılamadığı.
+- **H20** reponun en sağlam bulgusunun (uzun ufuk >> kısa ufuk) en sade hali: haftada
+  bir karar, yılda ~4 işlem, komisyon önemsiz.
+- **H21** ölçülen edge'in (1d/20 bar üst desil fazlalığı +%5.97) kurulum, conviction,
+  stop katmanları **olmadan** işlenmesi. Hipotez 1'e benziyor (rejim kapılı, n=18,
+  red) — bu yüzden ayrı bir deneme olarak sayılıyor, tekrarı olarak değil.
+
+### Parametreler — arşive bakmadan, literatür varsayılanlarından sabitlendi
+
+`RebalanceConfig` varsayılanları; `scripts/rebalance_research.py` bir kez koşar.
+
+| | şartname |
+|---|---|
+| H19 | spot ∩ perp evreni (18 isim, sabit). Her gün 00:00 UTC kapanışında: son 7 günde settle olan funding **toplamı** ≥ %0.21 (≈ yıllık %11) → spot long + perp short, eşit miktar; ≤ 0 → çift kapanır. ≤ 4 çift, her bacak tahsisin 1/8'i. Hedge reddedilirse spot bacak anında geri satılır. Funding borsanın işlem günlüğünden okunur |
+| H20 | BTC/USDT + ETH/USDT spot. **Pazartesi 00:00 UTC** (haftalık sınır): son kapanış > 140 günlük SMA → tut, değilse sat. Her isim tahsisin yarısı |
+| H21 | ana motorun 21 spot sembolü (2026-09 evreni, sabit). Pazartesi 00:00 UTC: 28 günlük getiriye göre sırala; getirisi pozitif ilk 4'ü al; tutulan isim sırası ≤ 8 ve getirisi > 0 iken kalır |
+| hepsi | giriş t kapanışı, dolum t+1 açılışı (değişmez 1). Her pozisyon girişte eşit payla **bir kez** boyutlanır, miktar çıkışa kadar sabit. Stop yok: kural çıkıştır. Spot sembolleri de kiralanır (değişmez 81) |
+
+### Arşiv sonucu (2026-10-12, tek koşu + bir hizalama koşusu)
+
+Maliyet: spot taker %0.1 + 5 bps, perp taker %0.055 + 5 bps, her bacakta.
+
+| | işlem | toplam | CAGR | maks düşüş | Sharpe | karşılaştırma |
+|---|---|---|---|---|---|---|
+| H20 trend | 12 | **+%55.6** | +%15.5 | %36.6 | 0.59 | al-tut BTC+ETH: +%131.2, %58.1, 0.79 |
+| — 1. yarı | 8 | +%22.1 | | %36.6 | 0.53 | al-tut +%109.9 |
+| — 2. yarı | 4 | **−%15.1** | | %24.7 | −0.36 | al-tut +%19.5 |
+| H21 xsmom | 146 | **+%230.7** | +%47.8 | **%78.1** | 0.87 | al-tut 21 sembol: +%82.4, %71.3, 0.63 |
+| — 1. yarı | 70 | +%221.1 | | %56.1 | 1.37 | al-tut +%115.6 |
+| — 2. yarı | 71 | **+%1.9** | | %62.7 | 0.47 | al-tut **+%42.4** |
+| H19 carry | 16 | +%2.5 (2 yıl) | +%1.3 | %0.3 | 4.05 | — |
+| — 2. yarı | **0** | 0 | | | | funding eşiği bir kez bile aşılmadı |
+
+Arşivin funding'i: settle'ların %74.7'si pozitif, ortalama 8 saatte %0.0044 (**yıllık
+%4.8** — eşiğin yarısı). Medyan çift tutuşu 87 gün.
+
+**İlk koşu farklı bir haftalık sınırla yapıldı ve şeffaflık için burada:** backtest
+kararı Pazartesi *barının* kapanışında (Salı 00:00) alıyordu; canlı motor Pazartesi
+00:00'da (Pazar barının kapanışı, değişmez 17) karar veriyor. Canlı ile backtest aynı
+kuralı kullanmalı (değişmez 59), backtest canlıya hizalandı. İlk koşu: trend +%40.3
+(Sharpe 0.50), xsmom +%213.6 (düşüş %82.7). **Bir günlük kaydırma trend'i 15 puan
+oynattı** — 12 işlemlik bir sonucun ne kadar gürültü taşıdığının ölçüsü bu.
+
+### Uyarılar (sonuca bakarken okunmalı)
+
+1. **H21'in evreni hayatta kalanlardan seçildi.** 21 sembol 2026-09'daki hacme göre;
+   arşivin başında bu isimlerin bir kısmı küçüktü, sonradan büyüdükleri *için* evrende.
+   Momentum tam olarak bunu ödüllendirir. Arşiv sonucu iyimser, ne kadar olduğu bilinmiyor.
+2. **H21'in edge'i arşivin içinde çöktü**: 1. yarı +%221, 2. yarı +%1.9 (al-tut +%42).
+3. **H19'da baz yok.** Arşivde perp-spot fiyat farkının seyri yok; iki bacak birbirini
+   tam götürüyor varsayıldı. İleri testin ölçeceği ilk şey bu.
+4. Üçü de az işlem: H20 yılda ~4, H21 ~50, H19 ~8. **Hiçbiri DSR/CPCV ile aylar içinde
+   yargılanamaz.** Aşağıdaki kriterler bu yüzden yön ve model doğrulaması üzerine.
+
+### Beklenen sonuç (ön-kayıt)
+
+| | beklenti |
+|---|---|
+| H19 | **Çoğunlukla nakitte.** Funding eşiği aşarsa çift başına net ≈ +%1 / 3 ay. Kâr kaynağı funding ise defterdeki `income` ≈ çiftin pnl'i; baz kayıpları bunu yerse model yanlış |
+| H20 | Al-tut'un **gerisinde** toplam getiri, **daha düşük** düşüş. Boğa piyasasında belirgin geride |
+| H21 | Al-tut civarı ya da gerisi (arşivin ikinci yarısı gibi), büyük düşüşlerle |
+
+Bir motorun belirgin pozitif çıkması **şüpheyle** karşılanır: önce dönemin piyasa
+yönü (al-tut ne yaptı?), sonra evren seçimi, sonra şans.
+
+### Kill kriterleri (koşmadan önce yazıldı)
+
+| | durum | aksiyon |
+|---|---|---|
+| hepsi | equity ≤ `rebalance.freeze_equity` (H19 $900, H20 $650, H21 $500) | **yeni pozisyon yok**, açıklar kuralla çıkar (kodda) |
+| H19 | herhangi bir çiftte baz kaybı > o çiftin funding'i | model yanlış — dondur, buraya yaz |
+| H19 | 90 günde hiç çift açılmadı | sonuç bu: bu evrende carry yok. Kapat |
+| H20, H21 | 26 hafta | aynı pencerede al-tut ile karşılaştır (toplam getiri ve maks düşüş); yargı yön, istatistik değil |
+| H21 | 50 kapanmış işlemde işlem başına getirinin bootstrap CI'si tamamen sıfırın altında | kapat |
+
+### Altyapı notları
+
+- Spot cüzdanı artık dört motor paylaşıyor; kira tablosu spot'a da genişletildi ve
+  ana motor da kiralıyor (`symbol_claims: true`, sahip adı `main`). **Bu, ana motorun
+  işlem popülasyonunu değiştirir**: trend BTC/ETH'yi tutarken ana motor onları atlar,
+  xsmom'un ilk 4'ü de öyle. Etki ölçülebilir: `scans`'te `claimed_by_other_engine`.
+- H17'nin (fast) 50 işlemlik yargısı bundan etkilenmez — fast perp'te; carry'nin perp
+  short'ları ancak çift açıldığında sembol kiralar.
 
 ## 18. ve 19. deneme: H18a / H18b — ÖN-KAYIT (backtest ve canlı koşudan önce yazıldı)
 
