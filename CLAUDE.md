@@ -4,7 +4,7 @@ Otonom kripto al-sat botu. Bybit spot, önce demo, sonra gerçek para ($100).
 Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
 
 ```bash
-.venv/bin/python -m pytest -q             # 577 test
+.venv/bin/python -m pytest -q             # 578 test
 .venv/bin/ruff check src tests scripts    # lint
 ```
 
@@ -677,7 +677,7 @@ ise mümkün — yön borsa tarafından çıkarsandığı için tetik fiyatını
 **üstünde** olduğu her yerleştirmede doğrulanıyor, yoksa satış-stop'u olarak
 okunup anında dolar.
 
-**Açık, düzeltilmedi:** `report.py` ve panel `run_id`/`mode` filtrelemiyor. `runs`
+**~~Açık, düzeltilmedi~~ — kapandı (2026-10-12):** `report.py` ve panel `run_id`/`mode` filtrelemiyor — ama artık filtreleyecek bir şey yok: `paper` modu kaldırıldı (#75), her motorun kendi `runtime-*` dizini ve DB'si var, sıfırlama DB'yi siliyor. Bir DB'de tek mod, tek ölçek. Eski metin: `runs`
 tablosunda mod var, ama equity eğrisi ve işlem istatistikleri farklı ölçekteki
 koşuları ($1.000 / $50.000) tek seriye karıştırıyor.
 İşlem güvenliği sorunu değil, **rapor doğruluğu** sorunu. Çözüm: sorguları aktif
@@ -758,6 +758,7 @@ python scripts/scalp_backtest.py --to <ISO>               # H18 backtest (bir ke
 python scripts/rebalance_research.py                      # H19–H21 arşiv ölçümü (bir kez, ayarsız)
 python scripts/claims.py [--release SYM]                  # perp sembol kiraları
 python scripts/report.py --since 30d                      # durum raporu
+python scripts/scorecard.py                               # H17–H21: ön-kayıtlı kill kuralları, tek sayfa
 python scripts/llm_impact.py                              # LLM karşı-olgusal
 ```
 
@@ -953,7 +954,12 @@ yalnız çıkış yapar (değişmez 77'nin bu motordaki karşılığı). Nabız 
   spot bacak hemen geri satılır. Funding borsanın işlem günlüğünden okunur
   (`PerpBroker.funding_settlements`, `type=SETTLEMENT`, `baseCoin` filtresi) ve
   `Portfolio.book_income` ile hem nakde hem pozisyonun realised P&L'ine yazılır, yani
-  işlemin `pnl`'ine girer (değişmez 76).
+  işlemin `pnl`'ine girer (değişmez 76). Kapanan işlem `meta`'da `income` ve `pair`
+  taşır: H19'un kill kuralı (baz kaybı > funding) çift kapandıktan sonra ancak bununla
+  ölçülebilir — önceden pozisyonla birlikte kayboluyordu.
+- `scripts/scorecard.py` her ileri testi kendi ön-kayıtlı kuralına göre okur (H17 havuzlu
+  50 işlem CI'si, H19 90 gün / baz, H20–H21 26 hafta al-tut karşılaştırması, H21 50 işlem
+  CI'si, dondurma eşikleri). Salt-okur, motorlar çalışırken güvenli.
 - Arşiv ölçümü (`scripts/rebalance_research.py`): trend +%56 / al-tut +%131; xsmom
   +%231 ama düşüş %78 ve ikinci yarıda edge yok; carry 2 yılda +%2.5, son yılda hiç
   sinyal yok. Beklenti ve kill kriterleri `research/hypotheses.md`'de.

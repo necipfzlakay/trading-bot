@@ -610,11 +610,16 @@ class RebalanceEngine:
         if position is None:
             return
         fee, fee_estimated = self._fee_split(symbol, fee, price, position.quantity)
+        # The funding a perp leg earned and the leg it hedged leave with the
+        # position unless the trade carries them: H19's kill rule compares a
+        # pair's basis loss against exactly this income.
+        kept = {k: position.meta[k] for k in ("income", "pair") if k in position.meta}
         trade = self.portfolio.close_position(
             symbol, price, now_ms(), reason, fee, fee_estimated=fee_estimated
         )
         if trade is None:
             return
+        trade.meta.update(kept)
         self.db.record_trade(trade)
         self.db.delete_position(symbol)
         self.claims.release(symbol)

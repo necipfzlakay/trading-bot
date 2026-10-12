@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -336,6 +337,10 @@ def test_funding_reaches_the_cash_and_the_trade(tmp_path):
     short_pnl = next(t["pnl"] for t in trades if t["symbol"] == "BTC/USDT:USDT")
     assert short_pnl > 0.25 - 0.3, "the funding is in the short's pnl, net of its fees"
     assert eng._equity() == pytest.approx(1_000.0 + sum(t["pnl"] for t in trades))
+    # H19's kill rule needs the income after the pair is gone: basis = pnl - income.
+    metas = {t["symbol"]: json.loads(t["meta"]) for t in eng.db.query("SELECT symbol, meta FROM trades")}
+    assert metas["BTC/USDT:USDT"] == {"income": pytest.approx(0.25), "pair": "BTC/USDT"}
+    assert metas["BTC/USDT"] == {"pair": "BTC/USDT:USDT"}
 
 
 # --------------------------------------------------------------------------
