@@ -213,7 +213,7 @@ def test_trend_buys_above_its_average_and_sells_below_it(tmp_path):
     position = eng.portfolio.positions["BTC/USDT"]
     # Half the allocation: two names, two equal slots.
     assert position.quantity * 250.0 == pytest.approx(500.0, rel=0.01)
-    assert eng.claims.owner_of("BTC/USDT") == "tr"
+    assert eng.claims.owner_of("BTC/USDT") == "trend"
     scans = {r["symbol"]: r["no_trade_reason"] for r in eng.db.query("SELECT * FROM scans")}
     assert scans == {"BTC/USDT": "entered", "ETH/USDT": "below_threshold"}
 
@@ -296,7 +296,7 @@ def test_carry_hedges_what_the_spot_leg_actually_holds(tmp_path):
     assert spot.holdings["BTC/USDT"] - short.quantity < 0.002
     # One leg is an eighth of the allocation: four pairs, two legs each.
     assert long.quantity * 100.0 == pytest.approx(125.0, rel=0.02)
-    assert eng.claims.owner_of("BTC/USDT") == eng.claims.owner_of("BTC/USDT:USDT") == "ca"
+    assert eng.claims.owner_of("BTC/USDT") == eng.claims.owner_of("BTC/USDT:USDT") == "carry"
 
 
 def test_a_refused_hedge_unwinds_the_spot_leg(tmp_path):

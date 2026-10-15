@@ -13,7 +13,7 @@ venue: bybit-demo
 runtime_dir: runtime-xsmom
 
 engine:
-  namespace: xs
+  namespace: xsmom
   kind: rebalance
   symbol_claims: true
 

@@ -12,7 +12,7 @@ venue: bybit-demo
 runtime_dir: runtime-trend
 
 engine:
-  namespace: tr
+  namespace: trend
   kind: rebalance
   symbol_claims: true # spot cüzdanı ana motorla paylaşılıyor (değişmez 81)
 

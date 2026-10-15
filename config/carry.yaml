@@ -15,7 +15,7 @@ venue: bybit-demo
 runtime_dir: runtime-carry
 
 engine:
-  namespace: ca
+  namespace: carry
   kind: rebalance
   # Hem spot (ana motor, trend, xsmom) hem perp (fast, scalp) ile paylaşıyor.
   symbol_claims: true

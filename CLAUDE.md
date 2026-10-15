@@ -945,9 +945,9 @@ yalnız çıkış yapar (değişmez 77'nin bu motordaki karşılığı). Nabız 
 
 | motor | config | port | strateji | karar |
 |---|---|---|---|---|
-| trend | `trend.yaml` (`tr`) | 8790 | H20: BTC+ETH, 140g SMA üstünde long | Pazartesi 00:00 UTC |
-| xsmom | `xsmom.yaml` (`xs`) | 8791 | H21: 21 spot sembolde 28g getiride ilk 4, tampon 8 | Pazartesi 00:00 UTC |
-| carry | `carry.yaml` (`ca`) | 8792 | H19: spot long + perp short, 7g funding ≥ %0.21 | her gün 00:00 UTC |
+| trend | `trend.yaml` | 8790 | H20: BTC+ETH, 140g SMA üstünde long | Pazartesi 00:00 UTC |
+| xsmom | `xsmom.yaml` | 8791 | H21: 21 spot sembolde 28g getiride ilk 4, tampon 8 | Pazartesi 00:00 UTC |
+| carry | `carry.yaml` | 8792 | H19: spot long + perp short, 7g funding ≥ %0.21 | her gün 00:00 UTC |
 
 - Carry'nin iki broker'ı var (spot + `PerpBroker`); perp bacağı spot bacağın **elde
   kalan** miktarına göre (spot alım komisyonu coin'den, değişmez 23). Hedge reddedilirse
