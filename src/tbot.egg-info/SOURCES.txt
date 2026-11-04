@@ -1,6 +1,0 @@
-pyproject.toml
-src/tbot.egg-info/PKG-INFO
-src/tbot.egg-info/SOURCES.txt
-src/tbot.egg-info/dependency_links.txt
-src/tbot.egg-info/requires.txt
-src/tbot.egg-info/top_level.txt

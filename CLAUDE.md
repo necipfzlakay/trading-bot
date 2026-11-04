@@ -1,7 +1,7 @@
 # TRADING-BOT — proje haritası
 
 Otonom kripto al-sat botu. Bybit spot, önce paper/demo, sonra gerçek para ($100).
-Plan: `~/.claude/plans/simdi-benim-aklimda-bir-ticklish-micali.md` · Kurulum: `SETUP.md`
+Kurulum: `SETUP.md`
 
 ```bash
 .venv/bin/python -m pytest -q             # 389 test
