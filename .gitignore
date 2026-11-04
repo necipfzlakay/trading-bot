@@ -13,3 +13,6 @@ runtime/
 .ruff_cache/
 .DS_Store
 research/notebooks/.ipynb_checkpoints/
+
+# Python packaging artifacts
+*.egg-info/
